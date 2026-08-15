@@ -3,8 +3,9 @@
 
     tools/adint-ref-check [--ref ref/exchange-domains.tsv] [--sigs ref/sdk-signatures.tsv]
                           [--candidates data/bundle-sdk-candidates.tsv]
+                          [--unresolved data/unresolved-hosts.tsv] [--min-obs N]
 
-Three classes of check, in rising order of what they catch:
+Four classes of check, in rising order of what they catch:
 
 1. STRUCTURE — the file loads under the same loader the pipeline uses, no duplicate
    patterns, no empty source, no pattern written as a wildcard or a URL. A malformed row
@@ -20,11 +21,36 @@ Three classes of check, in rising order of what they catch:
    a false negative in the exact direction this project must not produce, so it is reported
    as a named gap, per org, not as a count.
 
+4. THE WIRE (`--unresolved`) — the same hole read from the other end. Check 3 can only ask
+   about an org whose SDK is IN a DEX; a host reached by an obfuscated app, by a preinstalled
+   system app, or by an SDK we never inventoried is invisible to it. The first real capture
+   proved this is not hypothetical: Moloco's DSP host, Baidu MediaGo, Xiaomi's own ad estate
+   and a ByteDance host under the MIUI ad service all arrived on the wire while the
+   87-row SDK-constant reference could name none of them. So the two legs have OPPOSITE
+   blind spots and both are run: check 3 asks *what could talk and can never be named*,
+   check 4 asks *what DID talk and was not named*.
+
+   Two things this leg must not be read as saying:
+
+   * An unnamed host is a LEAD, never a defect. Most of them are first-party API traffic and
+     will never belong in an exchange table. It is reported, ranked by observations, and
+     never turned into an error.
+   * It is silent about the largest gap of all. `unresolved-hosts.tsv` only holds rows that
+     HAD a hostname; connections whose DNS was already cached carry no name at all (354 of
+     1348 rows — 26% — in the 2026-08-15 capture) and are unnameable by any table. The leg
+     says so out loud, because "12 hosts unnamed" otherwise reads as the whole of what the
+     capture failed to identify.
+
+   The matcher is IMPORTED from `adint-aggregate`, never re-implemented here: a second
+   suffix-matcher would drift, and a gate that resolves hosts differently from the pipeline
+   it guards reports gaps the pipeline does not have — and misses the ones it does.
+
 Exit codes: 0 clean · 1 structural error or contradiction · 0 with warnings for coverage
 gaps (a gap is a lead, not a defect — an SDK in a DEX need not ever talk).
 """
 
 import argparse
+import importlib.util
 import os
 import sys
 from collections import Counter, defaultdict
@@ -162,11 +188,66 @@ def check_coverage(ref_path, candidates_path):
     return gaps, len(dev_orgs), coarse
 
 
+def _aggregate_matcher():
+    """Import load_ref/resolve from adint-aggregate — one matcher for gate and pipeline.
+
+    The sibling has no .py suffix (it is a command, not a module), so it is loaded by path.
+    If it cannot be loaded the wire leg must NOT quietly fall back to a local copy of the
+    matching rule: that is how a gate starts asserting something the pipeline does not do."""
+    path = os.path.join(HERE, "adint-aggregate")
+    spec = importlib.util.spec_from_loader(
+        "adint_aggregate", importlib.machinery.SourceFileLoader("adint_aggregate", path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.load_ref, mod.resolve
+
+
+def check_wire(ref_path, unresolved_path, min_obs):
+    """Hosts the WIRE produced that no ref row can name.
+
+    Returns (leads, stats). `leads` is [(host, observations, packages)] over the threshold,
+    most-observed first. Never an error: an unnamed host is usually first-party traffic."""
+    if not os.path.exists(unresolved_path):
+        return [], None
+    load_ref, resolve = _aggregate_matcher()
+    table = load_ref(ref_path)
+
+    leads, total_hosts, total_obs, named_now = [], 0, 0, 0
+    with open(unresolved_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#") or line.startswith("hostname\t"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            host = parts[0].strip()
+            try:
+                obs = int(parts[1])
+            except ValueError:
+                continue
+            pkgs = parts[2].strip() if len(parts) > 2 else "?"
+            total_hosts += 1
+            total_obs += obs
+            # A host listed as unresolved that the CURRENT table resolves is not a lead —
+            # it is the artifact being older than the reference. Counted, not reported.
+            if resolve(host, table) is not None:
+                named_now += 1
+                continue
+            if obs >= min_obs:
+                leads.append((host, obs, pkgs))
+    leads.sort(key=lambda t: (-t[1], t[0]))
+    return leads, {"hosts": total_hosts, "obs": total_obs, "named_since": named_now}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", default=os.path.join(ROOT, "ref", "exchange-domains.tsv"))
     ap.add_argument("--candidates", default=os.path.join(ROOT, "data", "bundle-sdk-candidates.tsv"))
+    ap.add_argument("--unresolved", default=os.path.join(ROOT, "data", "unresolved-hosts.tsv"))
+    ap.add_argument("--min-obs", type=int, default=2,
+                    help="report an unnamed host only from this many observations (default 2)")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
 
@@ -194,8 +275,24 @@ def main():
     elif norgs:
         print("  coverage: every demand-side org on the device has at least one domain row (%d orgs)"
               % norgs)
-    print("%d errors, %d warnings, %d coverage gaps"
-          % (len(errors), len(warnings) + len(coarse), len(gaps)))
+
+    leads, wstats = check_wire(args.ref, args.unresolved, args.min_obs)
+    if wstats is None:
+        print("  wire: no %s — the wire leg did not run (this is not a pass)"
+              % os.path.relpath(args.unresolved, ROOT))
+    else:
+        print("  wire: %d hosts / %d observations in %s; %d now named by the table"
+              % (wstats["hosts"], wstats["obs"], os.path.relpath(args.unresolved, ROOT),
+                 wstats["named_since"]))
+        for host, obs, pkgs in leads:
+            print("    lead %-52s %4d obs  %s pkg" % (host, obs, pkgs))
+        if leads:
+            print("    (leads, not defects — most unnamed hosts are first-party API traffic)")
+        print("    NOTE this leg sees only rows that HAD a hostname; connections whose DNS was "
+              "already cached carry no name and are unnameable by any table.")
+
+    print("%d errors, %d warnings, %d coverage gaps, %d wire leads"
+          % (len(errors), len(warnings) + len(coarse), len(gaps), len(leads)))
     return 1 if errors else 0
 
 
@@ -298,6 +395,32 @@ def selftest():
               any("AdColony" in c and "ORG-level" in c for c in coarse3), coarse3)
         _, _, coarse4 = check_coverage(refp2, candp2)
         check("single-family org does not warn", not coarse4, coarse4)
+
+        # ---- the wire leg: what DID talk and was not named ----
+        wref = write("wire-ref.tsv", hdr + "\n" + "\t".join(
+            ["known.com", "Known", "exchange", "yes", "yes", "high", "s"]) + "\n")
+        unres = write("unresolved.tsv",
+                      "hostname\tobservations\tdistinct_packages\n"
+                      "sdkapi.dsp-api.ghost.com\t9\t2\n"      # unnamed, above threshold
+                      "api.known.com\t7\t1\n"                 # the table names it now
+                      "one-off.ghost.com\t1\t1\n")            # unnamed, below threshold
+        leads, st = check_wire(wref, unres, 2)
+        check("an unnamed wire host is a lead",
+              any(h == "sdkapi.dsp-api.ghost.com" for h, _, _ in leads), leads)
+        check("a host the table NOW names is not a lead",
+              not any(h == "api.known.com" for h, _, _ in leads), leads)
+        check("suffix match comes from the pipeline's matcher, not a local copy",
+              st["named_since"] == 1, st)
+        check("min-obs suppresses the long tail",
+              not any(h == "one-off.ghost.com" for h, _, _ in leads), leads)
+        leads1, _ = check_wire(wref, unres, 1)
+        check("min-obs=1 keeps the long tail",
+              any(h == "one-off.ghost.com" for h, _, _ in leads1), leads1)
+        check("wire stats count every row, lead or not", st["hosts"] == 3 and st["obs"] == 17, st)
+        # a MISSING artifact must be distinguishable from a clean one — a wire leg that
+        # silently returns [] when the capture was never imported reads as "nothing unnamed".
+        _, st_missing = check_wire(wref, os.path.join(td, "no-such.tsv"), 2)
+        check("a missing unresolved file is not a pass", st_missing is None, st_missing)
 
     print("selftest: %d checks failed" % len(fails))
     return 1 if fails else 0
