@@ -158,6 +158,67 @@ explicitly — drive a foreign-IFA request through the panic path and assert not
 **1c. Gates must be seen red.** Synthetic requests are the whole test surface at this stage, so
 they carry the weight: break the ifa filter and watch the foreign row appear, then restore it.
 
+**1d (OURS, 2026-08-15, operator's second branch) — the decoy becomes a REAL buyer, and that is a
+different machine.** He does not want a receiver that reads and never answers: he wants the bidder
+to **bid, win, and show his own creative to whoever's request arrived**. Everything above was
+written for a bidder whose win is an accident to be capped; here the win is the point. Three
+things change shape, and none of them is a bigger version of 1a:
+
+- **The spend cap stops being a safety net and becomes the budget.** 1a's cap exists so an
+  accidental win cannot cost anything; now it is the monthly ceiling (his: **100 USD/mo**) and it
+  is *expected* to be spent. The alert on the first non-zero win (1a) stays — as a *confirmation*
+  signal rather than an alarm — but the artifact changes: the win counter must now be reconciled
+  against what the exchange bills, and a divergence between our count and their invoice is a
+  defect, not noise.
+- **We do not guess the price.** `bidfloor` («Minimum bid for this impression expressed in CPM»,
+  with `bidfloorcur`, default USD) arrives in every `imp`, and `at` declares the auction type
+  (1 = first price, 2 = second price plus; in a deal, `bidfloor` may be the agreed deal price).
+  What we pay is a function of fields we READ, never of a constant we chose.
+- **We do not guess the deadline either.** See 1e.
+
+**1e (OURS) — TWO timers, and they are not the same timer.** This is the correction that cost the
+most confusion to state:
+
+- **Timer one — the bid.** `tmax` in the BidRequest: «Maximum time in milliseconds the exchange
+  allows for bids to be received **including Internet latency** to avoid timeout. **This value
+  supersedes any a priori guidance from the exchange.**» (IAB OpenRTB 2.5.) So a hardcoded
+  100–120 ms budget is a guess the spec explicitly overrides; read `tmax` per request. And because
+  network latency is INSIDE it, the budget for our own decision is **`tmax` minus RTT** — the
+  point of presence spends the budget before our code runs. Missing it is not a lost impression,
+  it is an *error*: Google states that timeouts and unparseable responses count as errors and that
+  it throttles bidders with high error rates. A slow bidder is punished with less traffic, not
+  with a lost auction.
+- **Timer two — the render, on the device, AFTER the win.** Separate clock, separate budget, and
+  the one that was mis-estimated by two orders of magnitude (a guess of ~500 s; the real budget is
+  **seconds**). If the creative does not render in a couple of seconds the impression is not
+  counted — but **the win is already bought**. That failure mode has a name worth carrying: **a
+  PAID ZERO**. It is strictly worse than losing the auction, and it is invisible in a win counter
+  that only counts wins.
+
+**1f (OURS) — the creative and its hosting; no S3, no CDN.** The section the plan did not have.
+
+- **Serve it ourselves.** A static banner of a few tens of KB, at his budget, is single-digit rps
+  at peak. `nginx` on the same VM as the bidder covers it; the VM already needs public TLS and a
+  static IP for the bidder itself, so this adds a vhost, not infrastructure. An object store is
+  solving a problem this project does not have.
+- **`data:`-URI (base64 in the markup)** removes the fetch entirely — the creative is not hosted
+  anywhere and timer two loses its network leg. Constraints are markup size and whether the
+  platform's moderation accepts it. That goes to the exchange as a QUESTION (letter, q7), never
+  into the plan as an assumption.
+- **Upload-to-them.** Several exchanges require the creative to be uploaded for moderation and
+  serve it from their own CDN, which removes the topic altogether. Also a question, not an
+  assumption — and note it is not free: it makes the creative's delivery host *theirs*, which is
+  the very host our device-side capture reads. A creative served from the exchange's CDN is
+  harder to tell from any other creative on that CDN; one served from our own host is
+  unambiguous on the wire. **The hosting choice is also a measurement choice.**
+- **Yandex moderates creatives manually** and requires compliance with Russian advertising law
+  (primary: its DSP connection docs). So the creative must exist and be stable *before* the first
+  bid, not be raised at the first win. ОРД/`erid` marking rides the same pass — in the creative
+  and in the link.
+- **Video is out**, on his call: cost plus VAST. Static banner only.
+
+Detail and sources: `docs/step3-small-buyer-onboarding-2026-08-15-ru.md`.
+
 ## Step 2 — the questions to the exchange (his list, + one; drafted here, sent by him)
 
 His five stand. Adding a sixth, which decides whether group testing is viable at all:
