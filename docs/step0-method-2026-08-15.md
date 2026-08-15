@@ -121,6 +121,24 @@ inflated Google by a third. That split relies on `grep -oE` returning the leftmo
 alternative, which was verified *on the device* (GNU grep 3.11: 9 + 6, not 15 + 6) before
 anything was built on it.
 
+### A sharper static probe, and the trap in it
+
+The signature scan asks *which SDK families ship*. A second, sharper question can be asked of the
+same DEX for free: **which hostnames are written into the app as literals.** It settled a real
+open question in minutes — an app carrying `com/tapjoy` ×20 turned out to contain **no Tapjoy host
+of either era** (neither `connect.tapjoy.com` from ≤14.1.1 nor `gateway-b.offerwall.unity3d.com`
+from ≥14.2.0), only listener class names: that app references Tapjoy through an adapter, it does
+not ship the SDK. The control ran first — 63 `https://` literals and a dozen real ad hosts in the
+same file — because an empty result from a broken probe and an empty result from a clean app look
+identical.
+
+**The trap:** DEX strings are length-prefixed MUTF-8 with no separator, so a permissive discovery
+regex swallows the preceding bytes and *mints hostnames that do not exist* — this scan produced
+`5com.applovin.com`, `.com.applovin.com`, `9wv.inner-active.mobi`. Harmless when matching a fixed
+list of known hosts (the pattern anchors both ends), fatal for discovery: those strings would have
+entered a reference table as new domains, sourced to "observed on the device". Any literal-mining
+lane must anchor on a known suffix and treat the left edge as garbage until proven otherwise.
+
 ## The shape of Step 0's own verdict: `IN` / `UNKNOWN`, never `NOT`
 
 The oracle his brief designed for segments — `LOSS` is not `NOT IN`, a negative is

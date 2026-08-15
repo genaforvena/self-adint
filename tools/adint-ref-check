@@ -125,6 +125,7 @@ def check_coverage(ref_path, candidates_path):
         ref_orgs.add(norm_org(parts[1]))
 
     dev_orgs = defaultdict(int)
+    dev_families = defaultdict(set)
     with open(candidates_path, encoding="utf-8") as fh:
         for line in fh:
             if line.startswith("#") or line.startswith("bundle\t"):
@@ -133,6 +134,9 @@ def check_coverage(ref_path, candidates_path):
             if len(parts) < 7 or parts[6] != "yes":
                 continue
             dev_orgs[parts[1].strip()] += int(parts[4] or 0)
+            for sdk in parts[3].split(","):
+                if sdk.strip():
+                    dev_families[parts[1].strip()].add(sdk.strip())
 
     gaps = []
     for org, hits in sorted(dev_orgs.items(), key=lambda kv: -kv[1]):
@@ -140,7 +144,22 @@ def check_coverage(ref_path, candidates_path):
         if not any(o in r or r in o for r in ref_orgs):
             gaps.append("%s (%d dex hits on the device, no domain row — its traffic can only "
                         "land in unresolved-hosts.tsv)" % (org, hits))
-    return gaps, len(dev_orgs)
+
+    # The coverage check above is ORG-level, and an org can own several SDK families with
+    # entirely separate domain families. One row for one family then reads as coverage for
+    # all of them: the gate reports no gap while the other family's traffic still lands in
+    # unresolved-hosts.tsv. (Live example: DigitalTurbine owns both Fyber and AdColony; the
+    # table names inner-active/fyber hosts and no adcolony host at all.) Not a defect in the
+    # table -- a limit of what an org-level check can assert, so it is said out loud.
+    coarse = []
+    for org, fams in sorted(dev_families.items()):
+        o = norm_org(org)
+        covered = any(o in r or r in o for r in ref_orgs)
+        if covered and len(fams) > 1:
+            coarse.append("%s is covered ORG-level while the device carries %d SDK "
+                          "families under it (%s) — a domain row for one family reads as "
+                          "coverage for all" % (org, len(fams), ", ".join(sorted(fams))))
+    return gaps, len(dev_orgs), coarse
 
 
 def main():
@@ -160,10 +179,10 @@ def main():
         print("adint-ref-check: %s" % e, file=sys.stderr)
         return 1
 
-    gaps, norgs = check_coverage(args.ref, args.candidates)
+    gaps, norgs, coarse = check_coverage(args.ref, args.candidates)
 
     print("%s: %d rows" % (args.ref, nrows))
-    for w in warnings:
+    for w in warnings + coarse:
         print("  warn  %s" % w)
     for e in errors:
         print("  ERROR %s" % e)
@@ -175,7 +194,8 @@ def main():
     elif norgs:
         print("  coverage: every demand-side org on the device has at least one domain row (%d orgs)"
               % norgs)
-    print("%d errors, %d warnings, %d coverage gaps" % (len(errors), len(warnings), len(gaps)))
+    print("%d errors, %d warnings, %d coverage gaps"
+          % (len(errors), len(warnings) + len(coarse), len(gaps)))
     return 1 if errors else 0
 
 
@@ -250,7 +270,7 @@ def selftest():
             "com.a\tEx\texchange\tX\t100\t1\tyes\n" +
             "com.b\tGhostOrg\texchange\tY\t4242\t1\tyes\n" +
             "com.c\tAppsFlyer\tattribution\tZ\t900\t1\tno\n")
-        gaps, norgs = check_coverage(refp, candp)
+        gaps, norgs, coarse = check_coverage(refp, candp)
         check("known org is not a gap", not any("Ex (" in g for g in gaps), gaps)
         check("unnameable org is named", any("GhostOrg" in g for g in gaps), gaps)
         check("gap carries its weight", any("4242" in g for g in gaps), gaps)
@@ -264,8 +284,20 @@ def selftest():
         candp2 = write("cands2.tsv", "\t".join(
             ["bundle", "org", "role", "sdks", "signature_hits", "distinct_signatures",
              "demand_side"]) + "\n" + "com.a\tDigitalTurbine\texchange\tX\t1894\t1\tyes\n")
-        gaps2, _ = check_coverage(refp2, candp2)
+        gaps2, _, _ = check_coverage(refp2, candp2)
         check("org spelling differences do not fabricate a gap", not gaps2, gaps2)
+
+        # an org owning several SDK families is covered only coarsely — say so
+        candp3 = write("cands3.tsv", "\t".join(
+            ["bundle", "org", "role", "sdks", "signature_hits", "distinct_signatures",
+             "demand_side"]) + "\n" +
+            "com.a\tDigital Turbine (Fyber/Inneractive)\texchange\tFyber\t900\t1\tyes\n" +
+            "com.b\tDigital Turbine (Fyber/Inneractive)\texchange\tAdColony\t400\t1\tyes\n")
+        _, _, coarse3 = check_coverage(refp2, candp3)
+        check("multi-family org warns that coverage is coarse",
+              any("AdColony" in c and "ORG-level" in c for c in coarse3), coarse3)
+        _, _, coarse4 = check_coverage(refp2, candp2)
+        check("single-family org does not warn", not coarse4, coarse4)
 
     print("selftest: %d checks failed" % len(fails))
     return 1 if fails else 0
