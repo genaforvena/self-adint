@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""adint-bid-capture — put the bid request the PHONE made on disk, byte for byte.
+
+    tools/adint-bid-capture --listen 0.0.0.0:8000 --upstream 127.0.0.1:8001 \\
+        --out data/bidreq [--device <GAID> | --any-device] [--allow 192.168.8.0/24]
+
+Sits in front of a local Prebid Server. Every POST is written to disk EXACTLY as it arrived
+and then forwarded unchanged; the response is written too. Prebid Server itself is never
+patched — a patched binary claiming to log its own input is a claim about our patch, not about
+the phone.
+
+Why the raw bytes matter more than a parsed copy
+------------------------------------------------
+A convincing OpenRTB request can be hand-written in half an hour, and it proves nothing: the
+whole point of this step is that the SDK — not us — describes the device. So this tool must
+make a forged capture impossible to confuse with a real one:
+
+  * The body is stored VERBATIM. It is never parsed-then-reserialised, because a re-serialised
+    document is a document WE wrote. The sha256 of the stored file is the sha256 of what
+    arrived on the socket.
+  * Every capture carries its PEER ADDRESS in a sidecar. A capture whose peer is 127.0.0.1 was
+    made by whoever is on this host — that is us — and the summary says so out loud. "The
+    phone sent it" is then checkable from the artifact instead of asserted in a commit message.
+  * `--test` writes to a temporary directory and NEVER to the capture directory. A self-test
+    that writes into the log a human reads for evidence forges the very thing it checks.
+
+Privacy (CLAUDE.md rules 1 and 2)
+---------------------------------
+`device.ifa` in a stored request is the point of the exercise, but only for HIS device. With
+`--device <GAID>` a request carrying any other ifa is refused before the body reaches disk —
+dropped in the handler, counted as a bare integer, never written, never logged with its value.
+`--any-device` is the bootstrap mode for the first run, when his GAID is not yet known; it
+prints a standing warning, because it is the mode in which a foreign request COULD land on
+disk if anything but his phone reached the port. The port is LAN-only either way and
+`--allow` narrows it further.
+
+Bootstrap note: the first successful capture is what YIELDS the GAID (it is inside the
+request), which is the input the data-subject letters are blocked on. So the honest order is
+`--any-device` once, read the ifa, then pin `--device` for everything after.
+"""
+
+import argparse
+import hashlib
+import http.server
+import ipaddress
+import json
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+STATE = {
+    "out": None, "upstream": None, "device": None, "any_device": False,
+    "allow": [], "n": 0, "foreign_dropped": 0, "peers": {}, "quiet": False,
+}
+
+
+def extract_ifa(body):
+    """Read device.ifa without keeping the parse. Returns None if absent/unparseable.
+
+    The parsed object is discarded here on purpose: it exists only to answer the
+    is-this-his-device question, and nothing derived from it is written anywhere."""
+    try:
+        doc = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    dev = doc.get("device")
+    if not isinstance(dev, dict):
+        return None
+    ifa = dev.get("ifa")
+    return ifa if isinstance(ifa, str) and ifa else None
+
+
+def peer_allowed(addr, allow):
+    if not allow:
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in allow)
+
+
+def store(out_dir, body, meta):
+    """Write the body verbatim plus a sidecar. Returns the request file path."""
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = meta["received"].replace(":", "").replace("-", "")
+    base = "%s-%s" % (stamp, meta["sha256"][:8])
+    req_path = os.path.join(out_dir, base + ".request.json")
+    with open(req_path, "wb") as fh:
+        fh.write(body)
+    with open(os.path.join(out_dir, base + ".meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2, sort_keys=True)
+    return req_path
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        if not STATE["quiet"]:
+            sys.stderr.write("%s %s\n" % (self.client_address[0], fmt % args))
+
+    def do_POST(self):
+        peer = self.client_address[0]
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+
+        if not peer_allowed(peer, STATE["allow"]):
+            self.send_error(403, "peer not allowed")
+            return
+
+        # --- privacy gate, BEFORE anything reaches disk -------------------------
+        if not STATE["any_device"]:
+            ifa = extract_ifa(body)
+            if ifa != STATE["device"]:
+                STATE["foreign_dropped"] += 1      # a bare integer; no ifa, no peer, no body
+                self.send_error(403, "device not in scope")
+                return
+
+        meta = {
+            "received": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+            "peer": peer,
+            "peer_is_localhost": peer in ("127.0.0.1", "::1"),
+            "path": self.path,
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "headers": {k: v for k, v in self.headers.items()},
+            "device_gate": "any-device" if STATE["any_device"] else "pinned",
+        }
+        req_path = store(STATE["out"], body, meta)
+        STATE["n"] += 1
+        STATE["peers"][peer] = STATE["peers"].get(peer, 0) + 1
+
+        # --- forward unchanged --------------------------------------------------
+        url = "http://%s%s" % (STATE["upstream"], self.path)
+        fwd = urllib.request.Request(url, data=body, method="POST")
+        for k, v in self.headers.items():
+            if k.lower() not in ("host", "content-length", "connection"):
+                fwd.add_header(k, v)
+        try:
+            with urllib.request.urlopen(fwd, timeout=10) as resp:
+                payload, status = resp.read(), resp.status
+        except urllib.error.HTTPError as e:
+            payload, status = e.read(), e.code
+        except (urllib.error.URLError, socket.timeout) as e:
+            # An upstream that is down must be LOUD: the request is already on disk,
+            # and a silent 200 here would read as a working auction.
+            payload = json.dumps({"adint_error": "upstream unreachable: %s" % e}).encode()
+            status = 502
+
+        with open(req_path.replace(".request.json", ".response.json"), "wb") as fh:
+            fh.write(payload)
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        if self.path != "/status":
+            self.send_error(404)
+            return
+        body = json.dumps({
+            "captured": STATE["n"], "foreign_dropped": STATE["foreign_dropped"],
+            "peers": STATE["peers"], "out": STATE["out"],
+            "device_gate": "any-device" if STATE["any_device"] else "pinned",
+        }, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--listen", default="0.0.0.0:8000")
+    ap.add_argument("--upstream", default="127.0.0.1:8001")
+    ap.add_argument("--out", default=os.path.join(ROOT, "data", "bidreq"))
+    ap.add_argument("--device", default=None, help="his GAID; requests with any other ifa are refused")
+    ap.add_argument("--any-device", action="store_true",
+                    help="bootstrap only — accept any ifa (his GAID is not yet known)")
+    ap.add_argument("--allow", action="append", default=[],
+                    help="CIDR the peer must be in; repeatable")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    if not args.device and not args.any_device:
+        print("adint-bid-capture: pass --device <GAID>, or --any-device to bootstrap.\n"
+              "  Refusing to run ungated by accident: an unpinned port on the LAN can put a\n"
+              "  foreign device's ifa on disk, which rule 1 forbids.", file=sys.stderr)
+        return 2
+
+    STATE["out"] = args.out
+    STATE["upstream"] = args.upstream
+    STATE["device"] = args.device
+    STATE["any_device"] = args.any_device
+    STATE["allow"] = [ipaddress.ip_network(c) for c in args.allow]
+
+    host, port = args.listen.rsplit(":", 1)
+    srv = http.server.ThreadingHTTPServer((host, int(port)), Handler)
+    print("adint-bid-capture on %s -> %s, writing %s" % (args.listen, args.upstream, args.out))
+    if args.any_device:
+        print("  WARNING: --any-device. Any ifa reaching this port lands on disk. Pin --device\n"
+              "  as soon as the first capture reveals his GAID.")
+    print("  status: curl http://127.0.0.1:%s/status" % port)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    print("\ncaptured=%d foreign_dropped=%d peers=%s"
+          % (STATE["n"], STATE["foreign_dropped"], STATE["peers"]))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    real = b'{"id":"a1","app":{"bundle":"com.x"},"device":{"ifa":"HIS-GAID","ua":"Dalvik"}}'
+    other = b'{"id":"a2","app":{"bundle":"com.x"},"device":{"ifa":"SOMEONE-ELSE"}}'
+
+    check("ifa is read out of a real-shaped body", extract_ifa(real) == "HIS-GAID",
+          extract_ifa(real))
+    check("a body with no device yields None", extract_ifa(b'{"id":"a"}') is None)
+    check("unparseable body yields None, never a crash", extract_ifa(b'not json') is None)
+
+    with tempfile.TemporaryDirectory() as td:
+        meta = {"received": "2026-08-15T10:00:00Z", "peer": "192.168.8.7",
+                "sha256": hashlib.sha256(real).hexdigest()}
+        p = store(td, real, meta)
+        with open(p, "rb") as fh:
+            stored = fh.read()
+        check("the body is stored BYTE FOR BYTE, not re-serialised", stored == real, stored)
+        check("sha256 in the sidecar is the sha256 of the stored bytes",
+              hashlib.sha256(stored).hexdigest() == meta["sha256"])
+        side = json.load(open(p.replace(".request.json", ".meta.json"), encoding="utf-8"))
+        check("the peer address is recorded beside the capture",
+              side["peer"] == "192.168.8.7", side)
+
+        # the gate, exercised as the handler exercises it
+        STATE["device"], STATE["any_device"] = "HIS-GAID", False
+        check("his device passes the gate", extract_ifa(real) == STATE["device"])
+        check("a foreign ifa does NOT pass the gate", extract_ifa(other) != STATE["device"])
+        check("a body with no ifa does NOT pass a pinned gate",
+              extract_ifa(b'{"id":"a"}') != STATE["device"])
+        STATE["any_device"] = True
+        check("--any-device is the only mode that accepts an unknown ifa",
+              STATE["any_device"] is True)
+        STATE["any_device"] = False
+
+        # peer allowlist
+        nets = [ipaddress.ip_network("192.168.8.0/24")]
+        check("a peer inside the allowed CIDR passes", peer_allowed("192.168.8.7", nets))
+        check("a peer outside it does not", not peer_allowed("10.0.0.5", nets))
+        check("no allowlist means no restriction", peer_allowed("10.0.0.5", []))
+        check("a non-address peer is refused, not crashed",
+              not peer_allowed("garbage", nets))
+
+        # ---- drive the REAL handler over a REAL socket ------------------------
+        # Everything above hands store() a meta dict the test itself built, which asserts the
+        # fixture and not the code: two mutations (sha256 over the wrong bytes, peer dropped
+        # from the sidecar) passed green against it. The sidecar is BUILT in do_POST, so
+        # do_POST is what has to run.
+        upstream_hits = []
+
+        class Stub(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                upstream_hits.append(self.rfile.read(n))
+                out = b'{"seatbid":[]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        up = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+
+        live = os.path.join(td, "live")
+        STATE.update({"out": live, "upstream": "127.0.0.1:%d" % up.server_address[1],
+                      "device": "HIS-GAID", "any_device": False, "allow": [],
+                      "n": 0, "foreign_dropped": 0, "peers": {}, "quiet": True})
+        prox = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=prox.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % prox.server_address[1]
+
+        def post(payload):
+            req = urllib.request.Request(base + "/openrtb2/auction", data=payload,
+                                         method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        status, _ = post(real)
+        check("a request from his device is accepted end to end", status == 200, status)
+        check("the body reached the upstream UNCHANGED",
+              upstream_hits and upstream_hits[-1] == real, upstream_hits)
+
+        reqs = sorted(f for f in os.listdir(live) if f.endswith(".request.json"))
+        check("the live handler wrote exactly one capture", len(reqs) == 1, reqs)
+        with open(os.path.join(live, reqs[0]), "rb") as fh:
+            landed = fh.read()
+        check("the LIVE path stores the body byte for byte", landed == real, landed)
+        live_meta = json.load(open(os.path.join(live, reqs[0].replace(".request", ".meta")),
+                                   encoding="utf-8"))
+        check("the LIVE sidecar's sha256 is the sha256 of the stored bytes",
+              live_meta["sha256"] == hashlib.sha256(landed).hexdigest(), live_meta["sha256"])
+        check("the LIVE sidecar records the real peer address",
+              live_meta["peer"] == "127.0.0.1", live_meta.get("peer"))
+        check("a capture made from this host is FLAGGED as localhost",
+              live_meta["peer_is_localhost"] is True, live_meta)
+        check("the response is stored beside the request",
+              os.path.exists(os.path.join(live, reqs[0].replace(".request", ".response"))))
+
+        before = len(os.listdir(live))
+        status, _ = post(other)
+        check("a foreign device is refused over the wire", status == 403, status)
+        check("and NOTHING of it reached disk", len(os.listdir(live)) == before,
+              os.listdir(live))
+        check("the foreign drop is counted as a bare integer",
+              STATE["foreign_dropped"] == 1, STATE["foreign_dropped"])
+
+        prox.shutdown()
+        up.shutdown()
+
+    check("the self-test wrote nothing into the capture directory",
+          not os.path.exists(os.path.join(ROOT, "data", "bidreq")) or
+          not any(f.endswith(".request.json") and "HIS-GAID" in open(
+              os.path.join(ROOT, "data", "bidreq", f), encoding="utf-8", errors="ignore").read()
+              for f in os.listdir(os.path.join(ROOT, "data", "bidreq"))))
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
