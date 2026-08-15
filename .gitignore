@@ -3,3 +3,9 @@
 *.pcap
 .env
 data/
+
+# Android build output — the APK is a build product, not a source artifact
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

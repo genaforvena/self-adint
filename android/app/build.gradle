@@ -1,0 +1,31 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'net.selfadint.probe'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "net.selfadint.probe"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "0.1"
+        // The Prebid Server host is baked in at build time so the APK carries no UI and no
+        // stored state: what it talks to is auditable by reading this file, not by trusting
+        // a screenshot of a settings screen.
+        buildConfigField "String", "PBS_HOST", "\"${project.findProperty('pbsHost') ?: 'http://192.168.8.224:8000/openrtb2/auction'}\""
+    }
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'org.prebid:prebid-mobile-sdk:2.2.3'
+    // Supplies AdvertisingIdClient. WITHOUT it the SDK cannot read the GAID and device.ifa
+    // comes out empty — which would look exactly like a phone that refused to share it.
+    implementation 'com.google.android.gms:play-services-ads-identifier:18.0.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+}

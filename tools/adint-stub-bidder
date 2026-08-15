@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""adint-stub-bidder — a local no-bid endpoint, so the local run leaks NOTHING outward.
+
+    tools/adint-stub-bidder --listen 127.0.0.1:8002 [--out data/bidreq-outbound]
+
+Prebid Server refuses an auction with no bidder configured, and every real adapter's endpoint
+points at a live exchange. Pointing a local test at one of those would post his device — ifa
+included — to a company we have no account with and no agreement from him to contact. That is
+the outward step this stage explicitly does not take (SSP onboarding is a separate, gated
+step), so the configured adapter's endpoint is overridden to point here instead.
+
+What it does: answers 204 (no bid), and optionally records what Prebid Server WOULD have sent
+outward. That second artifact is the interesting one — it is the request as the SERVER
+composes it for a buyer, which differs from what the SDK sent, and comparing the two shows
+exactly what the server adds, drops and rewrites on the way.
+
+It binds to 127.0.0.1 by default and refuses a non-loopback bind without --i-know: a stub that
+answers 204 to the open LAN is a thing that quietly absorbs real auctions.
+"""
+
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+STATE = {"out": None, "n": 0}
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def bind_allowed(host, i_know):
+    """A no-bid stub reachable from the LAN silently absorbs real auctions."""
+    return host in LOOPBACK or bool(i_know)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        STATE["n"] += 1
+        if STATE["out"]:
+            os.makedirs(STATE["out"], exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            name = "%s-%s.outbound.json" % (stamp, hashlib.sha256(body).hexdigest()[:8])
+            with open(os.path.join(STATE["out"], name), "wb") as fh:
+                fh.write(body)          # verbatim, same rule as the inbound capture
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--listen", default="127.0.0.1:8002")
+    ap.add_argument("--out", default=os.path.join(ROOT, "data", "bidreq-outbound"))
+    ap.add_argument("--i-know", action="store_true", help="allow a non-loopback bind")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    host, port = args.listen.rsplit(":", 1)
+    if not bind_allowed(host, args.i_know):
+        print("adint-stub-bidder: refusing to bind %s. A no-bid stub reachable from the LAN\n"
+              "  silently absorbs real auctions. Pass --i-know if that is truly intended."
+              % host, file=sys.stderr)
+        return 2
+
+    STATE["out"] = args.out
+    srv = http.server.ThreadingHTTPServer((host, int(port)), Handler)
+    print("adint-stub-bidder on %s (204 no-bid), recording outbound to %s" % (args.listen, args.out))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    print("\nsaw %d outbound request(s)" % STATE["n"])
+    return 0
+
+
+def selftest():
+    import tempfile
+    import threading
+    import urllib.request
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        STATE["out"], STATE["n"] = td, 0
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = "http://127.0.0.1:%d/x" % srv.server_address[1]
+        body = b'{"id":"srv-composed","device":{"ifa":"HIS-GAID"}}'
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+        check("the stub answers 204 no-bid", status == 204, status)
+        files = os.listdir(td)
+        check("the outbound request is recorded", len(files) == 1, files)
+        with open(os.path.join(td, files[0]), "rb") as fh:
+            check("recorded byte for byte, same rule as inbound", fh.read() == body)
+        srv.shutdown()
+
+    # Exercise the guard, never the source text. Grepping this file for "refusing to bind"
+    # would assert the string is present, not that the code refuses.
+    check("loopback binds are allowed", bind_allowed("127.0.0.1", False))
+    check("a non-loopback bind is refused by default", not bind_allowed("0.0.0.0", False))
+    check("--i-know is the ONLY thing that permits it", bind_allowed("0.0.0.0", True))
+    # ...and end to end through main(), which must return 2 WITHOUT ever binding.
+    # Only the refusing path is driven here: the permitted path would call serve_forever()
+    # and hang the test — a self-test that starts a server is a self-test that never ends.
+    argv, err = sys.argv[:], sys.stderr
+    try:
+        sys.argv = ["adint-stub-bidder", "--listen", "0.0.0.0:0"]
+        sys.stderr = open(os.devnull, "w")
+        rc_open = main()
+    finally:
+        sys.stderr.close()
+        sys.argv, sys.stderr = argv, err
+    check("main() refuses it with exit 2 and never reaches serve_forever", rc_open == 2, rc_open)
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
