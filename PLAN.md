@@ -31,6 +31,33 @@ guess, and it is a guess that can be turned into a measurement for free.
 **Artifact:** a `bundle → exchange` table with observed request counts, on disk, plus the list of
 exchanges ranked by how much of *his* traffic they carry. Not "app X uses ads" — a table.
 
+**Correction 0a (OURS, 2026-08-15, after the domain research).** Read literally, that artifact
+cannot be built from the wire, and calling it `bundle → exchange` overstates what any hostname
+observation can prove. **Mediation is not an exchange.** A request seen going to an AppLovin MAX
+or an AdMob host may be sold by that org's own exchange, by AdX, by a third-party Open Bidding
+exchange, or by a mediated network with no auction at all — *the wire looks identical in every
+case.* What the capture yields is honestly a **`bundle → demand-stack entry point`** table: which
+orgs' SDKs actually carry his impressions, ranked by observation count. That is enough to decide
+which exchange to approach — the decision Step 0 exists for — and it is not sale volume. It must
+never be reported as sale volume.
+
+**Correction 0b (OURS).** Two structural facts the research settled, both of which shape every
+step after this one:
+
+- The orgs most likely to carry his traffic (Google, Meta) are exactly the ones that will not
+  sell him a seat: Google's Authorized Buyers requires buying *"on behalf of multiple
+  advertisers"*, which disqualifies a self-directed seat as written; Meta, Pangle and Criteo are
+  closed too. The orgs that *are* open — Yandex, VK, Digital Turbine, Smaato/Verve, AppLovin,
+  Unity/ironSource, Vungle/Liftoff, InMobi, Chartboost, PubMatic — are plausibly significant on a
+  Russian device, but "plausibly" is a hypothesis about **his** phone until the capture ranks real
+  hostnames. Yandex publishes a DSP→SSP intake with a named address and a contract template, and
+  is the strongest candidate on jurisdiction and latency both.
+- Some demand paths are **invisible to a capture by construction** and have to be closed from a
+  second vantage or declared blind: Smaato fetches configuration over DNS with no TLS connection
+  (so a connection log never sees it — it needs a DNS log beside it), and Meta multiplexes ad
+  requests over `graph.facebook.com`, separable only by URL path and therefore never from a router
+  flow log. A method that cannot see a demand path must say so; the org is `UNKNOWN`, not absent.
+
 **What it decides:** which exchange to approach at all, and whether question 4 below (point of
 presence) even has an acceptable answer. If no reachable exchange carries his traffic, the project
 stops here having cost nothing.
