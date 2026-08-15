@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""adint-dsar-evidence — turn the capture into per-recipient EVIDENCE rows.
+
+    tools/adint-dsar-evidence [--in data/connections-*.csv ...] [--min-bytes N] [--tsv OUT]
+
+A data-subject request is answerable with "we hold nothing about you" for as long as it is
+blind. This tool makes it addressed: for every organisation the reference table can name, it
+prints the hostnames its infrastructure was contacted on, the FIRST and LAST contact, how many
+bytes the device SENT and RECEIVED, and which app on the device did it. That block is the same
+in every jurisdiction — it is fact, not law — so it is built now and the letter waits for the
+jurisdiction to be known.
+
+Refusing an addressed request costs more than refusing a blind one, and a refusal is itself a
+measurement: an organisation that states it holds nothing, against an observed exchange with
+its own hosts, has said something checkable.
+
+Three instruments, each of which cost something to learn:
+
+  * CAPTURES OVERLAP. PCAPdroid's export is cumulative — the 17:39 file contains the rows of
+    the 16:46 file. Globbing four captures and summing them triples the evidence and would put
+    a fabricated byte count into a legal document. Rows are deduplicated on the connection
+    identity (uid, ports, destination, first-seen) and the number of duplicates dropped is
+    REPORTED, so the overlap is visible rather than silently corrected.
+
+  * BYTES SENT ARE THE CLAIM, bytes received are the answer. For "you received data from my
+    device" the outbound number is the one that matters; the inbound number is what came back
+    (a creative, a config). Both are printed, never summed into one figure.
+
+  * A CDN ROW IS NOT A COLLECTION CLAIM. A creative delivered from an org's CDN says its
+    infrastructure served bytes TO the device; it is much weaker evidence of processing
+    personal data than a request host the device posted to. Roles are printed, and delivery
+    rows are grouped apart, so the letter cannot silently claim the strong thing from the weak
+    row.
+
+The org names come from ref/exchange-domains.tsv through the SAME resolver the pipeline uses
+(imported, never re-implemented). A host the table cannot name is reported in its own section:
+unnameable is not absent, and an unnamed host with real bytes is exactly the address that is
+missing from the list of recipients.
+"""
+
+import argparse
+import csv
+import glob
+import importlib.machinery
+import importlib.util
+import os
+import sys
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+DEMAND_ROLES = {"exchange", "dsp", "ssp", "mediation"}
+TRACKING_ROLES = {"attribution", "analytics"}
+DELIVERY_ROLES = {"cdn"}
+
+
+def _matcher():
+    """load_ref/resolve from adint-aggregate — one resolver for gate, pipeline and this."""
+    path = os.path.join(HERE, "adint-aggregate")
+    spec = importlib.util.spec_from_loader(
+        "adint_aggregate", importlib.machinery.SourceFileLoader("adint_aggregate", path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.load_ref, mod.resolve
+
+
+def conn_key(row):
+    """Identity of a single connection, stable across cumulative exports."""
+    return (row.get("UID", ""), row.get("SrcPort", ""), row.get("DstIp", ""),
+            row.get("DstPort", ""), row.get("FirstSeen", ""))
+
+
+def collect(paths, table, resolve):
+    """Returns (orgs, unnamed, stats). Rows are deduplicated across overlapping exports."""
+    seen = set()
+    orgs = defaultdict(lambda: defaultdict(lambda: {
+        "n": 0, "sent": 0, "rcvd": 0, "first": None, "last": None, "pkgs": set()}))
+    unnamed = defaultdict(lambda: {"n": 0, "sent": 0, "rcvd": 0, "pkgs": set()})
+    roles = {}
+    stats = {"rows": 0, "dup": 0, "nohost": 0, "files": len(paths)}
+
+    for path in paths:
+        with open(path, encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                stats["rows"] += 1
+                key = conn_key(row)
+                if key in seen:
+                    stats["dup"] += 1
+                    continue
+                seen.add(key)
+                host = (row.get("Info") or "").strip().lower()
+                if not host:
+                    stats["nohost"] += 1
+                    continue
+                try:
+                    sent = int(row.get("BytesSent") or 0)
+                    rcvd = int(row.get("BytesRcvd") or 0)
+                except ValueError:
+                    sent = rcvd = 0
+                pkg = (row.get("PackageName") or "").strip()
+                ref = resolve(host, table)
+                if ref is None:
+                    u = unnamed[host]
+                    u["n"] += 1
+                    u["sent"] += sent
+                    u["rcvd"] += rcvd
+                    u["pkgs"].add(pkg)
+                    continue
+                org = ref["org"]
+                roles.setdefault((org, host), ref["role"])
+                cell = orgs[org][host]
+                cell["n"] += 1
+                cell["sent"] += sent
+                cell["rcvd"] += rcvd
+                cell["pkgs"].add(pkg)
+                fs, ls = row.get("FirstSeen", ""), row.get("LastSeen", "")
+                if fs and (cell["first"] is None or fs < cell["first"]):
+                    cell["first"] = fs
+                if ls and (cell["last"] is None or ls > cell["last"]):
+                    cell["last"] = ls
+    return orgs, unnamed, roles, stats
+
+
+def org_weight(hosts):
+    return sum(h["sent"] for h in hosts.values())
+
+
+def render(orgs, unnamed, roles, stats, min_bytes, out):
+    print("evidence from %d capture file(s): %d rows read, %d duplicate rows dropped "
+          "(exports overlap), %d rows with no hostname"
+          % (stats["files"], stats["rows"], stats["dup"], stats["nohost"]))
+    print()
+
+    for label, wanted in (("DEMAND-SIDE (exchange / DSP / SSP / mediation)", DEMAND_ROLES),
+                          ("TRACKING (attribution / analytics)", TRACKING_ROLES),
+                          ("DELIVERY ONLY (cdn) — weaker evidence, do not claim collection",
+                           DELIVERY_ROLES),
+                          ("ROLE NOT ESTABLISHED", None)):
+        block = {}
+        for org, hosts in orgs.items():
+            keep = {h: c for h, c in hosts.items()
+                    if (roles.get((org, h)) in wanted if wanted
+                        else roles.get((org, h)) not in
+                        DEMAND_ROLES | TRACKING_ROLES | DELIVERY_ROLES)}
+            if keep:
+                block[org] = keep
+        if not block:
+            continue
+        print("== %s ==" % label)
+        for org in sorted(block, key=lambda o: -org_weight(block[o])):
+            print("  %s" % org)
+            for host in sorted(block[org], key=lambda h: -block[org][h]["sent"]):
+                c = block[org][host]
+                print("    %-46s conn=%-4d sent=%-9d rcvd=%-9d %s .. %s"
+                      % (host, c["n"], c["sent"], c["rcvd"],
+                         (c["first"] or "?")[:19], (c["last"] or "?")[:19]))
+                print("      apps: %s" % ", ".join(sorted(p for p in c["pkgs"] if p)))
+        print()
+
+    big = {h: c for h, c in unnamed.items() if c["sent"] >= min_bytes}
+    print("== HOSTS THE TABLE CANNOT NAME (>= %d bytes sent) ==" % min_bytes)
+    print("   unnameable is not absent — an unnamed host with real bytes is a MISSING recipient")
+    for host in sorted(big, key=lambda h: -big[h]["sent"])[:40]:
+        c = big[host]
+        print("    %-46s conn=%-4d sent=%-9d rcvd=%-9d %s"
+              % (host, c["n"], c["sent"], c["rcvd"],
+                 ", ".join(sorted(p for p in c["pkgs"] if p))))
+    print("   (%d of %d unnamed hosts above the threshold)" % (len(big), len(unnamed)))
+
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write("org\trole\thostname\tconnections\tbytes_sent\tbytes_received"
+                     "\tfirst_seen\tlast_seen\tsource_packages\n")
+            for org in sorted(orgs):
+                for host in sorted(orgs[org]):
+                    c = orgs[org][host]
+                    fh.write("\t".join([
+                        org, roles.get((org, host), "unknown"), host, str(c["n"]),
+                        str(c["sent"]), str(c["rcvd"]), c["first"] or "", c["last"] or "",
+                        ",".join(sorted(p for p in c["pkgs"] if p))]) + "\n")
+        print("\nwrote %s" % out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--in", dest="infiles", nargs="*", default=None)
+    ap.add_argument("--ref", default=os.path.join(ROOT, "ref", "exchange-domains.tsv"))
+    ap.add_argument("--min-bytes", type=int, default=1000)
+    ap.add_argument("--tsv", default=None)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    paths = args.infiles or sorted(glob.glob(os.path.join(ROOT, "data", "connections-*.csv")))
+    if not paths:
+        print("adint-dsar-evidence: no capture files", file=sys.stderr)
+        return 1
+    load_ref, resolve = _matcher()
+    table = load_ref(args.ref)
+    orgs, unnamed, roles, stats = collect(paths, table, resolve)
+    render(orgs, unnamed, roles, stats, args.min_bytes, args.tsv)
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    hdr = ("IPProto,SrcIP,SrcPort,DstIp,DstPort,UID,App,PackageName,Proto,Status,Info,"
+           "BytesSent,BytesRcvd,PktsSent,PktsRcvd,FirstSeen,LastSeen")
+
+    def row(port, host, sent, rcvd, first, last, pkg="com.a", uid="100"):
+        return ("6,10.0.0.1,%s,1.2.3.4,443,%s,App,%s,TLS,Closed,%s,%d,%d,1,1,%s,%s"
+                % (port, uid, pkg, host, sent, rcvd, first, last))
+
+    with tempfile.TemporaryDirectory() as td:
+        def write(name, lines):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("\n".join([hdr] + lines) + "\n")
+            return p
+
+        refp = os.path.join(td, "ref.tsv")
+        with open(refp, "w", encoding="utf-8") as fh:
+            fh.write("domain_pattern\torg\trole\trtb_exchange\texternal_seat\tconfidence\tsource\n")
+            fh.write("known.com\tKnownOrg\texchange\tyes\tyes\thigh\ts\n")
+            fh.write("cdn.example\tKnownOrg\tcdn\tno\tno\thigh\ts\n")
+
+        load_ref, resolve = _matcher()
+        table = load_ref(refp)
+
+        early = write("early.csv", [
+            row("1001", "api.known.com", 500, 900, "2026-08-15T10:00:00", "2026-08-15T10:00:05"),
+        ])
+        # cumulative export: repeats the earlier connection verbatim and adds two more
+        late = write("late.csv", [
+            row("1001", "api.known.com", 500, 900, "2026-08-15T10:00:00", "2026-08-15T10:00:05"),
+            row("1002", "api.known.com", 700, 100, "2026-08-15T11:00:00", "2026-08-15T11:00:09"),
+            row("1003", "img.cdn.example", 60, 50000, "2026-08-15T11:00:02", "2026-08-15T11:00:08"),
+            row("1004", "ghost.example.net", 4000, 10, "2026-08-15T11:00:03", "2026-08-15T11:00:04"),
+        ])
+
+        orgs, unnamed, roles, stats = collect([early, late], table, resolve)
+        cell = orgs["KnownOrg"]["api.known.com"]
+
+        check("overlapping exports are deduplicated, not summed",
+              cell["sent"] == 1200 and cell["n"] == 2, cell)
+        check("the dropped duplicates are reported, not hidden", stats["dup"] == 1, stats)
+        check("first_seen is the EARLIEST across files",
+              cell["first"] == "2026-08-15T10:00:00", cell["first"])
+        check("last_seen is the LATEST across files",
+              cell["last"] == "2026-08-15T11:00:09", cell["last"])
+        check("sent and received are kept apart",
+              cell["rcvd"] == 1000 and cell["sent"] == 1200, cell)
+        check("a cdn host keeps its own role, not the org's strongest",
+              roles[("KnownOrg", "img.cdn.example")] == "cdn", roles)
+        check("an unnameable host with real bytes is surfaced as a missing recipient",
+              unnamed["ghost.example.net"]["sent"] == 4000, dict(unnamed))
+        check("a named host never lands in the unnamed bucket",
+              "api.known.com" not in unnamed, list(unnamed))
+
+        # a capture with no hostname column value must not silently vanish
+        blind = write("blind.csv", [
+            row("1005", "", 10, 10, "2026-08-15T12:00:00", "2026-08-15T12:00:01")])
+        _, _, _, st2 = collect([blind], table, resolve)
+        check("rows with no hostname are counted, not dropped in silence",
+              st2["nohost"] == 1, st2)
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

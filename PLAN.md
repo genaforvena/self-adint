@@ -182,6 +182,56 @@ into the plan as an assumption.
 exactly what lands in a Prebid Server log — whether `device.ifa` is present for in-app, and what
 is legible in the responses. Primary sources only.
 
+## Step 0D — him as the DATA SUBJECT (OURS, 2026-08-15; PROPOSED, blocked on jurisdiction)
+
+His observation, and it reframes the whole project: **watching is available to whoever has money
+AND admission, and the binding barrier is admission, not money.** Every entrance above tries to
+buy or emit its way past that barrier. This one goes around it by **changing role** — as a data
+subject he is *entitled* to demand his own data, and no seat, deposit or legal entity gates that
+right.
+
+**And it is the only entrance that yields the segment NAMES officially.** Compare what each
+actually returns:
+
+| entrance | what it yields | what it cannot yield | gate |
+|---|---|---|---|
+| **Seat** (the plan) | the live bid request as the BUYER sees it, `user.data` included | — | admission + money |
+| **0S supply side** | his own outgoing request, the bids, prices, creatives | the `user.data` segment names — they exist only in the demand-side copy | his go |
+| **q3 forecast** | an aggregate model estimate | any fact about *him*; it answers about a population | partner login; **demoted by him** |
+| **0D data subject** | the profile itself, segment names included, on the record | anything about the auction — prices, bids, who bought | jurisdiction; the company's willingness |
+
+So it is not a substitute for the seat either: the DSAR gives the *profile* and the seat gives the
+*auction*. Different halves of the same question.
+
+**The lever nobody normally has: the 17:39 capture turns a blind request into an addressed one.**
+The usual DSAR is "do you hold anything on me", which is cheap to deflect. Ours can be *"your host
+`<h>` exchanged `<n>` bytes with my device between `<t1>` and `<t2>`, from application `<pkg>`;
+here is the identifier; produce the profile."* Deflecting that is expensive. **And a refusal is
+itself a measurement** — an organisation that states it holds nothing about him, against an
+observed exchange with its own hosts, has made a checkable claim.
+
+**Evidence is built; letters are not.** `tools/adint-dsar-evidence` renders the per-recipient
+block — hostnames, first and last contact, bytes sent and received, source app — from the
+captures on disk. That block is identical under either legal regime, so it is jurisdiction-free
+work and it is done. Its own instruments are worth naming, because two of them nearly put a
+fabricated number into a legal document:
+
+- **The exports OVERLAP.** PCAPdroid's CSV is cumulative — the 17:39 file contains the 16:46
+  file's rows. On the real corpus, 2 134 of 4 617 rows were duplicates: summing four captures
+  would have roughly doubled every byte count in a document meant to be exact. Rows are
+  deduplicated on connection identity and the dropped count is printed.
+- **Bytes SENT are the claim; bytes received are the answer.** "Your host received data from my
+  device" rests on the outbound figure. They are never summed into one number.
+- **A CDN row is not a collection claim.** Delivery hosts are grouped apart, so the letter cannot
+  silently claim the strong thing (they processed my data) from the weak row (their CDN served me
+  a picture).
+
+**Blocked, and not guessed: the jurisdiction.** GDPR and 152-ФЗ differ in deadline, in required
+wording and in how hard they bite. Which applies depends on where he lives, he has been asked
+directly, and **no draft is written until he answers** — a template aimed at the wrong regime is
+worse than no template. When he answers: addressed drafts per recipient, from the evidence
+artifact; **he sends them himself and only after reading them** (rule 3).
+
 ## Step 1 — receiver + decoy bidder, locally, on synthetic requests (his step 1)
 
 Go, ~200 lines, JSONL to disk, DuckDB offline. Three corrections fold in here:
