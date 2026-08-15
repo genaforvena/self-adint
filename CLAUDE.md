@@ -27,9 +27,21 @@ in a summary is a failure; it ends in a measured artifact or an answered questio
    construction. So: no request-body logging anywhere, a `recover` that never prints the request,
    no access log carrying the payload, metrics as **counters only**. Any framework default that
    dumps a request on panic is a defect to be removed before the first real packet.
-3. **No irreversible step without his explicit go, per step.** Onboarding a seat, signing an
-   agreement, paying a deposit, contacting an exchange, resetting his GAID — the mind **drafts**,
-   he ships. His "го" of 2026-08-15 authorises organising the channel and the plan, nothing beyond.
+3. **No UNRECOVERABLE step without his explicit go, per step** (narrowed 2026-08-15 on his own
+   objection — *«да ну а как же автопоэзис? давайте и почту вы сделаете и отправите тоже вы»*: a
+   project that stops for a human hand at every step does not self-produce, and the rule as written
+   made the hand mandatory everywhere). The gate now stands exactly where an error does not play
+   back: **onboarding a seat, signing an agreement, any payment, resetting his GAID.** There a
+   mistake costs money or destroys the baseline the comparison is made of.
+
+   **DELEGATED to the mind, end to end:** creating the dedicated mailbox and sending the data-subject
+   letters. Three commitments carry that delegation, and they are the reason it is safe: (a) **no
+   invented fact** — every evidentiary line in a letter is drawn from his own capture (host, time,
+   bytes, app), never from memory or "approximately"; (b) **every sent letter lands on disk and
+   reaches him the moment it goes out** — for reading, not for approval; a correction is an ordinary
+   follow-up in this genre; (c) **one ledger** of who was written to, when, what came back, who is
+   silent. His "го" of 2026-08-15 authorises the channel, the plan, the local Prebid step, and this
+   delegation — nothing beyond.
 4. **Nobody but him is in scope — and the line is the DISK, not the socket** (revised 2026-08-15 on
    his explicit word: *«на жёсткий диск никогда не попадает, если это не я»*). The old text banned
    seeing a foreign request "even incidentally", which the project cannot honour the moment it
