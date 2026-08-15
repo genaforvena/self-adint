@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""adint-candidates — the STATIC half of Step 0's artifact.
+
+Input : JSONL from tools/adint-inventory-run, one row per (package, signature):
+        {"ts":…,"source":"dex-inventory","device":…,"package":…,"signature":…,"hits":N}
+Ref   : ref/sdk-signatures.tsv (dex_pattern org sdk role [note])
+Output: data/bundle-sdk-candidates.tsv
+
+A CANDIDATE is not an observation. A signature in a DEX proves the code ships in the app; it
+does not prove an impression was ever sold through that org, and a mediation SDK ships adapters
+that name SDKs it does not contain. This file therefore lives apart from the observation table
+(data/bundle-exchange.tsv) and carries the hit count, which is the axis that separates a passing
+adapter reference from an embedded SDK — calibrated against the real corpus, never against a
+threshold guessed in advance.
+
+The device gate is the same as in adint-aggregate: --device is mandatory, a foreign row is
+dropped in the parser before any buffer, counted as a bare integer, and never written.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+SIGS_DEFAULT = os.path.join(ROOT, "ref", "sdk-signatures.tsv")
+
+SIG_COLUMNS = ["dex_pattern", "org", "sdk", "role"]
+
+
+class RefError(Exception):
+    pass
+
+
+def load_signatures(path):
+    """{dex_pattern: {org, sdk, role, note}} — raises rather than returning {}."""
+    if not os.path.exists(path):
+        raise RefError("signature table missing: %s" % path)
+    table = {}
+    with open(path, encoding="utf-8") as fh:
+        header = None
+        for lineno, line in enumerate(fh, start=1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            if header is None:
+                if parts[:len(SIG_COLUMNS)] != SIG_COLUMNS:
+                    raise RefError("signature header is %r, expected %r"
+                                   % (parts, SIG_COLUMNS))
+                header = parts
+                continue
+            if len(parts) < len(SIG_COLUMNS):
+                raise RefError("signature line %d has %d fields, expected >= %d"
+                               % (lineno, len(parts), len(SIG_COLUMNS)))
+            table[parts[0].strip()] = {
+                "org": parts[1], "sdk": parts[2], "role": parts[3],
+                "note": parts[4] if len(parts) > 4 else "",
+            }
+    if not table:
+        raise RefError("signature table %s has a header but no rows" % path)
+    return table
+
+
+UNKNOWN_SIG = {"org": "UNKNOWN", "sdk": "UNKNOWN", "role": "unknown", "note": ""}
+
+# roles that must never be read as "an exchange sells this app's traffic"
+NON_DEMAND_ROLES = {"attribution", "analytics", "identifier"}
+
+
+def aggregate(lines, device, sigs):
+    stats = {"read": 0, "kept": 0, "foreign_dropped": 0, "malformed": 0,
+             "unknown_signatures": 0}
+    cells = defaultdict(lambda: {"hits": 0, "sdks": set(), "sigs": set()})
+    packages = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        stats["read"] += 1
+        try:
+            rec = json.loads(line)
+            dev = rec["device"]
+            pkg = rec["package"]
+            sig = rec["signature"]
+            hits = int(rec.get("hits", 1))
+        except Exception:
+            stats["malformed"] += 1
+            continue
+        if dev != device:
+            stats["foreign_dropped"] += 1
+            del rec, dev, pkg, sig, hits
+            continue
+        stats["kept"] += 1
+        row = sigs.get(sig)
+        if row is None:
+            row = UNKNOWN_SIG
+            stats["unknown_signatures"] += 1
+        packages.add(pkg)
+        c = cells[(pkg, row["org"], row["role"])]
+        c["hits"] += hits
+        c["sdks"].add(row["sdk"])
+        c["sigs"].add(sig)
+    stats["packages"] = len(packages)
+    return stats, cells
+
+
+def render(cells):
+    out = ["# CANDIDATES, not observations: a signature in a DEX proves the code ships, not that",
+           "# an impression was sold. Mediation SDKs ship adapters naming SDKs they do not contain.",
+           "\t".join(["bundle", "org", "role", "sdks", "signature_hits",
+                      "distinct_signatures", "demand_side"])]
+    for key in sorted(cells, key=lambda k: (k[0], -cells[k]["hits"], k[1])):
+        pkg, org, role = key
+        c = cells[key]
+        demand = "no" if role in NON_DEMAND_ROLES else ("unknown" if role == "unknown" else "yes")
+        out.append("\t".join([pkg, org, role, ",".join(sorted(c["sdks"])),
+                              str(c["hits"]), str(len(c["sigs"])), demand]))
+    return "\n".join(out) + "\n"
+
+
+def summary(stats, cells):
+    """Both axes, always. Ranking by app count and ranking by hit count disagree — an SDK
+    referenced by one adapter class in a dozen apps outranks a fully embedded SDK on the
+    first axis and is buried by it on the second. Publishing one of them alone picks a
+    winner the other axis contradicts."""
+    apps = defaultdict(int)
+    hits = defaultdict(int)
+    for (pkg, org, role), c in cells.items():
+        if role not in NON_DEMAND_ROLES and org != "UNKNOWN":
+            apps[org] += 1
+            hits[org] += c["hits"]
+    by_apps = ", ".join("%s:%d" % (o, n) for o, n in
+                        sorted(apps.items(), key=lambda kv: (-kv[1], kv[0]))[:8])
+    by_hits = ", ".join("%s:%d" % (o, n) for o, n in
+                        sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:8])
+    return ("packages with at least one signature: %d · rows: %d · kept=%d "
+            "foreign-dropped=%d malformed=%d unknown-signatures=%d\n"
+            "demand-side orgs by APP COUNT : %s\n"
+            "demand-side orgs by HIT COUNT : %s"
+            % (stats["packages"], len(cells), stats["kept"], stats["foreign_dropped"],
+               stats["malformed"], stats["unknown_signatures"],
+               by_apps or "(none)", by_hits or "(none)"))
+
+
+# ---------------------------------------------------------------- self-test
+
+FIXTURE_SIGS = "\n".join([
+    "# comment line",
+    "\t".join(SIG_COLUMNS),
+    "\t".join(["com/applovin", "AppLovin", "AppLovin SDK / MAX", "mediation+exchange", "note here"]),
+    "\t".join(["com/vungle", "Liftoff", "Vungle", "exchange"]),          # 4 fields: note optional
+    "\t".join(["com/appsflyer", "AppsFlyer", "AppsFlyer", "attribution"]),
+    "\t".join(["com/google/android/gms/ads/identifier", "Google", "GAID", "identifier"]),
+]) + "\n"
+
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        sp = os.path.join(td, "sigs.tsv")
+        with open(sp, "w", encoding="utf-8") as fh:
+            fh.write(FIXTURE_SIGS)
+        sigs = load_signatures(sp)
+        check("signatures load, comments skipped", len(sigs) == 4, len(sigs))
+        check("note column optional", sigs["com/vungle"]["note"] == "", sigs["com/vungle"])
+
+        try:
+            load_signatures(os.path.join(td, "nope.tsv")); check("missing table raises", False)
+        except RefError:
+            check("missing table raises", True)
+        hp = os.path.join(td, "hdr.tsv")
+        with open(hp, "w", encoding="utf-8") as fh:
+            fh.write("\t".join(SIG_COLUMNS) + "\n")
+        try:
+            load_signatures(hp); check("header-only table raises", False)
+        except RefError:
+            check("header-only table raises", True)
+
+        recs = [
+            json.dumps({"ts": "T", "device": "MINE", "package": "com.mine.game",
+                        "signature": "com/applovin", "hits": 900}),
+            json.dumps({"ts": "T", "device": "MINE", "package": "com.mine.game",
+                        "signature": "com/vungle", "hits": 4}),
+            json.dumps({"ts": "T", "device": "MINE", "package": "com.mine.game",
+                        "signature": "com/appsflyer", "hits": 120}),
+            json.dumps({"ts": "T", "device": "MINE", "package": "com.mine.game",
+                        "signature": "com/google/android/gms/ads/identifier", "hits": 6}),
+            json.dumps({"ts": "T", "device": "MINE", "package": "com.mine.game",
+                        "signature": "com/nosuch", "hits": 7}),
+            json.dumps({"ts": "T", "device": "FOREIGN", "package": "com.foreign.app",
+                        "signature": "com/applovin", "hits": 5000}),
+            "{broken",
+        ]
+        stats, cells = aggregate(recs, "MINE", sigs)
+        tsv = render(cells)
+        blob = tsv + summary(stats, cells)
+
+        check("foreign row dropped", stats["foreign_dropped"] == 1, stats)
+        check("no foreign package anywhere", "com.foreign.app" not in blob)
+        check("no foreign device id anywhere", "FOREIGN" not in blob)
+        check("foreign hits excluded", "5000" not in blob)
+        check("malformed counted", stats["malformed"] == 1, stats)
+
+        # attribution must never read as demand side
+        af = [l for l in tsv.splitlines() if "AppsFlyer" in l]
+        check("attribution row present", len(af) == 1, af)
+        check("attribution marked demand_side=no", af and af[0].endswith("\tno"), af)
+        av = [l for l in tsv.splitlines() if "AppLovin" in l]
+        check("exchange marked demand_side=yes", av and av[0].endswith("\tyes"), av)
+        check("attribution excluded from org summary", "AppsFlyer" not in summary(stats, cells),
+              summary(stats, cells))
+
+        gaid = [l for l in tsv.splitlines() if "GAID" in l]
+        check("identifier row present", len(gaid) == 1, gaid)
+        check("GAID marked demand_side=no", gaid and gaid[0].endswith("\tno"), gaid)
+
+        # an unknown signature is loud, not silently dropped
+        check("unknown signature counted", stats["unknown_signatures"] == 1, stats)
+        check("unknown signature row present", "\tUNKNOWN\t" in tsv, tsv)
+        check("unknown row is not demand-side yes",
+              all(not (l.startswith("com.mine.game\tUNKNOWN") and l.endswith("\tyes"))
+                  for l in tsv.splitlines()), tsv)
+
+        # the hit count is the axis that separates an adapter reference from an SDK — it must survive
+        check("hit counts preserved", "\t900\t" in tsv and "\t4\t" in tsv, tsv)
+        check("package counted once", stats["packages"] == 1, stats)
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", help="target device id — MANDATORY")
+    ap.add_argument("--in", dest="infile", help="inventory JSONL (default: stdin)")
+    ap.add_argument("--sigs", default=SIGS_DEFAULT)
+    ap.add_argument("--out-dir", default=os.path.join(ROOT, "data"))
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if not args.device:
+        ap.error("--device is mandatory (rule 1: only his device reaches disk)")
+
+    try:
+        sigs = load_signatures(args.sigs)
+    except RefError as e:
+        print("adint-candidates: %s" % e, file=sys.stderr)
+        return 2
+
+    src = open(args.infile, encoding="utf-8") if args.infile else sys.stdin
+    try:
+        stats, cells = aggregate(src, args.device, sigs)
+    finally:
+        if args.infile:
+            src.close()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    path = os.path.join(args.out_dir, "bundle-sdk-candidates.tsv")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(render(cells))
+    print(summary(stats, cells))
+    print("wrote %s" % path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

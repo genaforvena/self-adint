@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# adint-inventory-run — the STATIC half of Step 0, run from the node against HIS phone only.
+#
+# For every third-party package on the phone, stream its DEX through one grep pass and count
+# how often each ad-SDK signature from ref/sdk-signatures.tsv appears. Emits normalised JSONL
+# on stdout:
+#
+#   {"ts":…,"source":"dex-inventory","device":"<id>","package":"…","signature":"com/applovin","hits":N}
+#
+# WHAT THIS IS NOT: it is not an observation of traffic. A signature in a DEX says the code is
+# shipped, not that an impression was ever sold, and a mediation SDK ships adapters that NAME
+# other SDKs it does not contain. Candidates live in their own file for that reason
+# (data/bundle-sdk-candidates.tsv), never mixed into the observation table.
+#
+# The phone is reached over its own sshd; nothing is written on the phone and no APK is copied
+# off it — the scan streams and the bytes are discarded. Only HIS device is ever contacted:
+# the host is given explicitly, and the device id stamped on every row is the one asserted here.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGS="$ROOT/ref/sdk-signatures.tsv"
+
+usage() { echo "usage: $0 --host <user@ip> [--port 8022] --device <id> [--pkgs-from <file>]" >&2; exit 64; }
+
+HOST=""; PORT=8022; DEVICE=""; PKGS_FROM=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) HOST="${2:-}"; shift 2 ;;
+    --port) PORT="${2:-}"; shift 2 ;;
+    --device) DEVICE="${2:-}"; shift 2 ;;
+    --pkgs-from) PKGS_FROM="${2:-}"; shift 2 ;;   # offline replay of a saved package list
+    --test) exec "$ROOT/tools/adint-candidates" --test ;;
+    *) usage ;;
+  esac
+done
+[ -n "$HOST" ] && [ -n "$DEVICE" ] || usage
+[ -r "$SIGS" ] || { echo "adint-inventory-run: missing $SIGS" >&2; exit 2; }
+
+# Build ONE alternation from the signature table. An empty pattern set is an error, never a
+# silent scan that finds nothing and looks like a clean phone.
+PATTERNS="$(awk -F'\t' 'NR>1 && $1 !~ /^#/ && $1 != "" && $1 != "dex_pattern" {print $1}' "$SIGS")"
+[ -n "$PATTERNS" ] || { echo "adint-inventory-run: no patterns in $SIGS" >&2; exit 2; }
+ALT="$(printf '%s' "$PATTERNS" | paste -sd'|' -)"
+
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# The remote side: list third-party packages with their APK path, one grep pass each, count
+# per signature. Prints "package<TAB>signature<TAB>hits". No temp files, nothing written.
+REMOTE='
+set -u
+alt="$1"
+pm list packages -3 -f 2>/dev/null | while IFS= read -r line; do
+  p=${line#package:}
+  path=${p%=*}
+  pkg=${p##*=}
+  [ -n "$path" ] || continue
+  unzip -p "$path" "classes*.dex" 2>/dev/null \
+    | grep -aoE "$alt" 2>/dev/null \
+    | sort | uniq -c \
+    | while read -r n sig; do printf "%s\t%s\t%s\n" "$pkg" "$sig" "$n"; done
+done
+'
+
+if [ -n "$PKGS_FROM" ]; then
+  RAW="$(cat "$PKGS_FROM")"
+else
+  RAW="$(ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "sh -c '$REMOTE' _ '$ALT'")"
+  rc=$?
+  [ $rc -eq 0 ] || { echo "adint-inventory-run: ssh scan failed rc=$rc (nothing written)" >&2; exit 3; }
+fi
+
+# A scan that reached the phone and matched nothing is a real result; a scan that produced no
+# LINES AT ALL is an instrument failure and must not render as "no ad SDKs anywhere".
+if [ -z "${RAW//[[:space:]]/}" ]; then
+  echo "adint-inventory-run: the scan returned no rows at all — instrument failure, not a clean phone" >&2
+  exit 4
+fi
+
+printf '%s\n' "$RAW" | awk -F'\t' -v ts="$TS" -v dev="$DEVICE" '
+  NF>=3 && $1 != "" {
+    gsub(/"/,"",$1); gsub(/"/,"",$2);
+    printf "{\"ts\":\"%s\",\"source\":\"dex-inventory\",\"device\":\"%s\",\"package\":\"%s\",\"signature\":\"%s\",\"hits\":%d}\n", ts, dev, $1, $2, $3+0
+  }'

@@ -1,0 +1,42 @@
+# dex class-path signatures of mobile ad SDKs, used by tools/adint-phone-inventory.
+# Public knowledge; committed. A hit means the string is present in the app's DEX — see the
+# limits recorded in docs/step0-method-2026-08-15.md: presence is a CANDIDATE, not an
+# observation, and a mediation SDK ships adapters that NAME other SDKs it does not contain.
+# The hit COUNT is kept for exactly that reason: an adapter reference and an embedded SDK
+# differ by orders of magnitude, and the split between them is calibrated against the real
+# corpus once it exists — never against a threshold guessed here.
+dex_pattern	org	sdk	role	note
+com/google/android/gms/ads	Google	GMA (AdMob/Ad Manager)	mediation+exchange	sells through Google's exchange
+com/google/android/gms/ads/identifier	Google	GAID (advertising id)	identifier	reads the ad id only — NOT a demand path; longest-match splits it out of the GMA count
+com/google/ads/mediation	Google	GMA mediation adapters	mediation	adapter layer — names other SDKs
+com/applovin	AppLovin	AppLovin SDK / MAX	mediation+exchange	MAX mediates; AppLovin Exchange buys
+com/unity3d/ads	Unity	Unity Ads	mediation+exchange
+com/unity3d/services	Unity	Unity Services	mediation+exchange
+com/ironsource	ironSource	ironSource / LevelPlay	mediation	Unity-owned since 2022
+com/mbridge	Mintegral	Mintegral MTG	exchange
+com/bytedance/sdk/openadsdk	ByteDance	Pangle	exchange
+com/pgl/sys	ByteDance	Pangle (native helper)	exchange
+com/facebook/ads	Meta	Audience Network	exchange
+com/vungle	Liftoff	Vungle	exchange
+com/inmobi	InMobi	InMobi SDK	exchange
+com/chartboost	Chartboost	Chartboost	exchange
+com/fyber	DigitalTurbine	Fyber / Offer Wall	mediation+exchange
+com/smaato	Smaato	Smaato SDK	ssp
+com/pubmatic	PubMatic	OpenWrap SDK	ssp
+com/criteo	Criteo	Criteo SDK	dsp	buy-side; presence means header bidding
+com/yandex/mobile/ads	Yandex	Yandex Mobile Ads	mediation+exchange	dominant in RU inventory
+com/my/target	VK	myTarget	exchange	RU
+com/huawei/hms/ads	Huawei	Petal Ads	exchange
+com/amazon/device/ads	Amazon	APS / TAM	exchange
+com/adcolony	DigitalTurbine	AdColony	exchange
+com/tapjoy	Tapjoy	Tapjoy	exchange
+com/startapp	StartApp	StartApp	exchange
+com/appodeal	Appodeal	Appodeal	mediation
+com/bidmachine	Appodeal	BidMachine	exchange
+io/bidmachine	Appodeal	BidMachine	exchange
+com/appsflyer	AppsFlyer	AppsFlyer	attribution	NOT an exchange — classified out
+com/adjust/sdk	Adjust	Adjust	attribution	NOT an exchange — classified out
+io/branch	Branch	Branch	attribution	NOT an exchange — classified out
+com/amplitude	Amplitude	Amplitude	analytics	NOT an exchange — classified out
+com/onesignal	OneSignal	OneSignal	analytics	push, not ads
+com/google/firebase/analytics	Google	Firebase Analytics	analytics	NOT an exchange — classified out
