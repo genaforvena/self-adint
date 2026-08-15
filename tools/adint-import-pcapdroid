@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""adint-import-pcapdroid — PCAPdroid connections CSV -> normalised observation JSONL.
+
+    tools/adint-import-pcapdroid --device redmi10-daily --in PCAPdroid_15_авг._18_42_07.csv \\
+      | tools/adint-aggregate --device redmi10-daily
+
+The CSV contract is taken from PCAPdroid's own source, not from a sample we never had
+(docs/research-device-capture-2026-08-15.md §1.2, §6):
+
+  IPProto,SrcIP,SrcPort,DstIp,DstPort,UID,App,PackageName,Proto,Status,Info,
+  BytesSent,BytesRcvd,PktsSent,PktsRcvd,FirstSeen,LastSeen        (+ Malicious when paid)
+
+Everything this importer refuses to do, and why:
+
+  * It never keys on a column index. 17 columns normally, 18 with the paid malware
+    detection — the header is read and indexed by name.
+  * It never guesses a row it cannot parse. The writer does NO quoting, so a comma inside
+    the app's display label or inside a hostname shifts the row. Such rows are counted and
+    reported, never reassembled by intuition.
+  * It never filters on `Status`: that column is localised, so on a Russian phone it reads
+    «Недоступно». An unreachable connection is still evidence of an attempted contact.
+  * It never attributes a system-resolver row to an app. On modern Android `netd` (uid 1051)
+    issues DNS on behalf of everyone: the hostname is real, the app is not. Those rows go to
+    a `system` bucket that is reported separately and never merged into a bundle's count.
+  * An empty `Info` is a KNOWN UNKNOWN: counted and reported, never silently dropped.
+  * If the row count reaches the app's connection ring size, the file is a truncated TAIL of
+    the period, not the period. That is a coverage warning on the artifact — the one failure
+    mode of this instrument that otherwise looks exactly like a complete day.
+"""
+
+import argparse
+import csv
+import json
+import os
+import sys
+from collections import defaultdict
+
+EXPECTED = ["IPProto", "SrcIP", "SrcPort", "DstIp", "DstPort", "UID", "App", "PackageName",
+            "Proto", "Status", "Info", "BytesSent", "BytesRcvd", "PktsSent", "PktsRcvd",
+            "FirstSeen", "LastSeen"]
+
+# AppsResolver synthesises these for kernel/system uids — they are tokens, not packages.
+VIRTUAL_PACKAGES = {"unknown", "root", "android", "phone", "mediaserver",
+                    "multicastdnsresponder", "gps", "netd", "nobody"}
+
+DEFAULT_RING = 8192
+
+
+class FormatError(Exception):
+    pass
+
+
+def read_header(row):
+    if row[:len(EXPECTED)] != EXPECTED:
+        raise FormatError("unexpected header: %r" % (row,))
+    return {name: i for i, name in enumerate(row)}
+
+
+def parse(fh, device, source, ring=DEFAULT_RING):
+    """Yields (records, stats). Records are grouped by (package, hostname)."""
+    reader = csv.reader(fh)
+    try:
+        header = read_header(next(reader))
+    except StopIteration:
+        raise FormatError("empty file")
+
+    n = len(header)
+    i_uid, i_pkg, i_info, i_first = header["UID"], header["PackageName"], header["Info"], header["FirstSeen"]
+
+    groups = defaultdict(lambda: {"count": 0, "first": None})
+    system = defaultdict(int)
+    stats = {"rows": 0, "ambiguous": 0, "no_hostname": 0, "system_rows": 0, "app_rows": 0}
+
+    for row in reader:
+        if not row:
+            continue
+        stats["rows"] += 1
+        if len(row) != n:
+            # No quoting exists in the writer, so this row contains a comma inside a text
+            # field. It is reported, not reconstructed.
+            stats["ambiguous"] += 1
+            continue
+        pkg = (row[i_pkg] or "").strip()
+        host = (row[i_info] or "").strip().lower().rstrip(".")
+        if not host:
+            stats["no_hostname"] += 1
+            continue
+        if not pkg or pkg in VIRTUAL_PACKAGES:
+            stats["system_rows"] += 1
+            system[(row[i_uid].strip(), pkg or "(empty)", host)] += 1
+            continue
+        stats["app_rows"] += 1
+        g = groups[(pkg, host)]
+        g["count"] += 1
+        ts = (row[i_first] or "").strip()
+        if ts and (g["first"] is None or ts < g["first"]):
+            g["first"] = ts
+
+    stats["ring_overflow"] = stats["rows"] >= ring
+    stats["ring"] = ring
+    records = []
+    for (pkg, host), g in groups.items():
+        records.append({"ts": g["first"] or "", "source": source, "device": device,
+                        "package": pkg, "hostname": host, "count": g["count"]})
+    return records, system, stats
+
+
+def report(stats, system):
+    lines = ["rows=%d app-rows=%d system-rows=%d no-hostname=%d ambiguous=%d"
+             % (stats["rows"], stats["app_rows"], stats["system_rows"],
+                stats["no_hostname"], stats["ambiguous"])]
+    if stats["ring_overflow"]:
+        lines.append("COVERAGE WARNING: %d rows reaches the connection ring (%d) — this file is a "
+                     "TAIL of the period, not the period. Raise 'Max logged connections' and "
+                     "export more often." % (stats["rows"], stats["ring"]))
+    if system:
+        top = sorted(system.items(), key=lambda kv: -kv[1])[:3]
+        lines.append("system-resolver hosts (NOT attributed to any app): %d distinct; top: %s"
+                     % (len(system), ", ".join("%s×%d" % (k[2], v) for k, v in top)))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- self-test
+
+def _row(**kw):
+    """Build a CSV row from the field writer in ConnectionsAdapter.dumpConnectionsCsv().
+    SYNTHETIC — no real PCAPdroid CSV row could be sourced, and inventing one that looked
+    authoritative is exactly what this project must not do. Fields follow the writer's
+    types: IPProto is an integer, Status is a localised label, FirstSeen is ISO-8601 local."""
+    d = {"IPProto": "6", "SrcIP": "10.215.173.1", "SrcPort": "45678", "DstIp": "142.250.1.1",
+         "DstPort": "443", "UID": "10123", "App": "Some App", "PackageName": "com.mine.app",
+         "Proto": "TLS.Google", "Status": "Закрыто", "Info": "pubads.g.doubleclick.net",
+         "BytesSent": "1200", "BytesRcvd": "3400", "PktsSent": "8", "PktsRcvd": "9",
+         "FirstSeen": "2026-08-15T13:04:21.377+02:00", "LastSeen": "2026-08-15T13:04:25.001+02:00"}
+    d.update(kw)
+    return ",".join(d[c] for c in EXPECTED)
+
+
+def selftest():
+    import io
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    hdr = ",".join(EXPECTED)
+    body = "\n".join([
+        hdr,
+        _row(),
+        _row(FirstSeen="2026-08-15T09:00:00.000+02:00"),                       # same pair, earlier
+        _row(Info="ads.mintegral.com", DstIp="1.2.3.4"),
+        _row(PackageName="com.other.app", Info="mobileads.mobile.yandex.net"),
+        _row(UID="1051", PackageName="netd", Info="tracker.example.net"),      # system resolver
+        _row(Info=""),                                                          # known unknown
+        _row(App="Some, App", Info="shifted.example.com"),                      # unquoted comma
+        _row(Status="Недоступно", Info="unreachable.example.com"),              # localised status
+    ]) + "\n"
+
+    recs, system, stats = parse(io.StringIO(body), "MINE", "test")
+    by = {(r["package"], r["hostname"]): r for r in recs}
+
+    check("grouped by (package, hostname)",
+          by[("com.mine.app", "pubads.g.doubleclick.net")]["count"] == 2, recs)
+    check("earliest FirstSeen kept",
+          by[("com.mine.app", "pubads.g.doubleclick.net")]["ts"].startswith("2026-08-15T09:00"),
+          by[("com.mine.app", "pubads.g.doubleclick.net")])
+    check("second package kept", ("com.other.app", "mobileads.mobile.yandex.net") in by, list(by))
+    check("localised status row kept",
+          ("com.mine.app", "unreachable.example.com") in by, list(by))
+
+    check("netd row not attributed to an app",
+          all(r["package"] != "netd" for r in recs) and stats["system_rows"] == 1, stats)
+    check("system host absent from app records",
+          all(r["hostname"] != "tracker.example.net" for r in recs), recs)
+    check("empty Info counted, not dropped silently", stats["no_hostname"] == 1, stats)
+    check("unquoted-comma row counted as ambiguous", stats["ambiguous"] == 1, stats)
+    check("ambiguous row not reassembled",
+          all(r["hostname"] != "shifted.example.com" for r in recs), recs)
+    check("device stamped", all(r["device"] == "MINE" for r in recs), recs)
+
+    # the 18-column paid build must parse, and by NAME not by index
+    paid_hdr = hdr + ",Malicious"
+    paid = "\n".join([paid_hdr, _row() + ",", _row(Info="paid.example.com") + ",yes"]) + "\n"
+    precs, _, pstats = parse(io.StringIO(paid), "MINE", "test")
+    check("18-column build parses", pstats["app_rows"] == 2, pstats)
+    check("18-column hostnames read from the right column",
+          any(r["hostname"] == "paid.example.com" for r in precs), precs)
+
+    # a wrong header is a format error, never a best-effort parse
+    try:
+        parse(io.StringIO("a,b,c\n1,2,3\n"), "MINE", "test"); check("bad header raises", False)
+    except FormatError:
+        check("bad header raises", True)
+    try:
+        parse(io.StringIO(""), "MINE", "test"); check("empty file raises", False)
+    except FormatError:
+        check("empty file raises", True)
+
+    # the ring-overflow warning: a truncated tail must not read as a complete period
+    small = "\n".join([hdr] + [_row(Info="h%d.example.com" % i) for i in range(4)]) + "\n"
+    _, _, sstats = parse(io.StringIO(small), "MINE", "test", ring=4)
+    check("ring overflow detected", sstats["ring_overflow"] is True, sstats)
+    check("overflow warning is in the report", "COVERAGE WARNING" in report(sstats, {}),
+          report(sstats, {}))
+    _, _, ustats = parse(io.StringIO(small), "MINE", "test", ring=8192)
+    check("no false overflow under the ring", ustats["ring_overflow"] is False, ustats)
+    check("clean report has no warning", "COVERAGE WARNING" not in report(ustats, {}))
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", help="device id stamped on every record — MANDATORY")
+    ap.add_argument("--in", dest="infile", help="PCAPdroid CSV (default: stdin)")
+    ap.add_argument("--source", default="pcapdroid-csv")
+    ap.add_argument("--ring", type=int, default=DEFAULT_RING,
+                    help="the phone's 'Max logged connections' (default %d)" % DEFAULT_RING)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if not args.device:
+        ap.error("--device is mandatory (rule 1: only his device reaches disk)")
+
+    fh = open(args.infile, encoding="utf-8", newline="") if args.infile else sys.stdin
+    try:
+        recs, system, stats = parse(fh, args.device, args.source, args.ring)
+    except FormatError as e:
+        print("adint-import-pcapdroid: %s" % e, file=sys.stderr)
+        return 2
+    finally:
+        if args.infile:
+            fh.close()
+
+    for r in recs:
+        print(json.dumps(r, ensure_ascii=False))
+    print(report(stats, system), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
