@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""adint-mail-send — send one data-subject letter, record it in the ledger, copy it to the operator.
+
+    tools/adint-mail-send --to privacy@example.com --subject "..." --body letters/liftoff.txt
+    tools/adint-mail-send --dry-run --to ... --subject ... --body ...     # renders, sends nothing
+    tools/adint-mail-send --test                                          # smoke, no network
+
+The operator delegated sending end to end (charter rule 3, revised 2026-08-15: "давайте и почту вы
+сделаете и отправите тоже вы"). That delegation rests on three commitments, and this tool is where
+two of them are MECHANISED rather than promised:
+
+  * every sent letter reaches him the moment it goes out — not for approval, for reading. So the
+    send path and the relay path are ONE action here: a letter that went to the recipient and not to
+    him is a defect, not a partial success. If the relay fails, the ledger says so on that row.
+  * one ledger of who was written to, when, what came back, who is silent. Append-only JSONL, one
+    row per attempt including FAILED attempts — a ledger that records only successes cannot answer
+    "who is silent", which is the loudest of the three outcomes we expect.
+
+What it refuses to do, and why:
+
+  * It never invents a recipient. --to is passed explicitly; there is no address book here, because
+    an address list drifting out of sync with docs/step0d-recipients-eu-entity is exactly how a
+    letter goes to the wrong company under the wrong legal basis.
+  * It never sends a body it did not read from disk. The letter is a FILE, so the thing sent and the
+    thing archived are the same bytes. No inline --text.
+  * A send with no credentials FAILS LOUDLY (exit 3). The mailbox does not exist yet; the tempting
+    shape here is a silent "would send" fallback, which is the fabricated-success trap — a dry run
+    must be ASKED for, never inferred from a missing password.
+"""
+import argparse
+import json
+import os
+import smtplib
+import ssl
+import subprocess
+import sys
+import time
+from email.message import EmailMessage
+
+LEDGER = os.path.expanduser("~/self-adint/data/dsar-ledger.jsonl")
+ENVFILE = os.path.expanduser("~/.mesh/adint-mail.env")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_env(path=None):
+    """Read the mailbox credentials. Separate file from the job lane's ~/.mesh/mail.env ON PURPOSE:
+    the whole point of the dedicated mailbox is that his primary address is never linked to his
+    advertising id, and one shared env is how those two identities get mixed by accident."""
+    path = path or ENVFILE
+    if not os.path.exists(path):
+        raise ConfigError(f"no mailbox configured: {path} absent")
+    env = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    missing = [k for k in ("MAIL_FROM", "MAIL_USER", "MAIL_PASS", "MAIL_SMTP_HOST") if not env.get(k)]
+    if missing:
+        raise ConfigError(f"{path} incomplete: missing {', '.join(missing)}")
+    return env
+
+
+def build(env, to, subject, body):
+    msg = EmailMessage()
+    msg["From"] = f"{env.get('MAIL_NAME')} <{env['MAIL_FROM']}>" if env.get("MAIL_NAME") else env["MAIL_FROM"]
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    return msg
+
+
+def send(env, msg):
+    port = int(env.get("MAIL_SMTP_PORT") or 465)
+    host = env["MAIL_SMTP_HOST"]
+    if str(env.get("MAIL_SMTP_SSL", "1")).lower() in ("1", "true", "yes"):
+        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=60) as s:
+            s.login(env["MAIL_USER"], env["MAIL_PASS"])
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=60) as s:
+            s.starttls(context=ssl.create_default_context())
+            s.login(env["MAIL_USER"], env["MAIL_PASS"])
+            s.send_message(msg)
+
+
+def relay_to_operator(to, subject, body, ledger=LEDGER):
+    """His copy. Failure here is recorded on the row, never swallowed — a letter he did not see is
+    the one thing this delegation is not allowed to produce."""
+    text = f"[dsar отправлено] {to}\nТема: {subject}\n\n{body}"
+    try:
+        r = subprocess.run(["mesh-tg", text], capture_output=True, text=True, timeout=90)
+        return (r.returncode == 0), (r.stderr or r.stdout or "").strip()[:200]
+    except Exception as exc:  # noqa: BLE001 - the reason goes on the ledger row verbatim
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def record(row, ledger=LEDGER):
+    os.makedirs(os.path.dirname(ledger), exist_ok=True)
+    with open(ledger, "a") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def selftest():
+    import tempfile
+
+    fails = []
+
+    def check(name, cond, detail=""):
+        print(f"  {'ok' if cond else 'FAIL'}: {name}{'' if cond else ' — ' + detail}")
+        if not cond:
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        # A missing mailbox must RAISE, never degrade to a silent "would send". Delete the raise and
+        # this goes red: the trap is a tool that reports success while nothing left the building.
+        try:
+            load_env(os.path.join(td, "absent.env"))
+            check("absent env raises", False, "load_env returned instead of raising")
+        except ConfigError as exc:
+            check("absent env raises", "absent" in str(exc), str(exc))
+
+        p = os.path.join(td, "partial.env")
+        with open(p, "w") as fh:
+            fh.write('MAIL_FROM="a@b.c"\nMAIL_USER="a@b.c"\nMAIL_SMTP_HOST="smtp.b.c"\n')
+        try:
+            load_env(p)
+            check("incomplete env raises", False, "missing MAIL_PASS accepted")
+        except ConfigError as exc:
+            check("incomplete env raises", "MAIL_PASS" in str(exc), str(exc))
+
+        p = os.path.join(td, "full.env")
+        with open(p, "w") as fh:
+            fh.write('MAIL_FROM="x@y.z"\nMAIL_NAME="Имя"\nMAIL_USER="x@y.z"\nMAIL_PASS="s"\nMAIL_SMTP_HOST="smtp.y.z"\n')
+        env = load_env(p)
+        check("full env loads", env["MAIL_FROM"] == "x@y.z", repr(env))
+
+        # The body must survive as BYTES: a letter whose Cyrillic arrives mangled is a letter the
+        # recipient can decline to act on, and we would never see it from our side.
+        body = "Здравствуйте.\nВаш хост r.mradx.net получил 6 006 339 байт.\n"
+        msg = build(env, "privacy@example.com", "Запрос субъекта", body)
+        check("body round-trips utf-8", msg.get_content().strip() == body.strip(), repr(msg.get_content()[:60]))
+        check("From carries the display name", "Имя" in msg["From"], msg["From"])
+
+        led = os.path.join(td, "ledger.jsonl")
+        record({"ts": stamp(), "to": "a@b.c", "status": "FAILED", "error": "boom"}, ledger=led)
+        rows = [json.loads(x) for x in open(led)]
+        # A ledger of successes only cannot answer "who is silent" — the question this project asks.
+        check("ledger records a FAILED attempt", rows and rows[0]["status"] == "FAILED", str(rows))
+
+    print("smoke-test: " + ("ok" if not fails else f"FAIL ({len(fails)})"))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--to")
+    ap.add_argument("--subject")
+    ap.add_argument("--body", help="path to the letter; the file IS the archived copy")
+    ap.add_argument("--dry-run", action="store_true", help="render + ledger, send nothing")
+    ap.add_argument("--env", default=None)
+    ap.add_argument("--ledger", default=LEDGER)
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+
+    if a.test:
+        return selftest()
+    if not (a.to and a.subject and a.body):
+        ap.error("--to, --subject and --body are required")
+    body = open(a.body, encoding="utf-8").read()
+
+    if a.dry_run:
+        env = {"MAIL_FROM": "<unconfigured>", "MAIL_NAME": ""}
+        print(build(env, a.to, a.subject, body))
+        record({"ts": stamp(), "to": a.to, "subject": a.subject, "body_file": a.body,
+                "status": "DRY-RUN", "relayed": False}, ledger=a.ledger)
+        return 0
+
+    try:
+        env = load_env(a.env)
+    except ConfigError as exc:
+        print(f"adint-mail-send: {exc}", file=sys.stderr)
+        print("the dedicated mailbox does not exist yet — create it, then fill "
+              f"{a.env or ENVFILE} (chmod 600). Use --dry-run to render without sending.",
+              file=sys.stderr)
+        return 3
+
+    msg = build(env, a.to, a.subject, body)
+    try:
+        send(env, msg)
+    except Exception as exc:  # noqa: BLE001 - the reason belongs on the row, not in a traceback
+        record({"ts": stamp(), "to": a.to, "subject": a.subject, "body_file": a.body,
+                "status": "FAILED", "error": f"{type(exc).__name__}: {exc}", "relayed": False},
+               ledger=a.ledger)
+        print(f"adint-mail-send: send failed: {exc}", file=sys.stderr)
+        return 4
+
+    relayed, relay_err = relay_to_operator(a.to, a.subject, body)
+    record({"ts": stamp(), "to": a.to, "subject": a.subject, "body_file": a.body,
+            "status": "SENT", "relayed": relayed, "relay_error": None if relayed else relay_err,
+            "reply": None}, ledger=a.ledger)
+    print(f"sent: {a.to} | relayed to operator: {'yes' if relayed else 'NO — ' + relay_err}")
+    return 0 if relayed else 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())
