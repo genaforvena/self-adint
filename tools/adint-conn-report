@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""adint-conn-report — read a PCAPdroid Connections CSV and report what it can and cannot say.
+
+Step-0's artifact is the CONNECTIONS csv (app column), never the pcap. Two instruments here,
+both learned the hard way:
+
+  * hosts are listed IN FULL, never filtered by a name-regex. A regex of known ad-network names
+    reported "no exchanges" on a capture that contained MediaGo and Yandex's own delivery path —
+    the domains that mattered carried no ad-ish token at all. A name list can flag; it must never
+    be allowed to produce a NEGATIVE claim.
+  * BytesRcvd separates an IMPRESSION from a request. A creative weighs hundreds of KB; a row with
+    no kilobytes is a config fetch, a beacon, or a refused handshake. Yandex.Go's 656 KB from
+    avatars.mds.yandex.net was corroborated by the operator's eyes ("~6 banners"); SofaScore's
+    16 KB over 14 minutes means nothing was rendered in-window whatever its DEX ships.
+
+Usage: adint-conn-report <connections.csv> [--top N]
+"""
+import csv, sys, collections
+
+FLAG = ('doubleclick', 'googleads', 'applovin', 'unity', 'inmobi', 'ironsrc', 'ironsource',
+        'vungle', 'mopub', 'smaato', 'pubmatic', 'criteo', 'adcolony', 'chartboost', 'fyber',
+        'inner-active', 'yandexadexchange', 'adsdk.yandex', 'an.yandex', 'mytarget', 'adfox',
+        'mradx', 'bidmachine', 'appodeal', 'pangle', 'mediago', 'moloco', 'liftoff', 'verve',
+        'smartadserver', 'teads', 'appmetrica', 'adjust', 'appsflyer', 'branch', 'amplitude',
+        'app-measurement', 'apptracer', 'facebook')
+IMPRESSION_FLOOR = 50_000   # bytes; below this nothing image-shaped arrived
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    top = 20
+    if '--top' in sys.argv:
+        top = int(sys.argv[sys.argv.index('--top') + 1])
+    rows = list(csv.DictReader(open(sys.argv[1])))
+    if not rows:
+        sys.exit('empty csv')
+
+    span = (min(r['FirstSeen'] for r in rows), max(r['LastSeen'] for r in rows))
+    print(f"rows {len(rows)} | {span[0]} -> {span[1]} | apps {len(set(r['PackageName'] for r in rows))}")
+
+    noinfo = sum(1 for r in rows if not r['Info'].strip())
+    print(f"hostname present {len(rows)-noinfo} | ABSENT {noinfo} (cached DNS / pre-window connection — host unknowable)")
+
+    print("\n== bytes received per app (an impression must WEIGH) ==")
+    per = collections.Counter()
+    for r in rows:
+        per[r['PackageName']] += int(r['BytesRcvd'])
+    for p, b in per.most_common(top):
+        mark = '' if b >= IMPRESSION_FLOOR else '   <- nothing image-shaped arrived'
+        print(f"  {b/1e6:8.3f} MB  {p}{mark}")
+
+    print(f"\n== heaviest single connections (top {top}) ==")
+    for r in sorted(rows, key=lambda r: -int(r['BytesRcvd']))[:top]:
+        print(f"  {int(r['BytesRcvd']):9}  {r['PackageName']:32} {(r['Info'] or r['DstIp'])[:44]:44} {r['FirstSeen'][11:19]}")
+
+    print("\n== flagged hosts (a LEAD, never a verdict — the list is not the estate) ==")
+    hit = [r for r in rows if any(k in r['Info'].lower() for k in FLAG)]
+    for (p, h), n in collections.Counter((r['PackageName'], r['Info']) for r in hit).most_common():
+        b = sum(int(r['BytesRcvd']) for r in hit if r['PackageName'] == p and r['Info'] == h)
+        print(f"  {n:3}x {b:8}B  {p:30} {h}")
+
+    hosts = collections.Counter(r['Info'] for r in rows if r['Info'].strip())
+    unflagged = [h for h in hosts if not any(k in h.lower() for k in FLAG)]
+    print(f"\n== ALL other hosts, {len(unflagged)} of {len(hosts)} — READ THESE, the flag list is incomplete by construction ==")
+    for h in sorted(unflagged, key=lambda h: -sum(int(r['BytesRcvd']) for r in rows if r['Info'] == h)):
+        b = sum(int(r['BytesRcvd']) for r in rows if r['Info'] == h)
+        apps = ','.join(sorted(set(r['PackageName'].split('.')[-1] for r in rows if r['Info'] == h)))
+        print(f"  {hosts[h]:3}x {b:9}B  {h:52} {apps[:40]}")
+
+
+main()
