@@ -59,6 +59,11 @@ in a summary is a failure; it ends in a measured artifact or an answered questio
   (`mesh-chat`) in its own voice, and speaks to the operator over `mesh-voice-tx`.
 - Subagents for heavy reading (spec sweeps of OpenRTB, exchange documentation, log analysis).
   A subagent's report is a claim, not an artifact — check the artifact before acting on it.
-- Nothing in this repo is pushed anywhere public without his go. It holds his device identifiers
-  and his profile; treat the whole tree as sensitive.
+- **The repo is PUBLIC on his go of 2026-08-15** (`genaforvena/self-adint`) — the code and the
+  reasoning are published. That go covers the tracked tree and nothing else: **`data/` is
+  gitignored and stays gitignored**, because it is where his observations land — his installed
+  apps, his hosts, his device id. Committed files carry no node identifiers either (the
+  reachability table in `docs/step0-method-2026-08-15.md` is written with `<phone-lan-ip>`-style
+  placeholders on purpose). Before any commit, check that what you are publishing is the method,
+  not the measurement.
 - Language with the operator: Russian, voice + duplicated text.

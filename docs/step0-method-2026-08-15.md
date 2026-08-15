@@ -1,0 +1,92 @@
+# Step 0 — method record (adint window, 2026-08-15)
+
+**Question:** which exchanges actually sell the operator's own phone's traffic?
+**Artifact:** `data/bundle-exchange.tsv` — bundle → org, with observation counts. Not "app X shows ads".
+
+This file records what was *measured from this node*, what was *rejected and why*, and what
+therefore has to be asked of the operator. It is written before the instrument exists so that
+the reasoning is auditable when the numbers arrive.
+
+## What is reachable from `mesh-home`, measured 2026-08-15 05:5x UTC
+
+| target | probe | result |
+|---|---|---|
+| phone (Redmi 10) LAN `<phone-lan-ip>` | ICMP | up |
+| phone `:8022` (Termux sshd) | TCP connect | **open** — sshd alive |
+| phone ssh `<termux-user>@…:8022` | ssh, our key | **Permission denied (publickey,password,keyboard-interactive)** |
+| phone adb `<phone-lan-ip>:<adb-port>` | `adb connect` | connection refused |
+| phone tailscale `<phone-tailscale-ip>` | tailscale status | offline, last seen 49d |
+| phone LAN alt `<phone-lan-ip-stale>` | ICMP | no reply (this is what `mesh-phone-ip` still reports) |
+| router `<router-lan-ip>` | TCP 22/53/80/443 | all open |
+| router ssh `root@<router-lan-ip>` | ssh, our key | Permission denied (publickey,password) |
+
+So: **we have no shell on his phone and no credentials on the router.** `mesh-phone-ip` reports
+`phone UP, key REJECTED (cached auth-rejected)`, and `mesh-phone-watch` has been logging
+`PRESENT on LAN but ADB transport AND sshd both down` — the second half of that line is wrong,
+sshd answers; what is down is *our authorisation*, not the daemon. (Genome-side observation, not
+this project's lane — reported to the board as `[fyi]`, not fixed here.)
+
+Note also: this node's LAN address has drifted by one from what `CLAUDE.local.md` records.
+Same class of drift; likewise reported, not fixed here.
+
+## Options considered, and the ones rejected
+
+1. **Passive Wi-Fi capture from this node (monitor mode + the AP's PSK).** *Rejected on rule 4.*
+   Monitor mode captures the whole cell; every other device in the flat lands in the capture by
+   construction. "Nobody but him is in scope, ever, including incidentally" — a design step that
+   needs foreign frames on the wire is the wrong step, and a post-hoc filter does not undo it.
+2. **ARP/DHCP-level MITM on the LAN.** *Rejected* for the same reason plus it is a substrate
+   change on a contended commons.
+3. **Router DNS / flow log.** *Instruction-only, and secondary.* The router is read-only on this
+   mesh, and we hold no credentials, so this needs him either way. It also gives **no app
+   attribution**: a DNS log proves the household resolved `pubads.g.doubleclick.net`, not which
+   package asked, and the artifact Step 0 demands is keyed by bundle. Useful later as a
+   cross-check on *volume*, not as the primary instrument.
+4. **On-device per-app capture (VPNService-based, no root), run by him.** The only channel that
+   yields the required key — `(package, hostname)` — at zero cost and touching nothing but his
+   own device. This is the primary instrument. Instrument survey and the step-by-step:
+   `research-device-capture-2026-08-15.md`.
+5. **Static SDK inventory from a Termux shell** (`pm list packages -f`, read the APKs, look for
+   embedded ad-SDK signatures). Cheap, *complementary*, and honest about its limit: it yields
+   **candidates** — which SDKs an app embeds — never observation counts. It cannot answer "which
+   exchange actually sold an impression", only "which could". Needs the ssh key re-authorised.
+
+## What that means for the operator
+
+Two asks, both on his own device, both reversible, neither irreversible in the project's sense
+(no seat, no contract, no deposit, no GAID reset):
+
+- **A.** Re-authorise our ssh key in Termux (one command, restores the mesh's own phone body too).
+- **B.** Install and run the capture app for a normal day of his usage, then export.
+
+And one **question that has to be answered before either is worth doing**: *is the Redmi 10 the
+phone he actually carries and uses* — the one with his real installed apps and his real ad
+profile — or is it a mesh sense body with almost no consumer apps on it? Step 0 measures the
+device he lives on; measuring the wrong handset produces a table that is honest and useless.
+Per rule 6 this is not reconstructed from the mesh's config: it is asked.
+
+## The pipeline that is already built and tested
+
+`tools/adint-aggregate` (self-test: `python3 tools/adint-aggregate --test`) turns normalised
+observation records into the artifact:
+
+    {"ts":…,"source":…,"device":…,"package":…,"hostname":…,"count":…}   (JSONL)
+      → data/bundle-exchange.tsv     bundle → org/role/rtb_exchange/external_seat + counts
+      → data/unresolved-hosts.tsv    every host the reference table could not name
+
+Properties asserted by the self-test, **each seen red under a deliberate mutation** before being
+accepted (2026-08-15):
+
+| property | mutation that must break it | seen red |
+|---|---|---|
+| a foreign device's rows never reach any output | `if dev != device:` → `if False:` | yes — 7 checks red |
+| longest-suffix domain match, not first-match | `len(pat) > len(best[0])` → first wins | yes |
+| an unnamed host is loud, with its count | drop the unresolved record / zero its count | yes (both) |
+| a missing reference table is an error, not an empty map | `raise` → `return {}` | yes |
+
+The last one matters more than it looks: an empty mapping renders *every* host `UNKNOWN` and the
+run still "succeeds" — a table of nothing that looks like a finished measurement.
+
+The reference table itself (`ref/exchange-domains.tsv`, domain → org → does that org run an
+OpenRTB exchange → can an outsider get a seat there) is public knowledge, committed, and is what
+turns hostnames into the decision Step 0 exists to make: **which exchange to approach at all.**

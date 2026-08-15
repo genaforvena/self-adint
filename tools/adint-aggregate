@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""adint-aggregate — Step 0's artifact producer.
+
+Input : normalised observation records, JSONL, one object per line:
+        {"ts":"<iso8601>","source":"<instrument>","device":"<device id>",
+         "package":"<android package / app.bundle>","hostname":"<observed host>",
+         "count":<int, default 1>}
+Ref   : ref/exchange-domains.tsv  (domain_pattern org role rtb_exchange external_seat
+        confidence source) — public knowledge, committed.
+Output: data/bundle-exchange.tsv   bundle -> org, with observation counts
+        data/unresolved-hosts.tsv  every host the ref table could NOT name
+
+Hard rules this file enforces (self-adint CLAUDE.md rules 1, 2 and the UNKNOWN doctrine):
+
+  * --device is MANDATORY. A record whose device is not the target is dropped in the
+    parser, before any buffer. It is counted (a bare integer) and NEVER written anywhere —
+    not as a row, not as an aggregate, not as a "noise statistic". The counter carries no
+    device id, no hostname, no package.
+  * A host the ref table cannot name is UNKNOWN, and UNKNOWN is loud: it lands in
+    unresolved-hosts.tsv and in the printed coverage line. Silently dropping it, or
+    letting it default into some org, would be a fabricated result.
+  * There is no fallback ref table. A missing/empty ref table is an error, not an
+    empty mapping that renders every host UNKNOWN and looks like a finished run.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+REF_DEFAULT = os.path.join(ROOT, "ref", "exchange-domains.tsv")
+
+REF_COLUMNS = ["domain_pattern", "org", "role", "rtb_exchange",
+               "external_seat", "confidence", "source"]
+
+
+class RefError(Exception):
+    pass
+
+
+def load_ref(path):
+    """Return {domain_pattern: {col: value}}. Raises RefError — never returns {}."""
+    if not os.path.exists(path):
+        raise RefError("ref table missing: %s" % path)
+    table = {}
+    with open(path, encoding="utf-8") as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        if header[:len(REF_COLUMNS)] != REF_COLUMNS:
+            raise RefError("ref header is %r, expected %r" % (header, REF_COLUMNS))
+        for lineno, line in enumerate(fh, start=2):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < len(REF_COLUMNS):
+                raise RefError("ref line %d has %d fields, expected %d"
+                               % (lineno, len(parts), len(REF_COLUMNS)))
+            row = dict(zip(REF_COLUMNS, parts))
+            pat = row["domain_pattern"].strip().lower().strip(".")
+            if not pat:
+                raise RefError("ref line %d has an empty domain_pattern" % lineno)
+            table[pat] = row
+    if not table:
+        raise RefError("ref table %s has a header but no rows" % path)
+    return table
+
+
+def resolve(host, table):
+    """Longest-suffix match. Returns the ref row, or None (== UNKNOWN)."""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return None
+    best = None
+    for pat, row in table.items():
+        if h == pat or h.endswith("." + pat):
+            if best is None or len(pat) > len(best[0]):
+                best = (pat, row)
+    return best[1] if best else None
+
+
+UNKNOWN = {"org": "UNKNOWN", "role": "unknown", "rtb_exchange": "unknown",
+           "external_seat": "unknown", "confidence": "n/a", "source": ""}
+
+
+def aggregate(lines, device, table):
+    """Parse records, keep only `device`, aggregate. Returns (stats, cells, hosts).
+
+    Foreign-device records are counted and discarded here — before any structure
+    that reaches disk.
+    """
+    stats = {"read": 0, "kept": 0, "foreign_dropped": 0, "malformed": 0,
+             "obs_total": 0, "obs_resolved": 0}
+    cells = defaultdict(lambda: {"obs": 0, "hosts": set(), "first": None, "last": None})
+    hosts = defaultdict(lambda: {"obs": 0, "pkgs": set()})
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        stats["read"] += 1
+        try:
+            rec = json.loads(line)
+            dev = rec["device"]
+            pkg = rec["package"]
+            host = rec["hostname"]
+            cnt = int(rec.get("count", 1))
+        except Exception:
+            stats["malformed"] += 1
+            continue
+        if dev != device:
+            stats["foreign_dropped"] += 1
+            del rec, dev, pkg, host, cnt
+            continue
+        stats["kept"] += 1
+        stats["obs_total"] += cnt
+        row = resolve(host, table) or UNKNOWN
+        if row is not UNKNOWN:
+            stats["obs_resolved"] += cnt
+        else:
+            u = hosts[host]
+            u["obs"] += cnt
+            u["pkgs"].add(pkg)
+        key = (pkg, row["org"], row["role"], row["rtb_exchange"], row["external_seat"])
+        c = cells[key]
+        c["obs"] += cnt
+        c["hosts"].add(host)
+        ts = rec.get("ts") or ""
+        if ts:
+            c["first"] = ts if c["first"] is None else min(c["first"], ts)
+            c["last"] = ts if c["last"] is None else max(c["last"], ts)
+    return stats, cells, hosts
+
+
+def render_bundle_table(cells):
+    out = ["\t".join(["bundle", "org", "role", "rtb_exchange", "external_seat",
+                      "observations", "distinct_hosts", "first_seen", "last_seen"])]
+    for key in sorted(cells, key=lambda k: (-cells[k]["obs"], k[0], k[1])):
+        pkg, org, role, rtb, seat = key
+        c = cells[key]
+        out.append("\t".join([pkg, org, role, rtb, seat, str(c["obs"]),
+                              str(len(c["hosts"])), c["first"] or "", c["last"] or ""]))
+    return "\n".join(out) + "\n"
+
+
+def render_unresolved(hosts):
+    out = ["\t".join(["hostname", "observations", "distinct_packages"])]
+    for host in sorted(hosts, key=lambda h: (-hosts[h]["obs"], h)):
+        out.append("\t".join([host, str(hosts[host]["obs"]),
+                              str(len(hosts[host]["pkgs"]))]))
+    return "\n".join(out) + "\n"
+
+
+def coverage_line(stats):
+    tot, res = stats["obs_total"], stats["obs_resolved"]
+    pct = ("%.1f%%" % (100.0 * res / tot)) if tot else "n/a"
+    return ("coverage: %d/%d observations named (%s) · kept=%d foreign-dropped=%d "
+            "malformed=%d" % (res, tot, pct, stats["kept"],
+                              stats["foreign_dropped"], stats["malformed"]))
+
+
+# ---------------------------------------------------------------- self-test
+
+FIXTURE_REF = "\t".join(REF_COLUMNS) + "\n" + "\n".join([
+    "\t".join(["doubleclick.net", "Google", "exchange", "yes", "no", "high", "fixture"]),
+    "\t".join(["applovin.com", "AppLovin", "mediation", "yes", "unknown", "high", "fixture"]),
+    "\t".join(["pubads.g.doubleclick.net", "Google", "ssp", "yes", "no", "high", "fixture"]),
+]) + "\n"
+
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        refp = os.path.join(td, "ref.tsv")
+        with open(refp, "w", encoding="utf-8") as fh:
+            fh.write(FIXTURE_REF)
+        table = load_ref(refp)
+
+        check("ref loads 3 rows", len(table) == 3, len(table))
+
+        # longest-suffix wins, not first match
+        r = resolve("pubads.g.doubleclick.net", table)
+        check("longest suffix wins", r and r["role"] == "ssp", r)
+        r = resolve("static.doubleclick.net", table)
+        check("plain suffix match", r and r["org"] == "Google", r)
+        check("no partial-label match", resolve("notdoubleclick.net", table) is None)
+        check("unknown host is None", resolve("example.com", table) is None)
+        check("empty host is None", resolve("", table) is None)
+
+        # ref table errors are errors, never an empty mapping
+        try:
+            load_ref(os.path.join(td, "nope.tsv")); check("missing ref raises", False)
+        except RefError:
+            check("missing ref raises", True)
+        emptyp = os.path.join(td, "empty.tsv")
+        with open(emptyp, "w", encoding="utf-8") as fh:
+            fh.write("\t".join(REF_COLUMNS) + "\n")
+        try:
+            load_ref(emptyp); check("header-only ref raises", False)
+        except RefError:
+            check("header-only ref raises", True)
+
+        # the privacy invariant: a foreign device leaves NO trace in any output
+        recs = [
+            json.dumps({"ts": "2026-08-15T05:00:00Z", "device": "MINE", "source": "t",
+                        "package": "com.mine.app", "hostname": "pubads.g.doubleclick.net",
+                        "count": 3}),
+            json.dumps({"ts": "2026-08-15T06:00:00Z", "device": "MINE", "source": "t",
+                        "package": "com.mine.app", "hostname": "weird.example.com"}),
+            json.dumps({"ts": "2026-08-15T05:30:00Z", "device": "FOREIGN", "source": "t",
+                        "package": "com.foreign.app", "hostname": "foreign-host.example",
+                        "count": 99}),
+            "{not json",
+        ]
+        stats, cells, hosts = aggregate(recs, "MINE", table)
+        bundle_tsv = render_bundle_table(cells)
+        unresolved_tsv = render_unresolved(hosts)
+        blob = bundle_tsv + unresolved_tsv + coverage_line(stats)
+
+        check("foreign row dropped", stats["foreign_dropped"] == 1, stats)
+        check("malformed counted", stats["malformed"] == 1, stats)
+        check("kept only mine", stats["kept"] == 2, stats)
+        check("no foreign package anywhere", "com.foreign.app" not in blob)
+        check("no foreign host anywhere", "foreign-host.example" not in blob)
+        check("no foreign device id anywhere", "FOREIGN" not in blob)
+        check("foreign counts excluded", "99" not in bundle_tsv)
+
+        # UNKNOWN is first-class and loud
+        # the row must carry its COUNT, not merely the name: a host listed with a
+        # zeroed observation count is a hole that looks like coverage
+        check("unknown host reported with its count",
+              "weird.example.com\t1\t1" in unresolved_tsv, unresolved_tsv)
+        check("unknown row in bundle table", "\tUNKNOWN\t" in bundle_tsv)
+        check("coverage counts unknown as unnamed",
+              stats["obs_total"] == 4 and stats["obs_resolved"] == 3, stats)
+        check("coverage line honest", "3/4 observations named (75.0%)" in coverage_line(stats),
+              coverage_line(stats))
+
+        # counting, not row-counting: count= is respected
+        check("count field respected", "\t3\t" in bundle_tsv, bundle_tsv)
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", help="target device id — MANDATORY; everything else is dropped")
+    ap.add_argument("--in", dest="infile", help="observations JSONL (default: stdin)")
+    ap.add_argument("--ref", default=REF_DEFAULT, help="domain->org table")
+    ap.add_argument("--out-dir", default=os.path.join(ROOT, "data"))
+    ap.add_argument("--test", action="store_true", help="run the self-test")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if not args.device:
+        ap.error("--device is mandatory (rule 1: only his device reaches disk)")
+
+    try:
+        table = load_ref(args.ref)
+    except RefError as e:
+        print("adint-aggregate: %s" % e, file=sys.stderr)
+        return 2
+
+    src = open(args.infile, encoding="utf-8") if args.infile else sys.stdin
+    try:
+        stats, cells, hosts = aggregate(src, args.device, table)
+    finally:
+        if args.infile:
+            src.close()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    bpath = os.path.join(args.out_dir, "bundle-exchange.tsv")
+    upath = os.path.join(args.out_dir, "unresolved-hosts.tsv")
+    with open(bpath, "w", encoding="utf-8") as fh:
+        fh.write(render_bundle_table(cells))
+    with open(upath, "w", encoding="utf-8") as fh:
+        fh.write(render_unresolved(hosts))
+    print(coverage_line(stats))
+    print("wrote %s (%d rows) · %s (%d hosts)"
+          % (bpath, len(cells), upath, len(hosts)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
