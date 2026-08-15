@@ -1,0 +1,31 @@
+# One vocabulary for organisation names across the two reference tables.
+#
+# ref/sdk-signatures.tsv names an org the way the SDK's package path does (`DigitalTurbine`,
+# `ironSource`); ref/exchange-domains.tsv names the corporate entity, keeping the acquisition
+# history that makes a domain row legible (`Digital Turbine (Fyber/Inneractive)`,
+# `Unity/ironSource`). Both spellings earn their place. What is not acceptable is every
+# consumer inventing its own fuzzy match: the first ad-hoc comparison split four orgs in two
+# and reported host literals "without an SDK signature" for SDKs that were plainly there.
+#
+# `variant` is matched case-insensitively after stripping non-alphanumerics. Canonical names
+# are the domain table's spellings, because that is the table a decision is read out of.
+#
+# DELIBERATELY NOT ALIASED: a subsidiary whose SDK and DOMAIN family are distinct from its
+# owner's stays its own org — AdColony under Digital Turbine, Tapjoy under Unity. Folding
+# those into the parent would let the parent's domain rows report coverage for a family that
+# has none, which is exactly the blind spot the coverage gate exists to expose.
+variant	canonical
+DigitalTurbine	Digital Turbine (Fyber/Inneractive)
+Fyber	Digital Turbine (Fyber/Inneractive)
+ironSource	Unity/ironSource
+Liftoff	Vungle/Liftoff
+Vungle	Vungle/Liftoff
+VK	MyTarget/VK
+myTarget	MyTarget/VK
+Smaato	Smaato/Verve
+ByteDance	Pangle/ByteDance
+Pangle	Pangle/ByteDance
+Appodeal (BidMachine)	Appodeal
+BidMachine	Appodeal
+Tapjoy	Tapjoy (Unity/ironSource)
+Magnite (Telaria/Tremor)	Magnite

@@ -20,26 +20,46 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIGS="$ROOT/ref/sdk-signatures.tsv"
 
-usage() { echo "usage: $0 --host <user@ip> [--port 8022] --device <id> [--pkgs-from <file>]" >&2; exit 64; }
+usage() { echo "usage: $0 --host <user@ip> [--port 8022] --device <id> [--patterns <tsv>] [--key signature|hostname] [--source <label>] [--pkgs-from <file>]" >&2; exit 64; }
 
-HOST=""; PORT=8022; DEVICE=""; PKGS_FROM=""
+# Two scans share this machinery, and they answer DIFFERENT questions:
+#   --key signature (default)  which ad-SDK families ship in the app   (ref/sdk-signatures.tsv)
+#   --key hostname             which HOSTNAMES are written into the app as literals
+#                              (ref/exchange-domains.tsv) — sharper, and it feeds the same
+#                              shape as a wire observation, which is exactly why the record
+#                              carries source=dex-literal: a literal proves the app CAN talk
+#                              to that host, never that it DID.
+HOST=""; PORT=8022; DEVICE=""; PKGS_FROM=""; KEY="signature"; SOURCE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --host) HOST="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --device) DEVICE="${2:-}"; shift 2 ;;
+    --patterns) SIGS="${2:-}"; shift 2 ;;
+    --key) KEY="${2:-}"; shift 2 ;;
+    --source) SOURCE="${2:-}"; shift 2 ;;
     --pkgs-from) PKGS_FROM="${2:-}"; shift 2 ;;   # offline replay of a saved package list
     --test) exec "$ROOT/tools/adint-candidates" --test ;;
     *) usage ;;
   esac
 done
 [ -n "$HOST" ] && [ -n "$DEVICE" ] || usage
+case "$KEY" in signature|hostname) ;; *) echo "adint-inventory-run: --key must be signature or hostname" >&2; exit 64 ;; esac
+[ -n "$SOURCE" ] || { [ "$KEY" = hostname ] && SOURCE="dex-literal" || SOURCE="dex-inventory"; }
 [ -r "$SIGS" ] || { echo "adint-inventory-run: missing $SIGS" >&2; exit 2; }
 
 # Build ONE alternation from the signature table. An empty pattern set is an error, never a
 # silent scan that finds nothing and looks like a clean phone.
-PATTERNS="$(awk -F'\t' 'NR>1 && $1 !~ /^#/ && $1 != "" && $1 != "dex_pattern" {print $1}' "$SIGS")"
+PATTERNS="$(awk -F'\t' 'NR>1 && $1 !~ /^#/ && $1 != "" && $1 != "dex_pattern" && $1 != "domain_pattern" {print $1}' "$SIGS")"
 [ -n "$PATTERNS" ] || { echo "adint-inventory-run: no patterns in $SIGS" >&2; exit 2; }
+# A hostname pattern is matched as a SUFFIX anchored on the right — a bare regex over DEX
+# would capture the length-prefix bytes that precede the string and mint hosts that do not
+# exist (measured: `5com.applovin.com`). Escaping the dots keeps `adsdk.yandex.ru` from
+# matching `adsdkxyandex.ru`, and the trailing (^|[^a-z0-9.-]) is impossible here because
+# grep -o has no lookbehind, so the left edge is normalised in the awk stage below instead.
+if [ "$KEY" = hostname ]; then
+  PATTERNS="$(printf '%s\n' "$PATTERNS" | sed 's/\./\\./g')"
+fi
 ALT="$(printf '%s' "$PATTERNS" | paste -sd'|' -)"
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -76,8 +96,9 @@ if [ -z "${RAW//[[:space:]]/}" ]; then
   exit 4
 fi
 
-printf '%s\n' "$RAW" | awk -F'\t' -v ts="$TS" -v dev="$DEVICE" '
+CNTFIELD=hits; [ "$KEY" = hostname ] && CNTFIELD=count
+printf '%s\n' "$RAW" | awk -F'\t' -v ts="$TS" -v dev="$DEVICE" -v key="$KEY" -v src="$SOURCE" -v cnt="$CNTFIELD" '
   NF>=3 && $1 != "" {
     gsub(/"/,"",$1); gsub(/"/,"",$2);
-    printf "{\"ts\":\"%s\",\"source\":\"dex-inventory\",\"device\":\"%s\",\"package\":\"%s\",\"signature\":\"%s\",\"hits\":%d}\n", ts, dev, $1, $2, $3+0
+    printf "{\"ts\":\"%s\",\"source\":\"%s\",\"device\":\"%s\",\"package\":\"%s\",\"%s\":\"%s\",\"%s\":%d}\n", ts, src, dev, $1, key, $2, cnt, $3+0
   }'

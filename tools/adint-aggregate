@@ -93,6 +93,7 @@ def aggregate(lines, device, table):
     """
     stats = {"read": 0, "kept": 0, "foreign_dropped": 0, "malformed": 0,
              "obs_total": 0, "obs_resolved": 0}
+    sources = defaultdict(int)
     cells = defaultdict(lambda: {"obs": 0, "hosts": set(), "first": None, "last": None})
     hosts = defaultdict(lambda: {"obs": 0, "pkgs": set()})
 
@@ -115,6 +116,7 @@ def aggregate(lines, device, table):
             del rec, dev, pkg, host, cnt
             continue
         stats["kept"] += 1
+        sources[str(rec.get("source", "")) or "(unstated)"] += cnt
         stats["obs_total"] += cnt
         row = resolve(host, table) or UNKNOWN
         if row is not UNKNOWN:
@@ -131,12 +133,21 @@ def aggregate(lines, device, table):
         if ts:
             c["first"] = ts if c["first"] is None else min(c["first"], ts)
             c["last"] = ts if c["last"] is None else max(c["last"], ts)
+    stats["sources"] = dict(sources)
     return stats, cells, hosts
 
 
-def render_bundle_table(cells):
-    out = ["\t".join(["bundle", "org", "role", "rtb_exchange", "external_seat",
-                      "observations", "distinct_hosts", "first_seen", "last_seen"])]
+def render_bundle_table(cells, sources=None):
+    # The table must NAME what produced it. A wire capture and a static scan of the app's
+    # own code both land in this shape, and they are not the same claim: a hostname written
+    # into a DEX proves the app CAN talk to it, an observation proves it DID. A file that
+    # does not say which one it holds will eventually be read as the stronger of the two.
+    out = []
+    if sources is not None:
+        out.append("# sources: %s" % (", ".join("%s=%d" % (s, n) for s, n in
+                                                sorted(sources.items())) or "(none)"))
+    out.append("\t".join(["bundle", "org", "role", "rtb_exchange", "external_seat",
+                           "observations", "distinct_hosts", "first_seen", "last_seen"]))
     for key in sorted(cells, key=lambda k: (-cells[k]["obs"], k[0], k[1])):
         pkg, org, role, rtb, seat = key
         c = cells[key]
@@ -247,6 +258,19 @@ def selftest():
         check("coverage line honest", "3/4 observations named (75.0%)" in coverage_line(stats),
               coverage_line(stats))
 
+        # the artifact names what produced it
+        titled = render_bundle_table(cells, stats.get("sources"))
+        check("source recorded in the table header", titled.startswith("# sources: t=4"), titled.splitlines()[:1])
+        mixed_stats, mixed_cells, _ = aggregate([
+            json.dumps({"ts": "T", "device": "MINE", "source": "pcapdroid-csv",
+                        "package": "p", "hostname": "static.doubleclick.net", "count": 2}),
+            json.dumps({"ts": "T", "device": "MINE", "source": "dex-literal",
+                        "package": "p", "hostname": "static.doubleclick.net", "count": 1}),
+        ], "MINE", table)
+        head = render_bundle_table(mixed_cells, mixed_stats.get("sources")).splitlines()[0]
+        check("a mixed table names BOTH sources",
+              "dex-literal=1" in head and "pcapdroid-csv=2" in head, head)
+
         # counting, not row-counting: count= is respected
         check("count field respected", "\t3\t" in bundle_tsv, bundle_tsv)
 
@@ -286,7 +310,7 @@ def main():
     bpath = os.path.join(args.out_dir, "bundle-exchange.tsv")
     upath = os.path.join(args.out_dir, "unresolved-hosts.tsv")
     with open(bpath, "w", encoding="utf-8") as fh:
-        fh.write(render_bundle_table(cells))
+        fh.write(render_bundle_table(cells, stats.get("sources")))
     with open(upath, "w", encoding="utf-8") as fh:
         fh.write(render_unresolved(hosts))
     print(coverage_line(stats))

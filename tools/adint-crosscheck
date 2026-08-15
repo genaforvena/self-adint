@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""adint-crosscheck — what the two static lanes say about each other.
+
+    tools/adint-crosscheck [--candidates data/bundle-sdk-candidates.tsv]
+                           [--literals data/literals/bundle-exchange.tsv]
+
+Two scans read the same DEX and ask different questions:
+
+  * `adint-candidates`  — which ad-SDK FAMILIES ship in each app (class-path signatures)
+  * the `--key hostname` scan — which HOSTNAMES from the reference table are written into
+    each app as literals
+
+Neither is an observation of traffic. Put side by side they do say something a single lane
+cannot, and the disagreement is the informative part:
+
+  SDK present, host literal present  → the app carries the SDK and its endpoint is in the code
+  SDK present, NO host literal       → the endpoint is built at runtime, or (the common case)
+                                       the SDK reference is a mediation ADAPTER, not the SDK
+  host literal, NO SDK signature     → the signature table has a hole — a real defect in ours
+
+The last line is why this tool exists: it is the only automatic check on the signature
+table's completeness, and it is checkable without a single packet.
+
+Org names are resolved through `ref/org-aliases.tsv`. Without it, the same org spelled two
+ways in the two reference tables splits into a phantom pair — measured, not hypothetical.
+An org that no alias covers is REPORTED, so the vocabulary is maintained loudly rather than
+silently drifting.
+"""
+
+import argparse
+import os
+import sys
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+ALIASES_DEFAULT = os.path.join(ROOT, "ref", "org-aliases.tsv")
+
+NON_DEMAND_ROLES = {"attribution", "analytics", "identifier", "cdn", "unknown"}
+
+
+def norm(name):
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def load_aliases(path):
+    """{normalised variant: canonical}. A missing file is an error: silently falling back to
+    identity would reinstate exactly the phantom split this table was added to remove."""
+    if not os.path.exists(path):
+        raise SystemExit("adint-crosscheck: missing alias table %s" % path)
+    out = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[0] == "variant":
+                continue
+            out[norm(parts[0])] = parts[1].strip()
+    return out
+
+
+def canon(name, aliases):
+    return aliases.get(norm(name), name.strip())
+
+
+def read_candidates(path, aliases):
+    """{canonical org: {"apps": set, "raw": set of spellings, "sdks": set}}"""
+    orgs = defaultdict(lambda: {"apps": set(), "raw": set(), "sdks": set()})
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("bundle\t"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 7 or p[6] != "yes":
+                continue
+            o = orgs[canon(p[1], aliases)]
+            o["apps"].add(p[0])
+            o["raw"].add(p[1])
+            o["sdks"].update(s.strip() for s in p[3].split(",") if s.strip())
+    return orgs
+
+
+def read_literals(path, aliases):
+    """{canonical org: {"apps": set, "raw": set, "hits": int}}"""
+    orgs = defaultdict(lambda: {"apps": set(), "raw": set(), "hits": 0})
+    if not os.path.exists(path):
+        return orgs
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("bundle\t"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 7 or p[2] in NON_DEMAND_ROLES:
+                continue
+            o = orgs[canon(p[1], aliases)]
+            o["apps"].add(p[0])
+            o["raw"].add(p[1])
+            o["hits"] += int(p[5] or 0)
+    return orgs
+
+
+def rows(cands, lits):
+    out = []
+    for org in sorted(set(cands) | set(lits),
+                      key=lambda o: (-len(cands.get(o, {}).get("apps", ())),
+                                     -len(lits.get(o, {}).get("apps", ())), o)):
+        s = len(cands.get(org, {}).get("apps", ()))
+        l = len(lits.get(org, {}).get("apps", ()))
+        if s and not l:
+            verdict = "adapter-or-runtime-host"
+        elif l and not s:
+            verdict = "SIGNATURE-TABLE-HOLE"
+        elif l < s:
+            verdict = "literals in a subset"
+        else:
+            verdict = "literals where the SDK is"
+        out.append((org, s, l, verdict))
+    return out
+
+
+def unmapped(cands, lits, aliases):
+    """Candidate SPELLING SPLITS: an org present in only one lane whose name overlaps an org
+    present only in the other. An org simply absent from one lane is ordinary (an SDK with no
+    host literal is the common case) and reporting it would bury the real signal in noise —
+    the check is for two names that look like one entity, not for one-lane orgs."""
+    only_sdk = {o for o in cands if o not in lits}
+    only_lit = {o for o in lits if o not in cands}
+    out = []
+    for a in sorted(only_sdk):
+        na = norm(a)
+        for b in sorted(only_lit):
+            nb = norm(b)
+            if na and nb and (na in nb or nb in na) and norm(a) not in aliases:
+                out.append("%s / %s" % (a, b))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--candidates", default=os.path.join(ROOT, "data", "bundle-sdk-candidates.tsv"))
+    ap.add_argument("--literals", default=os.path.join(ROOT, "data", "literals", "bundle-exchange.tsv"))
+    ap.add_argument("--aliases", default=ALIASES_DEFAULT)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    aliases = load_aliases(args.aliases)
+    if not os.path.exists(args.candidates):
+        print("adint-crosscheck: no candidates table at %s" % args.candidates, file=sys.stderr)
+        return 2
+    cands = read_candidates(args.candidates, aliases)
+    lits = read_literals(args.literals, aliases)
+
+    print("%-34s %8s %9s   %s" % ("org", "sdk-apps", "host-apps", "reading"))
+    holes = 0
+    for org, s, l, verdict in rows(cands, lits):
+        print("%-34s %8d %9d   %s" % (org[:34], s, l, verdict))
+        if verdict == "SIGNATURE-TABLE-HOLE":
+            holes += 1
+    todo = unmapped(cands, lits, aliases)
+    if todo:
+        print("\norgs seen in ONE lane only and not in ref/org-aliases.tsv "
+              "(check they are not the same org spelled twice): %s" % ", ".join(todo))
+    print("\n%d orgs · %d signature-table holes · neither lane is an observation of traffic"
+          % (len(set(cands) | set(lits)), holes))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        def write(name, body):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            return p
+
+        ap = write("aliases.tsv", "variant\tcanonical\nironSource\tUnity/ironSource\n")
+        aliases = load_aliases(ap)
+        check("alias loads", canon("ironSource", aliases) == "Unity/ironSource", aliases)
+        check("unknown org passes through", canon("Yandex", aliases) == "Yandex")
+        check("alias match ignores case and punctuation",
+              canon("IRON-SOURCE", aliases) == "Unity/ironSource")
+
+        cp = write("cands.tsv", "bundle\torg\trole\tsdks\tsignature_hits\tdistinct_signatures\tdemand_side\n"
+                   "com.a\tironSource\tmediation\tironSource\t300\t1\tyes\n"
+                   "com.b\tironSource\tmediation\tironSource\t300\t1\tyes\n"
+                   "com.c\tYandex\texchange\tYandex\t2000\t1\tyes\n"
+                   "com.d\tAppsFlyer\tattribution\tAppsFlyer\t50\t1\tno\n")
+        lp = write("lits.tsv", "# sources: dex-literal=9\n"
+                   "bundle\torg\trole\trtb_exchange\texternal_seat\tobservations\tdistinct_hosts\tfirst_seen\tlast_seen\n"
+                   "com.a\tUnity/ironSource\texchange\tyes\tyes\t4\t1\t\t\n"
+                   "com.c\tYandex\texchange\tyes\tyes\t5\t1\t\t\n"
+                   "com.e\tPubMatic\texchange\tyes\tyes\t3\t1\t\t\n"
+                   "com.f\tGoogle\tanalytics\tno\tno\t7\t1\t\t\n")
+        cands = read_candidates(cp, aliases)
+        lits = read_literals(lp, aliases)
+
+        check("non-demand candidate row excluded", "AppsFlyer" not in cands, list(cands))
+        check("non-demand literal role excluded", "Google" not in lits, list(lits))
+
+        table = {r[0]: r for r in rows(cands, lits)}
+        check("alias joins the two spellings into one org",
+              "ironSource" not in table and table["Unity/ironSource"][1] == 2, list(table))
+        check("subset verdict", table["Unity/ironSource"][3] == "literals in a subset", table)
+        check("full-agreement verdict", table["Yandex"][3] == "literals where the SDK is", table)
+        check("a literal with no signature is a HOLE in OUR table",
+              table["PubMatic"][3] == "SIGNATURE-TABLE-HOLE", table)
+
+        # without the alias the same input splits the org in two — the failure this file exists for
+        empty = write("empty-aliases.tsv", "variant\tcanonical\n")
+        na = load_aliases(empty)
+        split = {r[0]: r for r in rows(read_candidates(cp, na), read_literals(lp, na))}
+        check("without aliases the org splits (the bug being prevented)",
+              "ironSource" in split and "Unity/ironSource" in split, list(split))
+        check("and the split fabricates a false hole",
+              split["Unity/ironSource"][3] == "SIGNATURE-TABLE-HOLE", split)
+        # a one-lane org is ordinary and must NOT be reported...
+        check("a plainly absent org is not reported as a split",
+              not any("PubMatic" in u for u in unmapped(cands, lits, aliases)),
+              unmapped(cands, lits, aliases))
+        # ...but two overlapping names split across the lanes must be
+        split_c = read_candidates(cp, load_aliases(write("none.tsv", "variant\tcanonical\n")),)
+        split_l = read_literals(lp, load_aliases(os.path.join(td, "none.tsv")))
+        check("an overlapping pair split across lanes is reported",
+              any("ironSource" in u and "Unity/ironSource" in u
+                  for u in unmapped(split_c, split_l, load_aliases(os.path.join(td, "none.tsv")))),
+              unmapped(split_c, split_l, load_aliases(os.path.join(td, "none.tsv"))))
+
+        try:
+            load_aliases(os.path.join(td, "nope.tsv"))
+            check("missing alias table is fatal", False)
+        except SystemExit:
+            check("missing alias table is fatal", True)
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

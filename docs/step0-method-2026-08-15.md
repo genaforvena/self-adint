@@ -139,6 +139,40 @@ list of known hosts (the pattern anchors both ends), fatal for discovery: those 
 entered a reference table as new domains, sourced to "observed on the device". Any literal-mining
 lane must anchor on a known suffix and treat the left edge as garbage until proven otherwise.
 
+### Two static lanes with opposite blind spots
+
+The literal probe was then run across the whole phone against all 87 reference domains
+(`tools/adint-inventory-run --key hostname`), and cross-checked against the signature scan
+(`tools/adint-crosscheck`). The disagreement is the point:
+
+| org | apps with the SDK signature | apps with a host literal |
+|---|---|---|
+| Google | 18 | 12 |
+| AppLovin | 12 | 4 |
+| Unity/ironSource | 11 | 1 |
+| Digital Turbine | 10 | 1 |
+| Huawei | 9 | 0 |
+| Yandex | 7 | 6 |
+| Meta | 6 | 0 |
+| MyTarget/VK | **3** | **5** |
+
+**Signatures without literals** (Huawei, Meta, Chartboost, Mintegral, Pangle, Smaato, Amazon,
+Appodeal, Tapjoy) are the expected case: the endpoint is assembled at runtime, or the reference
+is a mediation adapter rather than the SDK. Not evidence of absence either way.
+
+**Literals without signatures is the finding.** Three apps — a bank, a mobile operator, and one
+more — carry myTarget/VK ad hosts (`r.my.com`, `ad.mail.ru`) with no `com/my/target` class path
+anywhere in their DEX. The reason is mechanical: **R8/ProGuard renames class paths and does not
+touch string constants.** A signature scan goes blind on an obfuscated app in exactly the
+direction that matters — it reports *no demand relationship* where one is written into the code
+— and the literal scan sees straight through it. The reverse blind spot is just as real: an SDK
+that builds its host at runtime has no literal at all.
+
+Neither lane is an observation, and this is the whole reason the cross-check exists rather than
+a single "static scan" that would have silently inherited one of the two blindnesses. It also
+gives the capture a falsifiable prediction: those three apps should contact `my.com` hosts on the
+wire, and if they do not, one of the two static lanes is lying about something.
+
 ## The shape of Step 0's own verdict: `IN` / `UNKNOWN`, never `NOT`
 
 The oracle his brief designed for segments — `LOSS` is not `NOT IN`, a negative is
