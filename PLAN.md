@@ -1,8 +1,10 @@
 # Self-ADINT — working plan
 
 His draft is `docs/brief-2026-08-15-operator.md` and stands as written. This file is the plan the
-window executes: his order of work with **one step inserted in front of it** and four corrections
-folded into the steps they belong to. Everything below that is not his is marked as ours.
+window executes: his order of work with **one step inserted in front of it** and our corrections
+folded into the steps they belong to — each one marked `OURS` and lettered inside its step, so the
+set is read off the headings and never off a count kept beside them (the count said "four" while
+seven were already in the file).
 
 His parts that needed no correction and are adopted as-is: the three-valued oracle (`IN` /
 `UNKNOWN` / `NOT`), the argument that segment membership is monotone and therefore `ddmin`
@@ -11,6 +13,77 @@ tool for "what minimal subset of behaviour puts me in X", the decoy bidder's nec
 latency-first choice of VM region, and the privacy invariant.
 
 ---
+
+## Method — the planted-invariant oracle (his doc, 2026-08-15; corrections OURS)
+
+`docs/method-planted-invariant-oracle-2026-08-15-operator.pdf` (+ `.txt`) generalises the project's
+core move into a domain-independent method: **find a quantity the system cannot corrupt because it
+needs it itself, put your own mark in it, read the output.** The shift it names is the load-bearing
+one — not *observe the system* but *control its input*: without input control any observation yields
+correlation, with it the provenance of the fact is known and the reading is causal. Adopted as the
+frame for Steps 4–6.
+
+Adopted as written: the four applicability conditions (a write channel · an observable output, one
+bit is enough · an invariant exists · the mark is globally unique); the route to finding the
+invariant through the pipeline's *loss function* — what is preserved exactly is what is monetised;
+the ladder of what can be extracted (connectivity → topology → time → provenance → inference model);
+the one-sided oracle with `k` computed from the observed occasion rate rather than taken as a
+constant; and the phase order, passive read **before** injection, because injection contaminates the
+baseline irreversibly. The strongest single thing in the document is that the rival explanation is
+written *into* the method: a field may arrive untouched out of **code inertia** rather than value,
+and the two are told apart by an external sign (is there a market for that field) — never by the
+data itself.
+
+Six notes below. **M1–M4 are corrections to the method**; M5 is a naming, M6 an ordering fact.
+
+**M1 (OURS) — the false `NO` is closed, the false `YES` is not.** The document handles the one-sided
+direction correctly: absence of return proves nothing. It does not handle the other failure — a mark
+can come back by a path other than the hypothesised one. Two concrete shapes: the SDK caches the
+value and re-emits it inside the same session, and two of our vantages sit on one upstream, so the
+"second confirmation" is a copy of the first observation rather than an independent one. Hence a
+**fifth applicability condition: the return vantage must be one our own injection could not have
+fed**, and it is established before any `YES` is trusted, not after. This is the mesh's own
+`a-cached-sample-reread-faster-than-its-producer` and `two-methods-agreeing-is-not-corroboration`,
+applied to a system we do not own — where it is harder, because we cannot inspect the wiring that
+would prove independence and must infer it from the outside.
+
+**M2 (OURS) — "the moment the mark stops arriving" is not the retention period.** It is a
+right-censored lower bound: `min(true TTL, our observation window, occasion frequency, overwrite by
+a fresher mark)`. The occasion base rate the document already computes for `k` must enter the time
+estimate as well, and the result is reported as a **lower bound**, never as a storage term — the
+error is one-directional and always flatters the system (measured retention comes out shorter than
+real). Formally this is survival analysis with right censoring: with the occasion rate in hand a
+Kaplan–Meier-style estimate is available; a single "last seen" date is not an estimate at all.
+
+**M3 (OURS) — condition 4 is necessary and not sufficient.** The mark must be unique **in the key
+space** and **typical in the field's own distribution**. A statistically odd value is caught by
+anti-fraud before it is caught by anything else, and then the quantity measured is the fraud filter,
+not the pipeline — with the side effect of landing in a sample that gets discarded. Practical form:
+draw the mark from the value distribution Step 4's passive read observes, never from a random
+string. Uniqueness buys proof; typicality buys survival, and the method needs both.
+
+**M4 (OURS) — step 5 of the method (the plausible false fact) is understated as "the point of no
+return for the baseline".** A planted fact propagates to third parties and is resold; it cannot be
+recalled; and at that step his own caveat — *the method yields facts about paths, not intentions* —
+stops holding, because the profile is no longer being read but shaped. The privacy invariant
+(`CLAUDE.md` rule 2), which today governs the **inbound** direction, is extended **outbound**: a
+planted false fact is chosen to be harmless in every downstream use — nothing health-, credit-,
+employment-, political- or location-adjacent — and the choice is his, on the record, not the
+window's.
+
+**M5 (naming, not a correction).** The nearest formal relative is not the canary token but the
+**chosen-plaintext attack**: the move from ciphertext-only (passive observation) to chosen
+plaintext, which is a strictly stronger model — that is exactly the upgrade this method buys. The
+"a distinct mark per source" step (topology) is **traitor tracing**, whose collusion theory applies
+directly here, since data pooling between exchanges *is* collusion in that theory's sense.
+
+**M6 (ordering).** The cheapest planted invariant needs no seat and no money: the **GAID reset** of
+Step 6 — `t0` is known exactly and it answers the most interesting question available about the box
+(does the profile survive an ID reset). Correction to how this was first put to him by voice, where
+it was called simply free: it is free in money and independent of Step 3, but **not free in
+baseline** — the reset is destructive to the very profile state being measured. The Step 6 ordering
+constraint therefore stands unchanged: his explicit go, and only after the passive baseline exists.
+Cheap is not the same as reversible.
 
 ## Step 0 — which exchanges actually sell his phone? (OURS; cost ≈ 0; before anything irreversible)
 
@@ -133,11 +206,24 @@ reconstruct.)
 Unchanged. Note his own condition: `WIN → состою` holds only if the exchange applies targeting
 honestly, which question 6 partly probes.
 
+This is the step the planted-invariant method governs: **M1** (a `WIN` counts only from a vantage
+our own bid could not have fed), **M2** (any time figure read out here is a lower bound), **M3** (the
+mark is drawn from the distribution Step 4 observed, not invented) all bind here, and **M4** binds
+the moment a planted value stops being a meaningless token and starts being a plausible claim about
+him.
+
 ## Step 6 — GAID reset → repeat the battery → profile recovery curve (his step 5)
 
 Unchanged, and agreed: this is the strongest demonstration available here. It is also destructive
 to his own profile state, so it runs on his explicit go and after the passive baseline exists —
 resetting before there is a baseline destroys the comparison the demonstration is made of.
+
+Read together with **M6**: in the method's own vocabulary this step is the cheapest planted
+invariant in the project — no seat, no money, `t0` exact — which makes it tempting to pull forward.
+It is not gated on Step 3; it *is* gated on Step 4. The recovery curve is measured against the
+baseline or it is not measured at all, and **M2** applies to the curve's tail exactly as it does to
+any other decay reading here: the point where the old profile stops showing is a lower bound on
+re-linking time, censored by his own impression frequency.
 
 ---
 
