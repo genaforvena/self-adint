@@ -1,0 +1,5 @@
+# nothing from this tree is public — it holds his device identifiers and his profile
+*.jsonl
+*.pcap
+.env
+data/
