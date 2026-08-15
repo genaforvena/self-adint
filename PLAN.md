@@ -226,11 +226,54 @@ fabricated number into a legal document:
   silently claim the strong thing (they processed my data) from the weak row (their CDN served me
   a picture).
 
-**Blocked, and not guessed: the jurisdiction.** GDPR and 152-ФЗ differ in deadline, in required
-wording and in how hard they bite. Which applies depends on where he lives, he has been asked
-directly, and **no draft is written until he answers** — a template aimed at the wrong regime is
-worse than no template. When he answers: addressed drafts per recipient, from the evidence
-artifact; **he sends them himself and only after reading them** (rule 3).
+**Jurisdiction, answered 2026-08-15: he lives in RUSSIA → 152-ФЗ.** Two consequences he set, and
+one correction the research forced.
+
+- **Russian companies are out of scope for now, on his call** («а то что-нибудь отхватим»):
+  VK/mradx, Yandex/AppMetrica, SMI2. **The price is carried in the conclusions, not hidden:** the
+  Russian recipients hold the most — `report.appmetrica.yandex.net` is the single largest outbound
+  channel in the whole capture (147 connections, **841 790 bytes sent** from the device, across
+  seven apps), with `vk-analytics.ru`, `mc.yandex.ru` and `tracking.rus.miui.com` in the top five.
+  So the picture is **knowingly incomplete**, stated in plain words. A partial answer presented as
+  a whole one is the only way to spoil this step.
+- **The lever is Art 3(1), never Art 3(2).** Writing "I am a GDPR data subject" is wrong and gets
+  the request dismissed: Art 3(2) protects people *located in the Union*, and he is not. Art 3(1)
+  applies to processing "in the context of the activities of an establishment … in the Union,
+  regardless of whether the processing takes place in the Union or not" — the subject's location
+  is irrelevant. The letter says *your company has a European entity and the processing happens in
+  the context of its activities*, not *I am European*.
+- **Correction the research forced: an Art 27 REPRESENTATIVE is not an establishment.** It is
+  appointed *because* there is no EU establishment, and it serves the Art 3(2) branch — the one
+  that does not apply here. So a policy line reading "EEA Representative: …" is evidence
+  **against** the lever, not for it. Recipients therefore split three ways, and **three templates,
+  not one**: (A) named EU establishment → Art 3(1) directly; (B) only a representative → a
+  conditional formulation plus their own policy; (C) no European presence at all → their global
+  privacy policy only, named for what it is — **their promise, not law**. Classification and
+  sources: `docs/step0d-recipients-eu-entity-2026-08-15-ru.md`.
+
+**The request is itself a leak, and for one recipient that is mandatory.** Today they hold a GAID
+with no name on it; he writes from an address and attaches the GAID, and links the two by his own
+hand. Bidease's published procedure *requires* it — "your email must contain: — Your advertising ID
+(e.g. IDFA / GAID / etc.)". So the leak cannot be avoided, only controlled: a **separate mailbox
+for this and nothing else**, not tied to his number, not pulling an existing account, **neutral
+name** (he identifies himself in the body; the address need not carry it), created by him — we need
+the address, never the password — and the **deletion demand in the same letter**.
+
+**Refusal to delete is lawful, and informative.** A company may lawfully refuse to erase what it is
+required to retain, and that is not a brush-off. But "some data was retained" without a subject is
+useless, so the letter asks them to **enumerate what is retained and on what basis** — the
+composition of what is kept describes what they hold.
+
+**The three-outcome model — this step has no empty outcome:**
+
+1. **Profile produced** → the data itself.
+2. **Deletion refused with reasons** → the *composition* of what is retained.
+3. **Silence, against an observed exchange with their own host** → the loudest result of the three.
+   Not "it did not work": an organisation that does not answer an *addressed* request backed by
+   times, byte counts and the source app has said more than any reply would.
+
+The third only works because the request is addressed. Silence in answer to a blind "do you hold
+anything on me" means nothing at all — which is precisely why the capture comes first.
 
 ## Step 1 — receiver + decoy bidder, locally, on synthetic requests (his step 1)
 
