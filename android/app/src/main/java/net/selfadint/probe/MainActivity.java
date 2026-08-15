@@ -11,9 +11,9 @@ import org.prebid.mobile.BannerAdUnit;
 import org.prebid.mobile.Host;
 import org.prebid.mobile.PrebidMobile;
 import org.prebid.mobile.ResultCode;
-import org.prebid.mobile.api.exceptions.InitError;
+import org.prebid.mobile.api.data.BidInfo;
 import org.prebid.mobile.api.data.InitializationStatus;
-import org.prebid.mobile.eventhandlers.utils.PublisherAdViewUtils;
+import org.prebid.mobile.rendering.listeners.SdkInitializationListener;
 
 /**
  * The whole app. It exists to make the SDK describe this phone to our own Prebid Server,
@@ -56,7 +56,7 @@ public class MainActivity extends AppCompatActivity {
         PrebidMobile.setShareGeoLocation(false);   // geo is not what this step is measuring
         PrebidMobile.setTimeoutMillis(3000);
 
-        PrebidMobile.initializeSdk(getApplicationContext(), new org.prebid.mobile.api.rendering.pluginrenderer.PrebidMobilePluginRenderer[]{}, new PrebidMobile.SdkInitializationListener() {
+        PrebidMobile.initializeSdk(getApplicationContext(), new SdkInitializationListener() {
             @Override
             public void onInitializationComplete(InitializationStatus status) {
                 say("sdk init: " + status);
@@ -68,7 +68,10 @@ public class MainActivity extends AppCompatActivity {
     private void fetch() {
         BannerAdUnit unit = new BannerAdUnit("adint-imp-1", 300, 250);
         say("requesting demand — the SDK is now composing the bid request");
-        unit.fetchDemand(resultCode -> {
+        // fetchDemand(OnFetchDemandResult) — BidInfo carries the ResultCode plus the
+        // targeting keywords a real publisher would forward to its ad server.
+        unit.fetchDemand((BidInfo info) -> {
+            ResultCode resultCode = info.getResultCode();
             say("result: " + resultCode
                     + (resultCode == ResultCode.NO_BIDS
                        ? "\n(NO_BIDS is the EXPECTED outcome: the local server's only bidder"

@@ -6,7 +6,7 @@ android {
 
     defaultConfig {
         applicationId "net.selfadint.probe"
-        minSdk 24
+        minSdk 21
         targetSdk 34
         versionCode 1
         versionName "0.1"
@@ -23,6 +23,11 @@ android {
 }
 
 dependencies {
+    // Prebid pulls kotlin-stdlib-jdk7/jdk8 1.6.21 while the toolchain resolves kotlin-stdlib
+    // 1.8.22; from 1.8 the jdk7/jdk8 artifacts were folded INTO kotlin-stdlib, so having both
+    // on the classpath duplicates every class in them and dex merging fails. The BOM aligns
+    // all three to one version, where the jdk7/jdk8 jars are empty shims.
+    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
     implementation 'org.prebid:prebid-mobile-sdk:2.2.3'
     // Supplies AdvertisingIdClient. WITHOUT it the SDK cannot read the GAID and device.ifa
     // comes out empty — which would look exactly like a phone that refused to share it.
