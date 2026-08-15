@@ -30,8 +30,18 @@ in a summary is a failure; it ends in a measured artifact or an answered questio
 3. **No irreversible step without his explicit go, per step.** Onboarding a seat, signing an
    agreement, paying a deposit, contacting an exchange, resetting his GAID — the mind **drafts**,
    he ships. His "го" of 2026-08-15 authorises organising the channel and the plan, nothing beyond.
-4. **Nobody but him is in scope.** No observation of any other person or device, ever, including
-   incidentally. If a design step would require it, the step is wrong, not the rule.
+4. **Nobody but him is in scope — and the line is the DISK, not the socket** (revised 2026-08-15 on
+   his explicit word: *«на жёсткий диск никогда не попадает, если это не я»*). The old text banned
+   seeing a foreign request "even incidentally", which the project cannot honour the moment it
+   BIDS: to answer an auction you must parse the request you are answering. Pretending otherwise
+   would have meant a rule the code quietly breaks — worse than a rule that says what we do. So,
+   binding: a foreign request lives **in memory, for the duration of the bid, and nowhere else**.
+   Not one line, not one aggregate, not one counter keyed by anything about that person reaches
+   storage; the filter stays in the parser **before the buffer** (rule 1), and rule 2's no-body-log
+   discipline is what makes this true under panic, access log, and metrics alike. Nothing about
+   another person is ever *retained*, *derived from*, or *reported* — his ad may be served to
+   whoever's request arrives, and that person leaves no trace behind them. If a design step would
+   require keeping anything about someone else, the step is wrong, not the rule.
 5. **The VM is outside the mesh.** It is a public TLS endpoint with a static whitelisted IP. It
    carries no Tailscale, no mesh reachability, no mesh credentials, and no node of the mesh routes
    through it. It cannot run on `mesh-home` regardless — public ingress here is closed.
