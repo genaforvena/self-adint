@@ -135,6 +135,53 @@ step after this one:
 presence) even has an acceptable answer. If no reachable exchange carries his traffic, the project
 stops here having cost nothing.
 
+## Step 0S — the SUPPLY-side entrance (OURS, 2026-08-15; PROPOSED, awaiting his word)
+
+**Status: not approved.** Proposed on the board (`[design]`, 15:14:59Z) after he rejected the
+forecast route — *«слишком много интерпретации на интерпретации, в идеале надо подобраться к
+бид-реквестам»*. Nothing here is registered or signed; registration is a rule-3 step and stays
+his. Written down now so the branch is a document rather than a memory.
+
+**The move.** Instead of buying our way to a bid request, *emit* one. A minimal publisher surface
+of his own — a page, or a simple app — plus his own **Prebid Server**. He opens it from his own
+phone; the surface generates a bid request **describing him** (in-app, that request carries
+`device.ifa`), and the exchanges' responses say **who bids for him, how much, and with what
+creative**.
+
+**Why it is worth doing before the seat, not after:**
+
+- **Publisher admission is a different order of difficulty from buyer admission.** No deposit,
+  frequently no legal entity, and the money flows *toward* him rather than out. The letter of
+  Step 2 can keep waiting for his go without the project standing still.
+- **Live data at zero cost**, on the timescale of days rather than of a contract.
+- **The receiver gets written against the real thing.** Step 1's bidder is currently specified
+  against samples out of documentation; this branch hands it *actual* bid requests from actual
+  exchanges, in their actual dialects. That is a large side benefit and arguably reason enough on
+  its own.
+- **It is the only path in this project where no foreign request is ever parsed.** The request is
+  his, about him, emitted by his own surface — so the disk boundary of rule 4 is not merely
+  respected, it is never approached. The buyer branch must *observe* rule 4; this branch cannot
+  violate it.
+
+**The boundary, stated up front so it is not discovered later.** From the supply side he sees his
+own **outgoing** request, the bids, the prices, the creatives. He does **not** see the `user.data`
+segment names the exchange mixes in **for the buyer** — those exist only in the copy of the
+request that goes to the demand side. The project's core question ("what do they think they know
+about me") still needs a seat. **This is a parallel entrance, not a replacement for the plan.**
+
+**Open risk, to be asked and never assumed.** A publisher surface whose entire audience is one
+device, generating requests with no real users behind them, is exactly the shape SSP terms
+describe as invalid traffic. That it is *his own* device and *his own* inventory does not
+automatically make it acceptable to the SSP, and the failure mode is account termination rather
+than a warning. This goes into the intake conversation as a stated question — "the inventory is a
+personal test surface with a single device; is that permitted, and under what conditions" — not
+into the plan as an assumption.
+
+**Research owed, gated on his yes** (do not start it before): which SSPs/exchanges onboard a
+*small* publisher; what they require (domain, minimum traffic, legal entity, tax form); and
+exactly what lands in a Prebid Server log — whether `device.ifa` is present for in-app, and what
+is legible in the responses. Primary sources only.
+
 ## Step 1 — receiver + decoy bidder, locally, on synthetic requests (his step 1)
 
 Go, ~200 lines, JSONL to disk, DuckDB offline. Three corrections fold in here:
