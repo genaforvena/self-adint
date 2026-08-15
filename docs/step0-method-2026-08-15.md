@@ -173,6 +173,63 @@ a single "static scan" that would have silently inherited one of the two blindne
 gives the capture a falsifiable prediction: those three apps should contact `my.com` hosts on the
 wire, and if they do not, one of the two static lanes is lying about something.
 
+### The capture's blind spot, measured before the capture (2026-08-15)
+
+Both static lanes describe code. The capture was to be the first lane describing *traffic* —
+and it was about to be taken on his home wifi, where a fact nobody had measured was waiting.
+
+`tools/adint-dns-vantage` asks every host twice: once of the LAN resolver over plain 53, once
+of a public resolver over DoH, which the LAN resolver cannot answer. **The disagreement is the
+measurement** — neither vantage alone can separate "blocked here" from "does not exist
+anywhere", because a blackhole's NXDOMAIN and a dead domain's NXDOMAIN are the same bytes.
+
+Result over 87 hosts — the reference table, which is a superset of the 36 host literals found
+on his phone (it has to be: the literal scan searches *for* reference hosts, so neither static
+lane can see an exchange the reference does not name; only the capture's unresolved-host list
+can):
+
+| verdict | hosts |
+|---|---|
+| `blackholed` — home answers `0.0.0.0`, public answers a real address | **39** |
+| `resolves` — both vantages agree on a real address | 31 |
+| `no_a_record` — no A at that name on either vantage (a suffix apex, not a block) | 17 |
+
+And it is not a random 39. Every Google auction host (`googleads.g.doubleclick.net`,
+`doubleclick.net`, `securepubads.g.doubleclick.net`), both Yandex exchange hosts
+(`adsdk.yandex.ru`, `mobile.yandexadexchange.net`), AppLovin, Unity, Fyber/`inner-active.mobi`
+and `r.my.com` are blackholed at home. What still resolves is InMobi, `ad.mail.ru` +
+`target.my.com`, `adfox.ru`, and the whole attribution/analytics estate (AppsFlyer, Adjust,
+Branch, Amplitude). **32 of the apps on his phone carry at least one host that is blind at
+home.**
+
+So a home-only capture would have shown ~zero for most of the exchanges an outsider can
+actually buy a seat on — and that zero reads exactly like *nobody is selling this phone to
+them*. It would have been the reasoning input to the one irreversible step in the whole plan
+(a seat deposit and an agreement), and it would have been an artifact of a router.
+
+Three things follow, and all three are now in the instructions:
+
+1. The capture is read **against this column**, never on its own.
+2. One capture day must be taken **off the home network** (mobile data), where the blackhole
+   does not apply. Same phone, same apps, different answer — and the difference is the point.
+3. Whether the phone obeys the home resolver at all is **unknown until he looks** (Android
+   Private DNS and in-app DoH both bypass it). Written down as unknown, not assumed.
+
+Two traps this lane walked into, both caught by its own controls:
+
+- **The negative control was wrong first.** `nonexistent-probe-control-adint.example.com` was
+  supposed to be NXDOMAIN on both vantages; both answered NOERROR/NODATA, because that zone
+  answers its own nonexistent names that way. A control that a zone operator can redefine is
+  not a control — replaced with a name under `.invalid`, which RFC 2606 forbids delegating.
+- **A dropped query looks exactly like a filtered one.** The first run reported 7 hosts as
+  `error` under 8 parallel workers; every one answered on a second ask — the home router simply
+  drops queries under load. The retry is bounded and a persistent failure still renders `error`,
+  because the one thing this table must never do is call a broken probe a blackhole. The mutant
+  that removes that guard reports a *dead public vantage* as `blackholed` — seen red.
+
+The artifact (`data/dns-vantage.tsv`, 87 rows, both vantages per row) stays out of the public
+repo like everything under `data/`: the tool and this record are the method, the reading is his.
+
 ## The shape of Step 0's own verdict: `IN` / `UNKNOWN`, never `NOT`
 
 The oracle his brief designed for segments — `LOSS` is not `NOT IN`, a negative is

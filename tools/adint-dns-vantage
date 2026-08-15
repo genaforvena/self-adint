@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""adint-dns-vantage — does the HOME network already answer for the ad hosts on his phone?
+
+Step 0 asks which exchanges his phone's traffic is sold to. The observational half of that
+answer is a capture taken ON the phone, on his home wifi. This tool measures, BEFORE the
+capture, a confound that would otherwise be invisible in it:
+
+    the home resolver blackholes part of the ad estate.
+
+A host answered 0.0.0.0 at home never carries bytes at home. In a capture it shows up as
+zero observations - which reads exactly like "no demand for this app", and is not. So the
+blind spot is enumerated first, per host, and the capture is read against it.
+
+Two vantages, and the comparison IS the measurement:
+  home   - the LAN resolver (dig, plain 53)
+  public - DoH over https, which cannot be answered by the LAN resolver
+
+Neither alone can tell "blocked here" from "does not exist anywhere": a NXDOMAIN from a
+blackhole and a NXDOMAIN from a dead domain are the same bytes. Only the disagreement
+between vantages names the mechanism.
+
+  adint-dns-vantage                    probe the phone's DEX host literals + the ref table
+  adint-dns-vantage --out FILE         write the TSV somewhere else
+  adint-dns-vantage --hosts FILE       probe an explicit host list (one per line)
+  adint-dns-vantage --test             gates
+
+WHAT THIS IS NOT: it is not an observation of his traffic. It is a property of the home
+network, and it only bears on the phone if the phone actually uses that resolver - which
+Private DNS / in-app DoH can override. The instruction asks him to check; until he does,
+that is written down as unknown rather than assumed.
+"""
+
+import argparse
+import collections
+import glob
+import json
+import os
+import subprocess
+import time
+import sys
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+# The DoH vantage exists to be UNMEDIATED. A proxy inherited from the environment would
+# resolve on our behalf somewhere else and quietly answer a different question, so the
+# opener is built with proxies explicitly emptied rather than trusting the env to be clean.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def _default_resolver():
+    """The LAN resolver, discovered rather than written down.
+
+    A hardcoded 192.168.x.y would be both an address of his home network in a public repo
+    and a lie on any other network.
+
+    The default GATEWAY, not /etc/resolv.conf: on a systemd-resolved host resolv.conf says
+    127.0.0.53, a local stub that forwards to the router - probing the stub measures the
+    stub's cache, one hop away from the vantage we mean. The gateway may of course not be a
+    resolver at all, and then the positive control fails loudly, which is the right outcome.
+    """
+    try:
+        p = subprocess.run(["ip", "-4", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=5)
+        f = p.stdout.split()
+        if "via" in f:
+            return f[f.index("via") + 1]
+    except Exception:
+        pass
+    try:
+        with open("/etc/resolv.conf") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) >= 2 and f[0] == "nameserver" and not f[1].startswith("127."):
+                    return f[1]
+    except OSError:
+        pass
+    return ""
+
+
+HOME_RESOLVER = os.environ.get("ADINT_HOME_RESOLVER") or _default_resolver()
+DOH_URL = os.environ.get("ADINT_DOH_URL", "https://dns.google/resolve")
+TIMEOUT = float(os.environ.get("ADINT_DNS_TIMEOUT", "8"))
+
+# A blackhole answers with a routable-looking address that goes nowhere. These are the
+# sink addresses in common use (AdGuard Home, Pi-hole, dnsmasq address= rules).
+SINK_ADDRS = {"0.0.0.0", "::", "127.0.0.1", "::1"}
+
+# rcode names, DoH returns the numeric form
+RCODE = {0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}
+
+
+def query_home(host, attempts=3):
+    """Ask the LAN resolver over plain 53. Returns (status, [addrs]).
+
+    Retried, because the vantage is a home router: under parallel probing it drops
+    queries, and a dropped query is indistinguishable from a filtered one at the byte
+    level. Measured on the first run - 7 of 87 hosts came back ERROR under 8 workers and
+    every one of them answered on a second ask. A retry here buys a real reading; what it
+    must never do is turn a host that ALWAYS fails into a verdict, which is why the
+    failure still renders 'error' after the last attempt rather than falling through.
+    """
+    for i in range(attempts):
+        st, addrs = _query_home_once(host)
+        if st not in ("TIMEOUT", "ERROR"):
+            return st, addrs
+        time.sleep(0.3 * (i + 1))
+    return st, addrs
+
+
+def _query_home_once(host):
+    try:
+        p = subprocess.run(
+            ["dig", "+time=3", "+tries=1", "+noall", "+comments", "+answer",
+             "@" + HOME_RESOLVER, host, "A"],
+            capture_output=True, text=True, timeout=TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT", []
+    except FileNotFoundError:
+        return "NODIG", []
+    if p.returncode != 0:
+        return "ERROR", []
+    status, addrs = None, []
+    for line in p.stdout.splitlines():
+        if "->>HEADER<<-" in line and "status:" in line:
+            status = line.split("status:")[1].split(",")[0].strip()
+        elif line and not line.startswith(";"):
+            f = line.split()
+            if len(f) >= 5 and f[3] == "A":
+                addrs.append(f[4])
+    if status is None:
+        return "TIMEOUT", []
+    return status, addrs
+
+
+def query_public(host):
+    """Ask a public resolver over DoH. The LAN resolver cannot answer this one."""
+    url = "%s?name=%s&type=A" % (DOH_URL, urllib.parse.quote(host))
+    req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
+    try:
+        with _OPENER.open(req, timeout=TIMEOUT) as r:
+            body = json.load(r)
+    except Exception:
+        return "TIMEOUT", []
+    status = RCODE.get(body.get("Status"), "RCODE%s" % body.get("Status"))
+    addrs = [a["data"] for a in body.get("Answer", []) if a.get("type") == 1]
+    return status, addrs
+
+
+def classify(home_status, home_addrs, pub_status, pub_addrs):
+    """Name the mechanism, or refuse to.
+
+    The rule that matters: a probe that FAILED is never a finding. A timeout on either
+    vantage renders 'error' - not 'blocked', not 'resolves'. A broken probe and a
+    blackholed host both return nothing, and only the status tells them apart.
+    """
+    if home_status in ("TIMEOUT", "ERROR", "NODIG") or pub_status == "TIMEOUT":
+        return "error"
+    home_real = [a for a in home_addrs if a not in SINK_ADDRS]
+    pub_real = [a for a in pub_addrs if a not in SINK_ADDRS]
+    home_sunk = bool(home_addrs) and not home_real
+    if not pub_real and pub_status == "NXDOMAIN":
+        # nothing to block: the name does not exist on the public internet
+        return "nonexistent" if home_status == "NXDOMAIN" else "home_only"
+    if not pub_real and pub_status == "NOERROR":
+        # apex of a suffix with no A of its own - true on both vantages, not a block
+        return "no_a_record" if not home_real else "home_only"
+    # public has a real address from here on: any home answer that is not that is a filter
+    if home_sunk:
+        return "blackholed"
+    if home_status == "NXDOMAIN":
+        return "blackholed_nxdomain"
+    if not home_real and home_status == "NOERROR":
+        return "blackholed_empty"
+    return "resolves"
+
+
+VERDICT_BLIND = {"blackholed", "blackholed_nxdomain", "blackholed_empty"}
+
+
+def probe(host):
+    hs, ha = query_home(host)
+    ps, pa = query_public(host)
+    return {
+        "host": host,
+        "home_status": hs, "home_answer": ",".join(ha) or "-",
+        "public_status": ps, "public_answer": ",".join(pa[:3]) or "-",
+        "verdict": classify(hs, ha, ps, pa),
+    }
+
+
+def controls():
+    """Both vantages must be proven working before any verdict is believed.
+
+    Without this a severed uplink renders the whole ad estate 'blackholed at home' -
+    a total probe failure wearing the shape of a finding.
+    """
+    errs = []
+    pos = probe("example.com")
+    if pos["verdict"] != "resolves":
+        errs.append("positive control example.com: expected resolves, got %s (home=%s public=%s)"
+                    % (pos["verdict"], pos["home_status"], pos["public_status"]))
+    # .invalid is reserved by RFC 2606 and can never be delegated, so NXDOMAIN here is a
+    # property of the DNS itself. The first choice - a made-up label under example.com -
+    # was WRONG and the control caught it: both vantages answered NOERROR/NODATA, because
+    # that zone answers its own nonexistent names that way. A negative control has to be a
+    # name whose absence no zone operator can turn into a different rcode.
+    neg = probe("adint-control-does-not-exist-9f3a.invalid")
+    if neg["verdict"] != "nonexistent":
+        errs.append("negative control: expected nonexistent, got %s (home=%s public=%s)"
+                    % (neg["verdict"], neg["home_status"], neg["public_status"]))
+    return errs
+
+
+def load_hosts():
+    """The phone's own host literals, plus every concrete name in the reference table."""
+    src = collections.defaultdict(set)   # host -> {source}
+    apps = collections.defaultdict(set)  # host -> {package}
+    hits = collections.Counter()         # host -> literal occurrences in DEX
+    for f in sorted(glob.glob(os.path.join(REPO, "data", "phone-literals-*.jsonl"))):
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                h = r["hostname"]
+                src[h].add("dex-literal")
+                apps[h].add(r["package"])
+                hits[h] += int(r.get("count", 1))
+    ref = os.path.join(REPO, "ref", "exchange-domains.tsv")
+    org = {}
+    if os.path.exists(ref):
+        with open(ref) as fh:
+            next(fh, None)
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 5 or not f[0]:
+                    continue
+                src[f[0]].add("ref")
+                org.setdefault(f[0], (f[1], f[2], f[3], f[4]))
+    return src, apps, hits, org
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def run(out_path, host_file=None):
+    if host_file:
+        with open(host_file) as fh:
+            hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+        src = {h: {"explicit"} for h in hosts}
+        apps, hits, org = {}, {}, {}
+    else:
+        src, apps, hits, org = load_hosts()
+        hosts = sorted(src)
+
+    errs = controls()
+    if errs:
+        for e in errs:
+            print("CONTROL FAILED: " + e, file=sys.stderr)
+        print("refusing to write a table from a probe that cannot prove it works",
+              file=sys.stderr)
+        return 1
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        rows = list(ex.map(probe, hosts))
+
+    for r in rows:
+        h = r["host"]
+        o = org.get(h, ("", "", "", ""))
+        r["org"], r["role"], r["rtb_exchange"], r["external_seat"] = o
+        r["source"] = "+".join(sorted(src.get(h, [])))
+        r["apps_on_phone"] = len(apps.get(h, ()))
+        r["dex_hits"] = hits.get(h, 0)
+
+    rows.sort(key=lambda r: (-r["apps_on_phone"], -r["dex_hits"], r["host"]))
+    cols = ["host", "source", "apps_on_phone", "dex_hits", "org", "role",
+            "rtb_exchange", "external_seat", "home_status", "home_answer",
+            "public_status", "public_answer", "verdict"]
+    tally = collections.Counter(r["verdict"] for r in rows)
+    blind_apps = sorted({a for r in rows if r["verdict"] in VERDICT_BLIND
+                         for a in apps.get(r["host"], ())})
+
+    with open(out_path, "w") as fh:
+        fh.write("# vantages: home=%s (plain 53) public=%s (DoH)\n" % (HOME_RESOLVER, DOH_URL))
+        fh.write("# verdicts: " + " ".join("%s=%d" % kv for kv in sorted(tally.items())) + "\n")
+        fh.write("# NOT an observation of traffic - a property of the home network. Bears on the\n")
+        fh.write("# phone only if the phone uses this resolver (Private DNS / in-app DoH override it).\n")
+        fh.write("\t".join(cols) + "\n")
+        for r in rows:
+            fh.write("\t".join(str(r[c]) for c in cols) + "\n")
+
+    print("wrote %s (%d hosts)" % (out_path, len(rows)))
+    for v, n in sorted(tally.items(), key=lambda kv: -kv[1]):
+        print("  %-20s %d" % (v, n))
+    print("apps on the phone carrying at least one host blind at home: %d" % len(blind_apps))
+    return 0
+
+
+def test():
+    fails = []
+
+    def check(name, got, want):
+        if got != want:
+            fails.append("%s: got %r want %r" % (name, got, want))
+
+    # A blackhole is a real answer that goes nowhere - the shape the home resolver uses.
+    check("sink -> blackholed",
+          classify("NOERROR", ["0.0.0.0"], "NOERROR", ["142.250.1.1"]), "blackholed")
+    check("nxdomain-at-home -> blackholed_nxdomain",
+          classify("NXDOMAIN", [], "NOERROR", ["1.2.3.4"]), "blackholed_nxdomain")
+    check("empty-at-home -> blackholed_empty",
+          classify("NOERROR", [], "NOERROR", ["1.2.3.4"]), "blackholed_empty")
+    check("both resolve -> resolves",
+          classify("NOERROR", ["1.2.3.4"], "NOERROR", ["1.2.3.4"]), "resolves")
+    # The two ways a table can lie about a host that was never blocked:
+    check("dead domain -> nonexistent",
+          classify("NXDOMAIN", [], "NXDOMAIN", []), "nonexistent")
+    check("suffix apex with no A -> no_a_record",
+          classify("NOERROR", [], "NOERROR", []), "no_a_record")
+    # A FAILED PROBE IS NEVER A FINDING. Both directions, because either vantage can die.
+    check("home timeout -> error",
+          classify("TIMEOUT", [], "NOERROR", ["1.2.3.4"]), "error")
+    check("public timeout -> error",
+          classify("NOERROR", ["0.0.0.0"], "TIMEOUT", []), "error")
+    check("no dig -> error",
+          classify("NODIG", [], "NOERROR", ["1.2.3.4"]), "error")
+
+    # The controls must be able to FAIL. Point both vantages at a resolver that is not
+    # there and the run must refuse, not emit a table of confident blackholes.
+    global HOME_RESOLVER, DOH_URL
+    keep = (HOME_RESOLVER, DOH_URL)
+    HOME_RESOLVER, DOH_URL = "192.0.2.1", "https://192.0.2.1/resolve"
+    got = controls()
+    HOME_RESOLVER, DOH_URL = keep
+    if not got:
+        fails.append("controls: a dead resolver produced NO control failure")
+
+    if fails:
+        for f in fails:
+            print("smoke-test: FAIL " + f)
+        return 1
+    print("smoke-test: ok (%d verdict cases + control-abort)" % 9)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=os.path.join(REPO, "data", "dns-vantage.tsv"))
+    ap.add_argument("--hosts")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return test()
+    return run(a.out, a.hosts)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
