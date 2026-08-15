@@ -121,6 +121,31 @@ inflated Google by a third. That split relies on `grep -oE` returning the leftmo
 alternative, which was verified *on the device* (GNU grep 3.11: 9 + 6, not 15 + 6) before
 anything was built on it.
 
+## The shape of Step 0's own verdict: `IN` / `UNKNOWN`, never `NOT`
+
+The oracle his brief designed for segments — `LOSS` is not `NOT IN`, a negative is
+indistinguishable from an absent result — turns out to govern **Step 0's own instrument** for a
+different reason, and this is the finding that outlives every number here.
+
+A device-side capture sees the connections his phone makes. It does **not** see what happens on
+the other side of them. An impression can be transacted entirely server-to-server: the SDK talks
+to its own host, and the auction that sells him runs between that host and an exchange his phone
+never contacts. Two demand paths are invisible even on the near side — Smaato configures over DNS
+with no TLS connection at all, and Meta multiplexes ad requests through `graph.facebook.com`,
+separable only by URL path and never from a router flow log.
+
+Therefore:
+
+    exchange observed on the wire       → IN       (it carries his traffic)
+    exchange not observed               → UNKNOWN  (always)
+    exchange does not carry his traffic → NOT REACHABLE from this instrument, ever
+
+An exchange missing from the table is a **statement about the instrument**, not about the
+exchange. Ranking by observation count is legitimate; reading a zero as "this exchange does not
+sell him" is the fabricated negative the whole project is built to avoid, and it would be
+fabricated at the exact step whose job is to stop an irreversible decision from resting on a
+guess.
+
 **What this half cannot say, and must never be read as saying:** a signature in a DEX proves the
 code ships. It does not prove an impression was ever sold through that org, it does not say which
 exchange won an auction, and mediation SDKs deliberately name demand sources they do not contain.
