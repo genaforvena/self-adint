@@ -90,3 +90,40 @@ run still "succeeds" — a table of nothing that looks like a finished measureme
 The reference table itself (`ref/exchange-domains.tsv`, domain → org → does that org run an
 OpenRTB exchange → can an outsider get a seat there) is public knowledge, committed, and is what
 turns hostnames into the decision Step 0 exists to make: **which exchange to approach at all.**
+
+## The static half, run (2026-08-15)
+
+He confirmed the handset is his daily phone, raised `sshd` on it himself, and it came back on a
+different LAN address than the one the mesh had cached. With a shell:
+`tools/adint-inventory-run` streamed every third-party APK's DEX through **one** `grep` pass on
+the phone — nothing copied off the device, nothing written on it — and
+`tools/adint-candidates` aggregated the result.
+
+**39 of his 66 third-party packages carry at least one ad-SDK signature.** Two rankings, both
+published, because they disagree:
+
+| axis | order |
+|---|---|
+| by app count | Google 26 · AppLovin 12 · ironSource 11 · DigitalTurbine 10 · Huawei 9 · Yandex 7 |
+| by hit count | Yandex 14658 · InMobi 5577 · Google 5084 · Mintegral 3974 · ironSource 3369 · ByteDance 2627 |
+
+The disagreement is the finding, not noise in it. AppLovin sits in 12 apps at ~10 hits each —
+that is a *mediation adapter naming a demand source*, not AppLovin's SDK; Yandex sits in 7 at
+~2100 hits each, which is an embedded SDK. Rank on one axis alone and you pick a winner the
+other axis contradicts. The split threshold between "adapter reference" and "embedded SDK" is
+**not fixed here**: it is a property of this corpus and gets derived from it when the corpus is
+worth deriving from.
+
+One signature had to be refined against the real data: `com/google/android/gms/ads/identifier`
+is its own row, role `identifier`, demand-side **no**. Eight of the 34 apps matching the bare
+`com/google/android/gms/ads` prefix only read the advertising id — counting them as demand-side
+inflated Google by a third. That split relies on `grep -oE` returning the leftmost-**longest**
+alternative, which was verified *on the device* (GNU grep 3.11: 9 + 6, not 15 + 6) before
+anything was built on it.
+
+**What this half cannot say, and must never be read as saying:** a signature in a DEX proves the
+code ships. It does not prove an impression was ever sold through that org, it does not say which
+exchange won an auction, and mediation SDKs deliberately name demand sources they do not contain.
+That is why the candidates live in `data/bundle-sdk-candidates.tsv` and not in
+`data/bundle-exchange.tsv`, and why Step 0 is not finished: **the counts that decide which
+exchange to approach have to come off the wire, per app.**
