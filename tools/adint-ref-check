@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""adint-ref-check — a gate on the reference tables, and on the hole between them.
+
+    tools/adint-ref-check [--ref ref/exchange-domains.tsv] [--sigs ref/sdk-signatures.tsv]
+                          [--candidates data/bundle-sdk-candidates.tsv]
+
+Three classes of check, in rising order of what they catch:
+
+1. STRUCTURE — the file loads under the same loader the pipeline uses, no duplicate
+   patterns, no empty source, no pattern written as a wildcard or a URL. A malformed row
+   here does not crash anything; it silently stops matching, which is worse.
+
+2. CONTRADICTION — `external_seat=yes` while `rtb_exchange=no` says an outsider can buy on
+   an exchange that is not there. `role=exchange` with `rtb_exchange=no` says the same thing
+   twice over. These cannot both be true and one of them is feeding the decision.
+
+3. COVERAGE — the hole BETWEEN the two halves of Step 0. An org whose SDK ships on his phone
+   but which has no domain row can never be named when its traffic shows up: the observation
+   lands in `unresolved-hosts.tsv` and the org reads as absent from the bundle table. That is
+   a false negative in the exact direction this project must not produce, so it is reported
+   as a named gap, per org, not as a count.
+
+Exit codes: 0 clean · 1 structural error or contradiction · 0 with warnings for coverage
+gaps (a gap is a lead, not a defect — an SDK in a DEX need not ever talk).
+"""
+
+import argparse
+import os
+import sys
+from collections import Counter, defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+REF_COLUMNS = ["domain_pattern", "org", "role", "rtb_exchange", "external_seat",
+               "confidence", "source"]
+YESNO = {"yes", "no", "unknown"}
+
+
+def read_tsv(path, columns):
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        header = None
+        for lineno, line in enumerate(fh, start=1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            if header is None:
+                header = parts
+                if header[:len(columns)] != columns:
+                    raise ValueError("%s: header is %r, expected %r" % (path, header, columns))
+                continue
+            rows.append((lineno, parts))
+    if header is None:
+        raise ValueError("%s: no header" % path)
+    return header, rows
+
+
+def check_ref(path):
+    errors, warnings = [], []
+    header, rows = read_tsv(path, REF_COLUMNS)
+    n = len(header)
+    seen = Counter()
+    for lineno, parts in rows:
+        pat = parts[0].strip()
+        if len(parts) != n:
+            errors.append("%s:%d has %d fields, header has %d" % (path, lineno, len(parts), n))
+            continue
+        seen[pat] += 1
+        if not pat:
+            errors.append("%s:%d empty domain_pattern" % (path, lineno))
+        if pat.startswith(".") or "*" in pat or "/" in pat or " " in pat:
+            errors.append("%s:%d pattern %r is not a bare suffix (no dots-leading, wildcards, "
+                          "slashes or spaces — the matcher does suffix comparison)"
+                          % (path, lineno, pat))
+        rtb, seat = parts[3].strip(), parts[4].strip()
+        if rtb not in YESNO:
+            errors.append("%s:%d rtb_exchange=%r not in yes/no/unknown" % (path, lineno, rtb))
+        if seat not in YESNO:
+            errors.append("%s:%d external_seat=%r not in yes/no/unknown" % (path, lineno, seat))
+        if seat == "yes" and rtb == "no":
+            errors.append("%s:%d %s: external_seat=yes while rtb_exchange=no — an outsider "
+                          "cannot buy on an exchange that is not there" % (path, lineno, pat))
+        if parts[2].strip() == "exchange" and rtb == "no":
+            errors.append("%s:%d %s: role=exchange while rtb_exchange=no" % (path, lineno, pat))
+        if not parts[6].strip():
+            errors.append("%s:%d %s: empty source — an unsourced row is a guess wearing a "
+                          "table's clothes" % (path, lineno, pat))
+    for pat, cnt in seen.items():
+        if cnt > 1:
+            errors.append("%s: duplicate pattern %r (%d rows) — longest-suffix picks one "
+                          "arbitrarily" % (path, pat, cnt))
+    # a shorter pattern that is a suffix of a longer one is legal and useful, but if the two
+    # name DIFFERENT orgs the specific one must exist for the right reason: report it.
+    pats = sorted(seen, key=len)
+    orgs = {p.strip(): r[1].strip() for _, r in rows for p in [r[0]] if len(r) == n}
+    for long_ in pats:
+        for short in pats:
+            if short != long_ and long_.endswith("." + short) and orgs.get(long_) != orgs.get(short):
+                warnings.append("%s: %r (%s) is shadowed by the shorter %r (%s) for any host "
+                                "that does not match it exactly — verify the specific row wins "
+                                "where it should" % (path, long_, orgs.get(long_), short,
+                                                     orgs.get(short)))
+    return errors, warnings, len(rows)
+
+
+def norm_org(name):
+    """Canonical form for comparing an org across the two tables.
+
+    They are written by different hands: the signature table says `DigitalTurbine`, the
+    domain table says `Digital Turbine (Fyber/Inneractive)`. Compared raw, that pair reads
+    as a coverage gap on the org with the third-most DEX hits on his phone -- a fabricated
+    hole, and the loudest kind of false positive a gate can produce."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def check_coverage(ref_path, candidates_path):
+    """Orgs whose SDK ships on the device but which no domain row can ever name."""
+    if not os.path.exists(candidates_path):
+        return [], 0
+    ref_orgs = set()
+    _, rows = read_tsv(ref_path, REF_COLUMNS)
+    for _, parts in rows:
+        ref_orgs.add(norm_org(parts[1]))
+
+    dev_orgs = defaultdict(int)
+    with open(candidates_path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("bundle\t"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 7 or parts[6] != "yes":
+                continue
+            dev_orgs[parts[1].strip()] += int(parts[4] or 0)
+
+    gaps = []
+    for org, hits in sorted(dev_orgs.items(), key=lambda kv: -kv[1]):
+        o = norm_org(org)
+        if not any(o in r or r in o for r in ref_orgs):
+            gaps.append("%s (%d dex hits on the device, no domain row — its traffic can only "
+                        "land in unresolved-hosts.tsv)" % (org, hits))
+    return gaps, len(dev_orgs)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ref", default=os.path.join(ROOT, "ref", "exchange-domains.tsv"))
+    ap.add_argument("--candidates", default=os.path.join(ROOT, "data", "bundle-sdk-candidates.tsv"))
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    try:
+        errors, warnings, nrows = check_ref(args.ref)
+    except (ValueError, FileNotFoundError) as e:
+        print("adint-ref-check: %s" % e, file=sys.stderr)
+        return 1
+
+    gaps, norgs = check_coverage(args.ref, args.candidates)
+
+    print("%s: %d rows" % (args.ref, nrows))
+    for w in warnings:
+        print("  warn  %s" % w)
+    for e in errors:
+        print("  ERROR %s" % e)
+    if gaps:
+        print("  coverage gaps (%d demand-side orgs on the device, %d unnameable):"
+              % (norgs, len(gaps)))
+        for g in gaps:
+            print("    gap %s" % g)
+    elif norgs:
+        print("  coverage: every demand-side org on the device has at least one domain row (%d orgs)"
+              % norgs)
+    print("%d errors, %d warnings, %d coverage gaps" % (len(errors), len(warnings), len(gaps)))
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------- self-test
+
+def selftest():
+    import tempfile
+    fails = []
+
+    def check(name, cond, detail=""):
+        if cond:
+            print("  ok   %s" % name)
+        else:
+            print("  FAIL %s %s" % (name, detail))
+            fails.append(name)
+
+    hdr = "\t".join(REF_COLUMNS)
+    good = "\t".join(["example.com", "Ex", "exchange", "yes", "yes", "high", "http://src"])
+
+    with tempfile.TemporaryDirectory() as td:
+        def write(name, body):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            return p
+
+        p = write("ok.tsv", hdr + "\n" + good + "\n")
+        e, w, n = check_ref(p)
+        check("a clean table passes", not e and n == 1, (e, n))
+
+        p = write("dup.tsv", hdr + "\n" + good + "\n" + good + "\n")
+        e, _, _ = check_ref(p)
+        check("duplicate pattern is an error", any("duplicate" in x for x in e), e)
+
+        p = write("contra.tsv", hdr + "\n" +
+                  "\t".join(["a.com", "Ex", "ssp", "no", "yes", "low", "s"]) + "\n")
+        e, _, _ = check_ref(p)
+        check("seat=yes with rtb=no is an error",
+              any("external_seat=yes while" in x for x in e), e)
+
+        p = write("contra2.tsv", hdr + "\n" +
+                  "\t".join(["a.com", "Ex", "exchange", "no", "no", "low", "s"]) + "\n")
+        e, _, _ = check_ref(p)
+        check("role=exchange with rtb=no is an error",
+              any("role=exchange while" in x for x in e), e)
+
+        p = write("nosrc.tsv", hdr + "\n" +
+                  "\t".join(["a.com", "Ex", "exchange", "yes", "no", "low", ""]) + "\n")
+        e, _, _ = check_ref(p)
+        check("unsourced row is an error", any("empty source" in x for x in e), e)
+
+        p = write("wild.tsv", hdr + "\n" +
+                  "\t".join(["*.a.com", "Ex", "exchange", "yes", "no", "low", "s"]) + "\n")
+        e, _, _ = check_ref(p)
+        check("wildcard pattern is an error", any("not a bare suffix" in x for x in e), e)
+
+        p = write("enum.tsv", hdr + "\n" +
+                  "\t".join(["a.com", "Ex", "exchange", "true", "no", "low", "s"]) + "\n")
+        e, _, _ = check_ref(p)
+        check("non-enum rtb_exchange is an error", any("not in yes/no/unknown" in x for x in e), e)
+
+        p = write("shadow.tsv", hdr + "\n" + good + "\n" +
+                  "\t".join(["ads.example.com", "Other", "ssp", "yes", "no", "low", "s"]) + "\n")
+        _, w, _ = check_ref(p)
+        check("cross-org suffix shadowing warns", any("shadowed by the shorter" in x for x in w), w)
+
+        # coverage: an org on the device with no domain row must be NAMED, not counted
+        refp = write("cov-ref.tsv", hdr + "\n" + good + "\n")
+        candp = write("cands.tsv", "\t".join(
+            ["bundle", "org", "role", "sdks", "signature_hits", "distinct_signatures",
+             "demand_side"]) + "\n" +
+            "com.a\tEx\texchange\tX\t100\t1\tyes\n" +
+            "com.b\tGhostOrg\texchange\tY\t4242\t1\tyes\n" +
+            "com.c\tAppsFlyer\tattribution\tZ\t900\t1\tno\n")
+        gaps, norgs = check_coverage(refp, candp)
+        check("known org is not a gap", not any("Ex (" in g for g in gaps), gaps)
+        check("unnameable org is named", any("GhostOrg" in g for g in gaps), gaps)
+        check("gap carries its weight", any("4242" in g for g in gaps), gaps)
+        check("non-demand org is not a gap", not any("AppsFlyer" in g for g in gaps), gaps)
+        check("org count counts demand side only", norgs == 2, norgs)
+
+        # the two tables are written by different hands and spell orgs differently
+        refp2 = write("cov-ref2.tsv", hdr + "\n" + "\t".join(
+            ["dt.example", "Digital Turbine (Fyber/Inneractive)", "exchange", "yes", "yes",
+             "high", "s"]) + "\n")
+        candp2 = write("cands2.tsv", "\t".join(
+            ["bundle", "org", "role", "sdks", "signature_hits", "distinct_signatures",
+             "demand_side"]) + "\n" + "com.a\tDigitalTurbine\texchange\tX\t1894\t1\tyes\n")
+        gaps2, _ = check_coverage(refp2, candp2)
+        check("org spelling differences do not fabricate a gap", not gaps2, gaps2)
+
+    print("selftest: %d checks failed" % len(fails))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
