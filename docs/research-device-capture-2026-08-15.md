@@ -17,13 +17,20 @@ Every factual claim below carries a source. Where a fact could not be establishe
 | **1** | **PCAPdroid** (`com.emanuelef.remote_capture`), VPNService mode, **CSV export of the connections log** | **yes** — `PackageName` + `UID` columns | **yes** — `Info` column (SNI / `Host:` / DNS name), no decryption needed | one CSV row per connection → count by grouping | free, GPL-3.0, F-Droid + Play | **primary instrument** |
 | 2 | PCAPdroid **PCAP-file dump with "PCAPdroid extensions"** + offline `tshark` on the node | yes (uid + app label in the PCAP trailer; package name only in pcapng) | yes (raw ClientHello SNI) | yes | free, but pcapng is a **paid** feature | **fallback for multi-day runs** — no 8192-connection ring limit |
 | 3 | TrackerControl / NetGuard / Rethink (other VPNService apps) | see §3c | see §3c | see §3c | free | secondary / cross-check |
-| 4 | Static ad-SDK inventory from Termux (`pm list packages -f` + APK dex scan) | yes (package) | **no** — yields *candidate SDKs*, not observed hosts | **no** | free | **complement, never a substitute** |
+| 4 | Static ad-SDK inventory from Termux (**`pm path`** + APK dex/manifest scan) | yes (package) | **no** — yields *candidate SDKs*, not observed hosts | **no** | free | **complement, never a substitute** |
 | 5 | LAN logging resolver (static DNS on his Wi-Fi) | **no** | yes | yes | free | volume cross-check only |
 | 6 | `dumpsys netstats` / Android per-app data usage | yes | **no hostnames at all** | bytes only | free | **rejected — cannot answer the question** |
 
-**The decision:** #1 alone answers Step 0's question. #4 runs in parallel (it needs only the ssh key
+**The decision:** #1 alone answers Step 0's question, and it is the only method that produces the
+`(package, hostname)` key the artifact is defined on. #4 runs in parallel (it needs only the ssh key
 back) and is used to *falsify* #1's coverage — an app whose APK embeds `com.applovin` but which
-never appears in the capture is a live question, not a null.
+never appears in the capture is a live question, not a null. One free by-product of #4 is directly
+reusable by #1: **Exodus Privacy's `network_signature` field is a public domain→tracker regex list**
+(§4.5) and is exactly the kind of public knowledge `ref/exchange-domains.tsv` is made of.
+
+**Exactly one VPNService app may be active at a time** (<https://developer.android.com/develop/connectivity/vpn>),
+so #1 and #3 are mutually exclusive, and #3 and #5 conflict too (TrackerControl forbids Private DNS).
+Sequence them; do not run them together.
 
 ---
 
@@ -443,7 +450,185 @@ established, and the instruction does not depend on always-on.
 
 ## 4. The static angle — Termux, `pm`, and APK ad-SDK signatures
 
-<!-- SECTION-4-PLACEHOLDER -->
+This lane produces a **candidate map** — which ad SDKs each installed app *embeds*. It is not a
+substitute for §1 and it never yields observation counts. Its value is as a **falsifier**: an app
+whose APK carries `com/applovin/` but which never appears in the capture is an open question about
+coverage, not a null result. It needs only the ssh key back on Termux (ask **A** in
+`docs/step0-method-2026-08-15.md`).
+
+**None of this has been executed against the phone** — `redmi-10` is offline on the tailnet (last
+seen 49 d) and rejects our key at `<phone-lan-ip>:8022`. What follows is a design with its
+preconditions verified against AOSP source, not an artifact.
+
+### 4.1 `pm` from an unrooted Termux shell — works, with one non-obvious incantation
+
+Exec'ing `/system/bin/pm` (→ `cmd package`) from an app domain-transitions to `system_server`, which
+is then denied read/write on the pty `untrusted_app` created — so a bare `pm list packages` fails and
+everyone concludes it needs root. Both redirections are required
+(<https://github.com/termux/termux-packages/discussions/8292>, with the literal
+`avc: denied { read write } for path="/dev/pts/0" … scontext=u:r:system_server:s0 … app=com.termux`):
+
+```bash
+pm list packages -3 --user 0 2>&1 </dev/null
+pm path com.termux --user 0 2>&1 </dev/null
+# → package:/data/app/~~zAi6GFqEAPTkudspFt7usg==/com.termux-XCCktU51me6pb27dF1b82A==/base.apk
+```
+
+**Android 11+ package-visibility filtering does not bite Termux.** The filter is a compat change
+gated on the *caller's* targetSdk — `@EnabledSince(targetSdkVersion = R)` on
+`FILTER_APPLICATION_QUERY = 135549675L` in `PackageManager.java`, consumed by
+`AppsFilter.FeatureConfigImpl`
+(<https://github.com/aosp-mirror/platform_frameworks_base/blob/android12-release/core/java/android/content/pm/PackageManager.java>,
+<https://github.com/aosp-mirror/platform_frameworks_base/blob/android12-release/services/core/java/com/android/server/pm/AppsFilter.java>).
+Termux's `gradle.properties` sets **`targetSdkVersion=28`** and its manifest declares neither
+`<queries>` nor `QUERY_ALL_PACKAGES` (<https://github.com/termux/termux-app/blob/master/gradle.properties>) —
+so the list comes back unfiltered.
+
+**Splits matter:** `pm path` prints `sourceDir` **plus every `splitSourceDirs` entry**, while
+`pm list packages -f` prints the base only
+(`PackageManagerShellCommand.displayPackageFilePath`, L606 vs L890,
+<https://github.com/aosp-mirror/platform_frameworks_base/blob/android12-release/services/core/java/com/android/server/pm/PackageManagerShellCommand.java>).
+**Use `pm path` and scan every APK it returns.**
+
+### 4.2 Are the APKs readable without root? — **yes, by exact path**
+
+| path element | mode | owner | others | source |
+|---|---|---|---|---|
+| `/data/app` | **0771** | system:system | traverse only, **no listing** | `init.rc`: `mkdir /data/app 0771 system system` |
+| `/data/app/~~<b64>==/` | **0775** on Android 11/12 (0771 from Android 14) | system:system | listable on 11/12 | `makeDirRecursive(…, 0775)` in PMS android11/android12; tightened in `InstallPackageHelper.java:1863` (android14) |
+| `…/<pkg>-<b64>==/` | 0775 | system:system | listable | `PackageInstallerService.prepareStageDir` |
+| `base.apk`, `split_config.*.apk` | **0644** | system:system | **world-readable** | `PackageInstallerSession.java:1666,1738` — `Os.chmod(sourcePath, 0644)`, comment *"Grant READ access for APK to be read successfully"* |
+
+SELinux is not the barrier: `system/sepolicy/public/app.te` (android-11.0.0_r48 L279-280,
+android-12.0.0_r32 L288-289) carries, under *"# Allow apps to read/execute installed binaries"*,
+`allow appdomain apk_data_file:dir r_dir_perms;` and `allow appdomain apk_data_file:file rx_file_perms;`
+(<https://android.googlesource.com/platform/system/sepolicy/+/refs/tags/android-12.0.0_r32/public/app.te>).
+`untrusted_app` is an `appdomain`.
+
+**⇒ `ls /data/app` fails; `cat <exact path from pm path>` succeeds.** The randomized `~~b64==` name
+defeats *enumeration*, not *open*. Preinstalled MIUI apps are not in `/data/app` at all — they live
+in `/system/app`, `/system/priv-app`, `/product/app`, `/vendor/app`, world-readable 0755 — which on a
+Redmi is the majority of the ad-bearing surface.
+
+**MIUI-specific deviation: UNKNOWN.** Nothing in MIUI changes those DAC modes or that sepolicy, but
+Chinese-vendor ROMs are reported to add a dangerous permission
+`com.android.permission.GET_INSTALLED_APPS` gating the installed-app list
+(<https://github.com/getActivity/XXPermissions/issues/175>). Whether **global** MIUI on a Redmi 10
+enforces it against a `cmd package` call from an app uid targeting SDK 28 is **UNKNOWN** and is
+decided by one command once the phone is reachable.
+
+**Gate to run first — assert the artifact, not the claim.** A truncated or 0-byte read greps clean
+and is indistinguishable from "no ad SDK":
+
+```bash
+pm path com.whatsapp --user 0 2>&1 </dev/null | sed 's/^package://' \
+  | while read p; do printf '%s ' "$p"; head -c4 "$p" | od -An -tx1; done
+# MUST print: 50 4b 03 04   (PK\x03\x04)
+```
+
+### 4.3 Reading the signatures out of a DEX
+
+DEX type descriptors are literal slash-form ASCII: `'L' FullClassName ';'`, `FullClassName →
+(SimpleName '/')* SimpleName` (<https://source.android.com/docs/core/runtime/dex-format>). So
+`com.applovin.sdk.AppLovinSdk` is the byte string **`Lcom/applovin/sdk/AppLovinSdk;`**.
+MUTF-8 differs from UTF-8 only for U+0000 and supplementary planes, so ASCII identifiers survive
+verbatim. **Grep with slashes; the dot form does not occur** (measured on a real 11.4 MB APK:
+`com/google/android/material` → 579 hits, `com.google.android.material` → 0).
+
+Two traps, both measured:
+- **Inflate first.** `classes*.dex` are usually DEFLATE-compressed inside the APK, so grepping the
+  APK directly returns 0. AGP ≥ 4.2 stores dex *uncompressed* at `minSdk ≥ 28`
+  (<https://developer.android.com/build/releases/past-releases/agp-4-2-0-release-notes>), which makes
+  a direct grep work for *some* apps — a silent-false-negative machine. Always `unzip -p '<apk>' 'classes*.dex'`.
+- **`grep -a` is mandatory.** Without it GNU grep prints `Binary file … matches`, suppresses output,
+  and **still exits 0**.
+
+`AndroidManifest.xml` inside an APK is binary AXML with a **UTF-16LE** string pool, so `strings` on
+it returns nothing. Decode with `aapt2 dump xmltree <apk> --file AndroidManifest.xml` /
+`aapt2 dump badging <apk>` (<https://developer.android.com/tools/aapt2>) or `apktool d -s`.
+
+**Termux tooling, checked against the live aarch64 package index**
+(<https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages>):
+present — `aapt`/`aapt2`, `apktool`, `jadx`, `dex2jar`, `unzip`, `radare2`/`rizin`, `python`+`pip`;
+**absent — `dexdump`** (which is exactly what Exodus's reference matcher shells out to), `dextra`,
+standalone smali/baksmali. `strings` is *not* in `binutils` (that ships `gstrings`); it is in `llvm`
+(~70 MB) — avoid it, `grep -a -o -E` replaces it. `pip install androguard` is plausible after
+`pkg install python-lxml python-cryptography clang` but the **end-to-end outcome is UNVERIFIED**.
+
+**Recommended split: enumerate on the phone, analyse on the node.** Pull each APK over ssh, PK-check
+it, and run the scan here where `dexdump`/androguard/exodus-standalone are available.
+
+### 4.4 Signal tiers — a dex hit is not the strongest signal available
+
+Harvested by reading the official SDK AARs (the manifests the merger injects into every host app):
+
+| tier | signal | strength |
+|---|---|---|
+| **A** | meta-data **`com.google.android.gms.ads.APPLICATION_ID`** with a `ca-app-pub-…~…` value — AdMob's quick start states *"failure to add the `<meta-data>` tag exactly as shown results in a crash with the message: Missing application ID"* (<https://developers.google.com/admob/android/quick-start>) | ≈ proof the app is a live AdMob publisher |
+| **A** | auto-merged **ContentProvider authority**: `com.applovin.sdk.AppLovinInitProvider`, `com.google.android.gms.ads.MobileAdsInitProvider`, `com.facebook.ads.AudienceNetworkContentProvider`, `com.vungle.ads.VungleProvider`, `com.my.target.common.MyTargetContentProvider`, `com.ironsource.lifecycle.IronsourceLifecycleProvider` | very strong — survives dex obfuscation, and a provider runs at process start |
+| **B** | declared ad **activity** (`com.unity3d.services.ads.adunit.AdUnitActivity`, `com.bytedance.sdk.openadsdk.activity.TT*Activity`, `com.chartboost.sdk.view.CBImpressionActivity`, `com.mbridge.msdk.activity.MBCommonActivity`, `com.inmobi.ads.rendering.InMobiAdActivity`, `com.yandex.mobile.ads.common.AdActivity`) | strong embed, silent on use |
+| **B** | bundled assets under an SDK name; **`com/iab/omid`** (IAB Open Measurement) — measured bundled inside AppLovin, Vungle, myTarget and Pangle | strong, obfuscation-proof |
+| **C** | dex class-prefix hit (`com/applovin/`, `com/unity3d/{ads,services}/`, `com/ironsource/`, `com/mbridge/msdk/`, `com/bytedance/sdk/openadsdk/`, **`com/bykv/vk/openvk/`**, `com/facebook/ads/`, `com/vungle/ads/`, `com/inmobi/`, `com/chartboost/sdk/`, `com/yandex/mobile/ads/` + **`com/monetization/ads/`**, `com/my/target/`) | embed only — this is where mediation-adapter noise lives |
+| **D** | permission `com.google.android.gms.permission.AD_ID` | measured present in **every** one of these SDKs — a good screen, a useless discriminator |
+
+### 4.5 Exodus Privacy as a reusable signature source — and its rot
+
+Public, unauthenticated, machine-readable: `GET https://reports.exodus-privacy.eu.org/api/trackers`
+(measured: HTTP 200, 571 866 B, **432 entries**; the upstream
+`https://etip.exodus-privacy.eu.org/api/trackers/` carries 715). Top level is
+`{"trackers": {"<id>": {...}}}` — an **object keyed by stringified id, not an array** — each entry
+carrying `id · name · description · creation_date · code_signature · network_signature · website ·
+categories · documentation`. Data is **ODbL 1.0 + DbCL 1.0**
+(<https://github.com/Exodus-Privacy/exodus/blob/v1/doc/api.md>). Both a **class-name regex**
+(`code_signature`) and a **domain regex** (`network_signature`) exist — the latter is exactly what
+maps a captured hostname to a named tracker, and is directly reusable for
+`ref/exchange-domains.tsv`.
+
+Three properties that must be carried into any use of it:
+
+1. **Signatures are dot-form, the class list is slash-form; it only works because `.` is a regex
+   wildcard** (`re.search("com.applovin", "com/applovin/sdk/X")` → True). **A literal substring match
+   against these signatures fails for every entry.** Convert `.` → `[./]`.
+   Matcher: <https://github.com/Exodus-Privacy/exodus-core/blob/v1/exodus_core/analysis/static_analysis.py>.
+2. **`network_signature` is never used for matching anywhere in the Exodus pipeline** — it is stored,
+   served and displayed only. It is data for downstream consumers, i.e. for us.
+3. **The list rots, and a clean Exodus result is not a clean app.** Measured against the current SDK
+   artifacts: `Vungle` = `com.vungle.publisher.|com.vungle.warren.` while the current SDK ships
+   `com/vungle/ads/`; `Facebook Audience` = `com.facebook.audiencenetwork` while the real AAR has only
+   `com/facebook/ads/`; `Yandex Ad` = `com.yandex.mobile.ads` misses the new `com/monetization/ads/`
+   namespace; the Pangle signature misses `com/bykv/vk/openvk`. Exodus also silently drops any
+   tracker whose signature is ≤ 3 chars (`Google Ads`, `Google DoubleClick`, `Xiti`, `CrowdTangle`).
+
+**The Exodus Android app does no on-device analysis** — *"The app downloads reports from the εxodus
+platform … and shows them to you app by app"* (its own store description;
+<https://f-droid.org/packages/org.eu.exodus_privacy.exodusprivacy/>). If the exact `versionCode` is
+absent from the DB it falls back to the **highest reported versionCode** — a report for a different
+build, silently. Genuinely offline on-device scanners exist if we ever want one without a shell:
+**ClassyShark3xodus** (<https://f-droid.org/packages/com.oF2pks.classyshark3xodus/>) and
+**App Manager** (<https://f-droid.org/packages/io.github.muntashirakon.AppManager/>, 989 signatures
+compiled in, Aho-Corasick substring matching, works unrooted).
+
+### 4.6 The limit, stated so the artifact cannot be over-read
+
+**SDK present ≠ SDK initialized ≠ endpoint contacted ≠ ad rendered.** Three evidenced mechanisms:
+
+1. **Mediation adapters are bundled wholesale for networks never configured.** AdMob's own consumer
+   ProGuard rules keep `* implements com.google.android.gms.ads.mediation.MediationAdapter` and
+   `* extends …mediation.Adapter` — every adapter class is force-kept **whether or not that network
+   is enabled in the dashboard**, and the waterfall is fetched server-side at runtime. Unity Ads
+   alone keeps `com.google.android.gms.ads.MobileAds`, so **that class appears in the dex of an app
+   with no AdMob account at all.**
+2. **Dead code behind a remote kill switch or a paid tier** is byte-identical to live code.
+3. **R8 cuts both ways, per SDK and per version.** Unity/Meta/InMobi/Yandex ship package-wide
+   `-keep` rules (nothing renamed); AppLovin ships only `-dontwarn`; AdMob keeps just
+   `…ads.internal.ClientApi` plus the mediation interfaces. Google now advises library authors
+   *"No broad or package-wide keep rules"*
+   (<https://developer.android.com/topic/performance/app-optimization/library-optimization>), so
+   today's high detection rate is a transient property of current SDK versions, not a law.
+
+**Therefore: a dex hit is strong evidence of embedding and weak evidence of use; a dex miss is not
+evidence of absence.** In the project's own vocabulary, this lane emits `IN`-candidates and
+`UNKNOWN`, never `NOT`.
 
 ---
 
@@ -617,5 +802,32 @@ MIUI агрессивно убивает фоновые процессы — п�
 ### 7.7 Как всё выключить
 
 21. Вкладка «Состояние» → «Остановить». Уведомление исчезнет, VPN снимется, твой обычный VPN снова
-    заработает. Если включал **Block QUIC** — вернуть в `never`. Приложение можно удалить: никаких
-    следов в системе, кроме сохранённых CSV, не остаётся.
+    заработает. Если включал **«Блокировка QUIC»** — вернуть в «никогда». Приложение можно удалить:
+    никаких следов в системе, кроме сохранённых CSV, не остаётся.
+
+---
+
+## 8. The open unknowns — what a reader must not assume this document settled
+
+1. **No real PCAPdroid CSV row has ever been seen.** The format in §1.2 is read out of the writer's
+   source, which is the strongest evidence available before file 1 — but the *first* file is still
+   the fixture that confirms it. Until then every parser test is labelled synthetic.
+2. **The Redmi 10's Android level and MIUI build are unverified** (no shell, no session). This
+   decides the uid-resolution path (§1.1), the `/data/app` directory mode (§4.2), and whether
+   `GET_INSTALLED_APPS` gates `pm list packages` (§4.2).
+3. **Whether the Redmi 10 is the phone he actually lives on.** Asked as step 20 of the instruction.
+   Measuring the wrong handset produces a table that is honest and useless.
+4. **Battery cost of a multi-day VPNService capture on MIUI: not measured by anyone we can cite.**
+   His day-1 battery screen is the measurement; no figure is quoted until then.
+5. **The maximum "Max logged connections" his device will offer** — computed at runtime from the Java
+   heap (§1.4). Until he reads the dropdown we do not know whether a full day fits in one export.
+6. **ECH deployment share on ad-SDK endpoints in 2026** (§2). The signature to watch for is an empty
+   `Info` on a `TLS` row.
+7. **What fraction of exchanges are transacted server-side and therefore invisible from the device**
+   (§5.1). Unbounded from this vantage — the artifact under-counts in a direction we cannot measure,
+   which is exactly why `NOT` is never issued from it.
+8. **TrackerControl's CSV column set** (§3c) — the reason it is the second opinion and not the first.
+9. **Whether Termux's `am` can drive PCAPdroid's Intent API from a background shell on this Android
+   version** (§1.8) — untested; not on the critical path.
+10. **`androguard` under Termux end-to-end** (§4.3) — plausible, unverified; the node-side analysis
+    path makes it unnecessary.
