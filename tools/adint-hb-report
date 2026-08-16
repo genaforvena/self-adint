@@ -272,9 +272,12 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
             for l in loads:
                 if l["url"] != u:
                     continue
+                # An unattributed row has bidder None, and None does not order against a
+                # string: sorting these raw crashed the whole read-out after the repeats
+                # header, so the tail of the report simply did not exist.
                 got = tuple(sorted(
-                    (r.get("bidder"), r.get("outcome")) for r in cands
-                    if r["load_id"] == l["load_id"]))
+                    ((r.get("bidder") or ""), (r.get("outcome") or ""))
+                    for r in cands if r["load_id"] == l["load_id"]))
                 sigs.add(got)
             if len(sigs) > 1:
                 disagree.append(u)
@@ -321,6 +324,11 @@ def selftest():
         {"schema": 1, "kind": "load", "load_id": "L2", "url": "https://a.ru/", "arm": "B",
          "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
          "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        # Unattributed (bidder None) on a repeat-visited site: sorting this against a named
+        # row is what crashed the read-out.
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": None,
+         "outcome": "no-answer", "is_bid_candidate": True, "evidence_strength": "protocol",
+         "match_by": "none"},
         # Timed, but the wrapper's deadline was never read on this load: lateness is
         # undecidable and must not default to "on time".
         {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "mediasniper",
@@ -376,6 +384,8 @@ def selftest():
          res["rendered"] == 3 and res["with_wrapper"] == 3 and res["silent_wrapper"] == 1),
         ("A/A arms are named as a noise floor, not an experiment",
          "NOISE FLOOR, not an experiment" in text),
+        ("an unattributed row does not crash the repeats section",
+         "-- repeats --" in text and "sites visited more than once" in text),
         ("repeat visits are detected and the disagreement is named",
          res["repeated"] == 1 and "changed between visits: 1" in text),
         ("placement stratum is reported",
