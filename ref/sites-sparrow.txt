@@ -1,0 +1,11 @@
+# Sites whose Adfox HB roster carries `sparrow`, the only bidder that returns PRICES to this
+# vantage (8 priced + 5 zero across the 186-load balanced corpus, all via widget.sparrow.ru).
+#
+# This is a targeted frame, not a sample of the market: it exists to build a price
+# distribution for one bidder and to test whether the RUB 2.5 seen three times on woman.ru is
+# an atom or a coincidence. Any count taken over it says something about sparrow on these four
+# publishers and nothing about runet demand in general.
+https://74.ru/
+https://www.fontanka.ru/
+https://www.woman.ru/
+https://www.e1.ru/
