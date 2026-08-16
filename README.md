@@ -43,8 +43,21 @@ Method record and what was rejected, with reasons: `docs/step0-method-2026-08-15
 
 ## Layout
 
-    tools/adint-aggregate   observations (JSONL) -> bundle-exchange table + unresolved hosts
-                            self-test: python3 tools/adint-aggregate --test
+    tools/                  the collectors and the reporters, one concern each, every one with
+                            a --test that runs offline against a local fixture. Load-bearing:
+                              adint-aggregate       observations -> bundle-exchange table
+                              adint-hb-capture      drives a browser, records the wrapper's
+                                                    auction; --via direct leaves by the node's
+                                                    own route and PROVES it from inside the
+                                                    browser (a launch flag does not)
+                              adint-hb-report       reads the log; refuses to read an arm whose
+                                                    vantage nobody measured as a condition
+                              adint-attribute-by-adapter
+                                                    names an unattributed host only when an
+                                                    adapter's own source contains it literally
+                            self-test any of them: python3 tools/<name> --test
+                            (adint-hb-capture needs ~/.venv-browser/bin/python3 — it drives a
+                            real browser, and its --test exits 2 when the arm cannot be verified)
     ref/                    public knowledge: domain -> org -> does it run an OpenRTB exchange,
                             can an outsider get a seat there
     docs/                   the fact base, the method record, the research notes
