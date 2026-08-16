@@ -42,6 +42,10 @@ def decimals(v):
 def collect(rows, schema=None):
     if schema is None:
         schema = max((r.get("schema", 1) for r in rows), default=1)
+    # The site lives on the load row; a price row carries only its load_id. Joining here keeps
+    # "how many sites did this value appear on" answerable, which is what separates a bidder's
+    # price rule from one publisher's quirk.
+    sites = {r.get("load_id"): r.get("url") for r in rows if r.get("kind") == "load"}
     prices = []
     zeros = 0
     for r in rows:
@@ -56,6 +60,7 @@ def collect(rows, schema=None):
                    "currency": x.get("currency") or d.get("currency"),
                    "field": x.get("field"), "path": x.get("path"),
                    "placement": x.get("placementId"), "arm": r.get("arm"),
+                   "site": sites.get(r.get("load_id")),
                    "load_id": r.get("load_id"), "decimals": decimals(v)}
             if v == 0:
                 zeros += 1
@@ -88,15 +93,42 @@ def report(prices, zeros, schema, min_n=8, min_repeats=3, out=sys.stdout):
         dec = collections.Counter(r["decimals"] for r in rs)
         p(f"   decimals: {dict(sorted(dec.items()))} "
           f"(a rule-set price is short; an optimised one is long)")
+        # A repeat is only evidence if it happened on separate PAGE LOADS. The wrapper fires a
+        # page's slots together off one config, so the same price returned twice within one
+        # load is one observation of the bidder, not two — clustering at the page load is in
+        # the design for exactly this reason. Counting rows here would have called `4` a
+        # repeat off a single page view.
         for v, c in counts.most_common():
+            rs_v = [r for r in rs if r["value"] == v]
+            n_loads = len({r["load_id"] for r in rs_v})
+            n_place = len({r["placement"] for r in rs_v if r["placement"]})
+            n_sites = len({r["site"] for r in rs_v if r.get("site")})
+            dec = decimals(v)
             mark = ""
-            if c >= min_repeats and n >= min_n:
-                mark = "  <- ATOM"
-                result["atoms"].setdefault(f"{bidder}/{cur}", []).append({"value": v, "count": c})
-            elif c > 1:
-                mark = f"  <- repeats {c}x, but n={n} is under the {min_n} this report needs " \
-                       f"before calling anything an atom"
-            p(f"      {v:<20.10g} x{c}  decimals={decimals(v)}{mark}")
+            if c > 1:
+                if n_loads < 2:
+                    mark = (f"  <- {c} rows but ONE load: a page's slots fire together, so this "
+                            f"is one observation, not {c}")
+                elif n_loads < min_repeats:
+                    mark = (f"  <- repeats on {n_loads} load(s); needs {min_repeats} before the "
+                            f"word atom is used")
+                elif n < min_n:
+                    mark = (f"  <- repeats on {n_loads} loads, but the group has n={n}, under "
+                            f"the {min_n} this report needs")
+                elif n_place < 2:
+                    # One slot returning the same number every time is a price fixed FOR THAT
+                    # SLOT — deterministic, and not a point of mass in the bidder's price list.
+                    mark = (f"  <- repeats on {n_loads} loads but only placement "
+                            f"{sorted({r['placement'] for r in rs_v if r['placement']})}: a "
+                            f"price fixed for that slot, not a price-list atom")
+                    result.setdefault("slot_fixed", []).append({"value": v, "loads": n_loads})
+                else:
+                    kind = "ATOM (round)" if (dec is not None and dec <= 2) else \
+                           "ATOM (full-precision — a computed value recurring exactly)"
+                    mark = f"  <- {kind}, {n_loads} loads / {n_place} placements / {n_sites} sites"
+                    result["atoms"].setdefault(f"{bidder}/{cur}", []).append(
+                        {"value": v, "loads": n_loads, "placements": n_place, "decimals": dec})
+            p(f"      {v:<20.10g} rows={c} loads={n_loads} pl={n_place}  decimals={dec}{mark}")
         result["groups"][f"{bidder}/{cur}"] = {"n": n, "distinct": distinct}
         if n < min_n:
             p(f"   n={n} is below --min-n {min_n}: this is a list of observations, not a "
@@ -108,13 +140,23 @@ def selftest():
     ok = True
     import io
 
-    def rows_for(vals, currency="RUB", bidder="sparrow", schema=4):
+    def rows_for(vals, currency="RUB", bidder="sparrow", schema=4, loads=None, places=None,
+                 sites=None):
+        """vals[i] gets load L<i> and placement P<i> unless overridden — so a fixture can put
+        two prices in ONE load, or the same price on ONE placement, which are the two cases the
+        atom test has to tell apart."""
         rs = []
+        seen_loads = {}
         for i, v in enumerate(vals):
-            rs.append({"schema": schema, "kind": "request", "bidder": bidder, "load_id": f"L{i}",
+            lid = (loads[i] if loads else f"L{i}")
+            seen_loads[lid] = (sites[i] if sites else "https://s.ru/")
+            rs.append({"schema": schema, "kind": "request", "bidder": bidder, "load_id": lid,
                        "outcome": "bid-zero" if v == 0 else "priced", "arm": "direct",
                        "detail": {"prices": [{"value": v, "field": "cpm", "currency": currency,
+                                              "placementId": (places[i] if places else f"P{i}"),
                                               "path": "$[0].cpm"}]}})
+        for lid, url in seen_loads.items():
+            rs.append({"schema": schema, "kind": "load", "load_id": lid, "url": url})
         return rs
 
     # A real-shaped sample: computed values plus a round one repeating.
@@ -127,7 +169,8 @@ def selftest():
     checks = [
         ("zero bid kept out of the distribution", zeros == 1 and len(prices) == 9),
         ("the repeated round value is named an atom",
-         res["atoms"].get("sparrow/RUB") == [{"value": 2.5, "count": 3}]),
+         [a["value"] for a in res["atoms"].get("sparrow/RUB", [])] == [2.5]
+         and res["atoms"]["sparrow/RUB"][0]["loads"] == 3),
         # Precision is the evidence that makes the repeat legible, so it must be reported.
         ("precision is reported per value", "decimals=1" in text and "decimals=15" in text),
     ]
@@ -137,8 +180,34 @@ def selftest():
     buf2 = io.StringIO()
     res2 = report(small[0], small[1], small[2], out=buf2)
     checks.append(("a repeat below min-n is not called an atom",
-                   not res2["atoms"] and "is under the 8" in buf2.getvalue()
+                   not res2["atoms"] and "under the 8 this report needs" in buf2.getvalue()
                    and "not a distribution" in buf2.getvalue()))
+    # The message must name the condition that actually failed. An earlier version blamed n
+    # for a repeat that was short of --min-repeats, sending the reader to fix the wrong thing.
+    small_reps = collect(rows_for([2.5, 2.5] + [0.1 * i for i in range(1, 12)]))
+    buf2b = io.StringIO()
+    res2b = report(small_reps[0], small_reps[1], small_reps[2], out=buf2b)
+    checks.append(("a short repeat is refused for REPEATS, not blamed on n",
+                   not res2b["atoms"] and "needs 3 before the word atom" in buf2b.getvalue()
+                   and "under the 8" not in buf2b.getvalue()))
+
+    # Two prices of the same value inside ONE page load: the wrapper fires a page's slots
+    # together, so that is one observation of the bidder, not two.
+    one_load = collect(rows_for([4.0, 4.0] + [0.1 * i for i in range(1, 12)],
+                                loads=["Lx", "Lx"] + [f"L{i}" for i in range(11)]))
+    buf4 = io.StringIO()
+    res4 = report(one_load[0], one_load[1], one_load[2], out=buf4)
+    checks.append(("two rows in one load are one observation, not a repeat",
+                   not res4["atoms"] and "ONE load" in buf4.getvalue()))
+
+    # The same value returning on one placement across loads is a price fixed for that SLOT.
+    one_slot = collect(rows_for([3.0, 3.0, 3.0] + [0.1 * i for i in range(1, 12)],
+                                places=["P9", "P9", "P9"] + [f"P{i}" for i in range(11)]))
+    buf5 = io.StringIO()
+    res5 = report(one_slot[0], one_slot[1], one_slot[2], out=buf5)
+    checks.append(("a value fixed to one placement is not a price-list atom",
+                   not res5["atoms"] and res5.get("slot_fixed")
+                   and "not a price-list atom" in buf5.getvalue()))
 
     # Two currencies must never be pooled into one distribution.
     mixed = rows_for([2.5] * 5, currency="RUB") + rows_for([2.5] * 5, currency="USD")
