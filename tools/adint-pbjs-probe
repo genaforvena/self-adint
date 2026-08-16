@@ -13,12 +13,24 @@ Discovery is `window._pbjsGlobals`, not `window.pbjs`: prebid appends its global
 to that array whatever the publisher renamed it to, so a renamed global (common in
 wrappers) is found rather than counted as absent.
 
-Five outcomes are kept apart on purpose, because collapsing them fabricates a corpus:
-  auction   — a prebid global exists AND bidders were actually asked (events observed)
+The read is taken in EVERY frame, not just the top document. A top-frame-only read answers
+"does the top window carry prebid", which is not the question: wrappers routinely run the
+auction inside an ad iframe, and there the top window is bare. The first sweep was
+top-only and reported 19 sites as `none` — a claim about one frame, printed as a claim
+about the site.
+
+Seven outcomes are kept apart on purpose, because collapsing them fabricates a corpus:
+  auction   — a prebid global exists in the TOP frame AND bidders were actually asked
+  auction-in-frame — bidders were asked, but in a SUBFRAME. A real auction and usable
+              evidence, yet not the same vantage: the page's own global does not expose it,
+              so any later collection has to address that frame, and pooling it with `auction`
+              would hide that the collector has to change.
+  pbjs-in-frame — a prebid global lives in a subframe with no auction observed in our window.
   pbjs-idle — the global is there but no auction ran in our window: lazy-loaded on scroll,
               consent-gated, or simply slower than --settle. NOT a confirmed auction, and
               NOT an absence either; it is a site to revisit with a longer window.
-  none      — the page loaded with a 2xx and there is demonstrably no prebid global
+  none      — the page loaded with a 2xx and there is demonstrably no prebid global in any
+              frame we could read
   blocked   — the server answered, but with 4xx/5xx. The page did not render, so it says
               NOTHING about prebid. From this node that is mostly geo: our egress is not
               in the geo being measured.
@@ -178,11 +190,67 @@ def egress_ip(timeout=15):
         return None
 
 
+FRAME_CAP = 80
+
+
+def scan_frames(page):
+    """Read the same question out of every subframe.
+
+    `page.evaluate` runs in the main frame and nowhere else, so a wrapper that runs its
+    auction inside an ad iframe is invisible to it — and invisible reads as absent. What
+    comes back per frame is a SUMMARY, not the full record: an ad-heavy page carries dozens
+    of frames and dumping each one's prebid block would bury the reading it exists to
+    surface. A frame we could not read is counted, never silently dropped, because
+    "unreadable" and "no prebid" are the same distinction this whole tool is built around.
+    """
+    out = {"frames_total": 0, "frames_read": 0, "frames_err": 0, "frames_skipped": 0,
+           "subframes": []}
+    try:
+        frames = page.frames
+    except Exception as e:
+        out["frames_err_top"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return out
+    subs = [f for f in frames if f is not page.main_frame]
+    out["frames_total"] = len(subs)
+    if len(subs) > FRAME_CAP:
+        # A cap that is not reported reads as full coverage.
+        out["frames_skipped"] = len(subs) - FRAME_CAP
+        subs = subs[:FRAME_CAP]
+    for fr in subs:
+        try:
+            d = fr.evaluate(PROBE_JS)
+        except Exception:
+            # Detached mid-scan, cross-process teardown, navigating — all unreadable, and
+            # unreadable is its own count.
+            out["frames_err"] += 1
+            continue
+        out["frames_read"] += 1
+        if not d.get("globals"):
+            continue
+        for rec in d.get("prebid") or []:
+            out["subframes"].append({
+                "frame_url": (fr.url or "")[:200],
+                "name": rec.get("name"),
+                "version": rec.get("version"),
+                "asked": len(rec.get("biddersAsked") or []),
+                "responded": len(rec.get("biddersResponded") or []),
+                "timedOut": len(rec.get("biddersTimedOut") or []),
+                "biddersAsked": rec.get("biddersAsked"),
+                "bidsReceived": rec.get("bidsReceived"),
+                "bidsWithOriginalCpm": rec.get("bidsWithOriginalCpm"),
+                "bidsWithFloorData": rec.get("bidsWithFloorData"),
+                "currencies": rec.get("currencies"),
+                "bidderTimeout": rec.get("bidderTimeout"),
+            })
+    return out
+
+
 def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
     row = {
-        # schema 1 folded 4xx/5xx into `none` and had no auction/idle split; rows without
-        # this field are from that run and must not be pooled with these.
-        "schema": 2,
+        # schema 1 folded 4xx/5xx into `none` and had no auction/idle split; schema 2 read
+        # the TOP FRAME ONLY, so its `none` rows are silent about subframes rather than
+        # evidence of absence. Rows of an older schema must not be pooled with these.
+        "schema": 3,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "url": url,
         "run_idx": run_idx,
@@ -227,15 +295,26 @@ def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
         row["load_s"] = round(time.time() - t0, 1)
         data = page.evaluate(PROBE_JS)
         row.update(data)
-        if not data.get("globals"):
-            row["verdict"] = "none"
-        else:
-            asked = 0
-            for rec in data.get("prebid") or []:
-                asked += len(rec.get("biddersAsked") or [])
+        row.update(scan_frames(page))
+
+        def asked_in(records):
+            return sum(len(r.get("biddersAsked") or []) for r in (records or []))
+
+        top_asked = asked_in(data.get("prebid"))
+        sub = row.get("subframes") or []
+        sub_asked = sum(f.get("asked") or 0 for f in sub)
+        if top_asked:
             # A global we can read is not an auction we observed. Only bidders actually
             # requested make this site usable for the study.
-            row["verdict"] = "auction" if asked else "pbjs-idle"
+            row["verdict"] = "auction"
+        elif sub_asked:
+            row["verdict"] = "auction-in-frame"
+        elif data.get("globals"):
+            row["verdict"] = "pbjs-idle"
+        elif sub:
+            row["verdict"] = "pbjs-in-frame"
+        else:
+            row["verdict"] = "none"
     except Exception as e:
         row["verdict"] = "error"
         row["error"] = f"{type(e).__name__}: {str(e)[:200]}"
@@ -302,13 +381,21 @@ def main():
             to = len(pb.get("biddersTimedOut") or [])
             ad = row.get("adfox") or {}
             admark = "adfox" if (ad.get("adfoxCode") or ad.get("hb_settings")) else ("ya" if ad.get("ya") else "-")
-            print(f"[{i}/{len(urls)}] {row['verdict']:9s} {u}  global={g} "
+            sub = row.get("subframes") or []
+            fr = (f"fr={len(sub)}/{row.get('frames_read', 0)}of{row.get('frames_total', 0)}"
+                  if "frames_total" in row else "fr=-")
+            if sub:
+                asked += sum(s.get("asked") or 0 for s in sub)
+                got += sum(s.get("responded") or 0 for s in sub)
+                to += sum(s.get("timedOut") or 0 for s in sub)
+            print(f"[{i}/{len(urls)}] {row['verdict']:16s} {u}  global={g} "
                   f"asked={asked} resp={got} to={to} bids={pb.get('bidsReceived')} "
-                  f"ya={admark} status={row.get('http_status')}"
+                  f"{fr} ya={admark} status={row.get('http_status')}"
                   + (f"  {row.get('error')}" if row.get("error") else ""))
             sys.stdout.flush()
     tally = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    denom = counts.get("auction", 0) + counts.get("pbjs-idle", 0) + counts.get("none", 0)
+    denom = sum(counts.get(k, 0) for k in
+                ("auction", "auction-in-frame", "pbjs-in-frame", "pbjs-idle", "none"))
     print(f"-- egress {ip} -- {tally} -- observable n={denom} of {len(urls)} "
           f"(blocked/error say nothing about prebid and are excluded from the denominator)")
     return 0
@@ -411,11 +498,27 @@ def selftest(sync_playwright):
             "{eventType:'bidRequested',args:{bidderCode:'betweendigital'}}];},"
             "getBidResponses:function(){return {};}};</script>live</body></html>")
 
+    # Filled in once the server has a port. The iframes point at `localhost` while the page
+    # is fetched over `127.0.0.1`, so the frames are genuinely CROSS-ORIGIN — a same-origin
+    # fixture would pass through the top document's context and prove nothing about the
+    # case this scan exists for.
+    SRC = {}
+
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path.startswith("/403"):
                 body = b"<html><body>Access denied</body></html>"
                 self.send_response(403)
+            elif self.path.startswith("/frameauction"):
+                body = ("<html><body>top has no prebid"
+                        f"<iframe src='{SRC['live']}'></iframe>"
+                        "</body></html>").encode()
+                self.send_response(200)
+            elif self.path.startswith("/frame"):
+                body = ("<html><body>top has no prebid"
+                        f"<iframe src='{SRC['idle']}'></iframe>"
+                        "</body></html>").encode()
+                self.send_response(200)
             elif self.path.startswith("/idle"):
                 body = IDLE.encode()
                 self.send_response(200)
@@ -432,12 +535,16 @@ def selftest(sync_playwright):
 
     srv = socketserver.TCPServer(("127.0.0.1", 0), H)
     port = srv.server_address[1]
+    SRC["idle"] = f"http://localhost:{port}/idle"
+    SRC["live"] = f"http://localhost:{port}/live"
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         with sync_playwright() as pw:
             r403 = probe(pw, f"http://127.0.0.1:{port}/403", 1, 10, None, 0)
             ridle = probe(pw, f"http://127.0.0.1:{port}/idle", 1, 10, None, 0)
             rlive = probe(pw, f"http://127.0.0.1:{port}/live", 1, 10, None, 0)
+            rfr = probe(pw, f"http://127.0.0.1:{port}/frame", 1, 10, None, 0)
+            rfra = probe(pw, f"http://127.0.0.1:{port}/frameauction", 1, 10, None, 0)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -451,6 +558,32 @@ def selftest(sync_playwright):
     checks.append(("bidders asked -> auction", rlive.get("verdict") == "auction"))
     checks.append(("auction row names the bidder",
                    (rlive.get("prebid") or [{}])[0].get("biddersAsked") == ["betweendigital"]))
+
+    # The leg the first sweep did not have: prebid in a CROSS-ORIGIN subframe. Top-frame-only
+    # reads call this page `none`, which is how 19 sites were reported as publishers without
+    # prebid off a read that never entered their ad frames.
+    sub = rfr.get("subframes") or []
+    checks.append(("subframe prebid -> pbjs-in-frame, not none",
+                   rfr.get("verdict") == "pbjs-in-frame"))
+    checks.append(("top frame of that page is genuinely bare", rfr.get("globals") == []))
+    checks.append(("the frame that carried it is named",
+                   bool(sub) and "/idle" in (sub[0].get("frame_url") or "")))
+    checks.append(("cross-origin frame was read, not just counted",
+                   bool(sub) and "localhost:" in (sub[0].get("frame_url") or "")
+                   and rfr.get("frames_read", 0) >= 1))
+    suba = rfra.get("subframes") or []
+    checks.append(("bidders asked in a subframe -> auction-in-frame",
+                   rfra.get("verdict") == "auction-in-frame"))
+    checks.append(("in-frame auction names the bidder",
+                   bool(suba) and suba[0].get("biddersAsked") == ["betweendigital"]))
+    # An in-frame auction must NOT be pooled with a top-frame one: the collector that reads
+    # `auction` cannot reach it, and pooling would hide that it has to change.
+    checks.append(("in-frame auction is not called auction",
+                   rfra.get("verdict") != "auction" and rlive.get("verdict") == "auction"))
+    # A frameless page must still report the scan as having run, so `none` is a read of every
+    # frame rather than a read of one.
+    checks.append(("frame scan reports coverage on a bare page",
+                   ridle.get("frames_total") == 0 and ridle.get("frames_err") == 0))
 
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
