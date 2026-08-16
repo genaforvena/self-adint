@@ -283,10 +283,17 @@ def parse_request_floor(post_data):
     return floors or None
 
 
-def arm_plan(count, arms):
+def arm_plan(count, arms, offset=0):
     """Which arm each load runs, in load order. Alternating, never blocked: the hour is the
-    dominant confounder, so a block design hands whichever hour it ran in to one arm."""
-    return [arms[i % len(arms)] for i in range(count)]
+    dominant confounder, so a block design hands whichever hour it ran in to one arm.
+
+    The offset exists because alternation alone is not enough across passes. The url list is
+    read in a fixed order, so `i % 2` gives every site the SAME arm on every pass — arm would
+    be perfectly confounded with site parity, and a per-site difference would read as an arm
+    effect. Shifting the offset by one on the next pass gives each site both arms, so an arm
+    effect can be estimated WITHIN a site.
+    """
+    return [arms[(i + offset) % len(arms)] for i in range(count)]
 
 
 def arms_need_note(arms, note):
@@ -537,6 +544,9 @@ def main():
                                    "blocks: the hour is the dominant confounder)")
     ap.add_argument("--arm-note", help="what the arms actually differ in; REQUIRED with --arms, "
                                        "because a label is not a treatment")
+    ap.add_argument("--arm-offset", type=int, default=0,
+                    help="shift the alternation; use 1 on the next pass so a site does not "
+                         "always land in the same arm (see arm_plan)")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test", action="store_true")
@@ -564,7 +574,7 @@ def main():
         return 2
 
     arms = [a.strip() for a in (args.arms or args.arm).split(",") if a.strip()]
-    plan = arm_plan(len(urls), arms)
+    plan = arm_plan(len(urls), arms, args.arm_offset)
     if arms_need_note(arms, args.arm_note):
         # An arm label with no stated treatment is a column that LOOKS like an experiment.
         # Somebody reading `arm: A` / `arm: B` months later will believe two conditions were
@@ -858,6 +868,11 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
         # Assignment: alternating, and a label that claims nothing is refused.
         ("arms alternate per load, never in blocks",
          arm_plan(6, ["A", "B"]) == ["A", "B", "A", "B", "A", "B"]),
+        # Without the offset, a fixed url order gives every site the same arm on every pass
+        # and arm becomes site parity wearing a different name.
+        ("the next pass can give each site the other arm",
+         arm_plan(4, ["A", "B"], 1) == ["B", "A", "B", "A"]
+         and all(a != b for a, b in zip(arm_plan(4, ["A", "B"]), arm_plan(4, ["A", "B"], 1)))),
         ("a single arm needs no note", not arms_need_note(["A"], None)),
         ("two arms without a stated treatment are refused",
          arms_need_note(["A", "B"], None) and not arms_need_note(["A", "B"], "A/A null")),
