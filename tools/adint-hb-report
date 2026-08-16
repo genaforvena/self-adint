@@ -57,7 +57,14 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     p = lambda s="": print(s, file=out)
     loads = [r for r in kept if r.get("kind") == "load"]
     reqs = [r for r in kept if r.get("kind") == "request"]
-    cands = [r for r in reqs if r.get("is_bid_candidate")]
+    # ASKED means we saw a bid request or a bid response — protocol evidence. A bidder's host
+    # being contacted is not the same claim: its cookie-sync pixel fires on pages where it is
+    # never asked to bid, and counting those as asked inflates reach and manufactures no-bids.
+    # A row with no `evidence_strength` predates that distinction; it is counted as `unstated`
+    # and said out loud rather than quietly folded into either side.
+    cands = [r for r in reqs if r.get("evidence_strength") == "protocol"]
+    attrib_only = [r for r in reqs if r.get("evidence_strength") == "attribution-only"]
+    unstated = [r for r in reqs if r.get("is_bid_candidate") and not r.get("evidence_strength")]
     by_load = {l["load_id"]: l for l in loads}
 
     p(f"== hb capture read-out — schema {schema} ==")
@@ -102,6 +109,13 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
           f"wrapper_timeout {l.get('wrapper_timeout_ms')})")
     if len(silent_wrapper) > 10:
         p(f"      … and {len(silent_wrapper) - 10} more")
+    sync_bidders = collections.Counter(r.get("bidder") for r in attrib_only if r.get("bidder"))
+    p(f"   named-but-not-asked rows (host contacted, no bid protocol seen): {len(attrib_only)}"
+      + (f" — {dict(sync_bidders.most_common(6))}" if sync_bidders else ""))
+    p("   those are contacts, mostly cookie syncs; they are NOT counted as asked anywhere below")
+    if unstated:
+        p(f"   !! {len(unstated)} candidate row(s) carry no evidence_strength (written before "
+          f"the distinction existed) — they are counted NOWHERE; re-capture to include them")
 
     # Per bidder. Sites, not rows: the unit of evidence is a publisher.
     p("")
@@ -237,7 +251,8 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
             "bidders": {b: dict(out_by_bidder[b]) for b in out_by_bidder},
             "latency": {b: {"answered": e["answered"], "late": e["late"]}
                         for b, e in lat.items()},
-            "no_deadline": no_deadline,
+            "no_deadline": no_deadline, "attribution_only": len(attrib_only),
+            "unstated": len(unstated),
             "sites_by_bidder": {b: len(v) for b, v in sites_by_bidder.items()},
             "repeated": len(repeated)}
 
@@ -255,16 +270,16 @@ def selftest():
          "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
         # Answers at 400ms against a 3000ms deadline: in time.
         {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "mediasniper",
-         "outcome": "no-bid", "is_bid_candidate": True, "wrapper_timeout_ms": 3000,
+         "outcome": "no-bid", "is_bid_candidate": True, "evidence_strength": "protocol", "wrapper_timeout_ms": 3000,
          "t_request_s": 8.0, "t_response_s": 8.4,
          "req_adfox": {"placement_ids": ["41139"], "places": 3}},
         # Answers at 4.5s against the same deadline: the auction was over. Still an answer.
         {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "buzzoola",
-         "outcome": "priced", "is_bid_candidate": True, "wrapper_timeout_ms": 3000,
+         "outcome": "priced", "is_bid_candidate": True, "evidence_strength": "protocol", "wrapper_timeout_ms": 3000,
          "t_request_s": 8.0, "t_response_s": 12.5,
          "req_adfox": {"placement_ids": ["777"], "places": 3}},
         {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "astralab",
-         "outcome": "no-answer", "is_bid_candidate": True,
+         "outcome": "no-answer", "is_bid_candidate": True, "evidence_strength": "protocol",
          "req_adfox": {"placement_ids": ["69eb"], "places": 3}},
         # Same publisher, second visit: mediasniper answers again, astralab is absent.
         {"schema": 1, "kind": "load", "load_id": "L2", "url": "https://a.ru/", "arm": "B",
@@ -273,9 +288,16 @@ def selftest():
         # Timed, but the wrapper's deadline was never read on this load: lateness is
         # undecidable and must not default to "on time".
         {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "mediasniper",
-         "outcome": "no-bid", "is_bid_candidate": True, "wrapper_timeout_ms": None,
+         "outcome": "no-bid", "is_bid_candidate": True, "evidence_strength": "protocol", "wrapper_timeout_ms": None,
          "t_request_s": 8.0, "t_response_s": 9.9,
          "req_adfox": {"placement_ids": ["41139"], "places": 3}},
+        # adriver's host was contacted for a cookie sync. Named, never asked to bid.
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "adriver",
+         "outcome": "redirect", "is_bid_candidate": True,
+         "evidence_strength": "attribution-only"},
+        # Written before the distinction existed: countable nowhere, and said out loud.
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "sape",
+         "outcome": "no-bid", "is_bid_candidate": True},
         # A load that ran a wrapper and produced nothing: a coverage gap, not zero demand.
         {"schema": 1, "kind": "load", "load_id": "L3", "url": "https://b.ru/", "arm": "A",
          "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
@@ -328,6 +350,13 @@ def selftest():
          and res["latency"].get("mediasniper", {}).get("late") == 0),
         ("lateness is undecidable without a deadline and is left uncounted",
          res["no_deadline"] == 1),
+        # The inflation this split exists to stop.
+        ("a cookie-sync contact is never counted as an asked bidder",
+         "adriver" not in res["bidders"] and res["attribution_only"] == 1
+         and "NOT counted as asked" in text),
+        ("rows predating the distinction are counted nowhere and said so",
+         res["unstated"] == 1 and "sape" not in res["bidders"]
+         and "counted NOWHERE" in text),
     ]
 
     # A corpus where every site was seen once must say the stability claim is unavailable.

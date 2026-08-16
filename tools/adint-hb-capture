@@ -308,7 +308,10 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
     load = {
-        "schema": 1, "kind": "load", "load_id": load_id,
+        # schema 2 adds evidence_strength (protocol vs attribution-only) and the
+        # `redirect` outcome. A schema-1 row is SILENT about both — its "candidates"
+        # include cookie-sync hops, so the two must never be pooled.
+        "schema": 2, "kind": "load", "load_id": load_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note, "egress_ip": ip,
         # Fresh context per load: the profile has no history, so cookie age can never become
@@ -340,7 +343,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 from urllib.parse import urlparse
                 host = (urlparse(req.url).hostname or "").lower()
                 row = {
-                    "schema": 1, "kind": "request", "load_id": load_id,
+                    "schema": 2, "kind": "request", "load_id": load_id,
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
@@ -363,6 +366,14 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 if resp.status >= 400:
                     row["outcome"] = "error"
                     row["detail"] = {"reason": f"http-{resp.status}"}
+                    return
+                if 300 <= resp.status < 400:
+                    # A cookie-sync hop. It has no body to read, and filing it as `unread`
+                    # reads as "we failed to look" — 16 such rows in the first sweep, mostly
+                    # sync.dmp.otm-r.com / sync.programmatica.com / mc.acint.net.
+                    row["outcome"] = "redirect"
+                    row["detail"] = {"reason": f"http-{resp.status}",
+                                     "location": (resp.headers or {}).get("location", "")[:200]}
                     return
                 if resp.status == 204:
                     row["outcome"] = "no-bid"
@@ -495,6 +506,15 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
             evidence.append("attributed:" + str(row.get("match_by")))
         row["bid_evidence"] = evidence
         row["is_bid_candidate"] = bool(evidence)
+        # Not all evidence is equal, and the difference decides who counts as ASKED. Protocol
+        # evidence means we saw a bid request or a bid response. A name alone means only that
+        # a bidder's host was contacted — and a bidder's cookie-sync pixel is contacted on
+        # every page whether or not it is ever asked to bid. On fontanka.ru's first capture
+        # 52 rows were "named" and a good share of them were sync hops.
+        protocol = [e for e in evidence if e in (
+            "adfox-hb-request", "adfox-hb-response", "openrtb-request", "openrtb-response")]
+        row["evidence_strength"] = ("protocol" if protocol
+                                    else ("attribution-only" if evidence else "none"))
         row["wrapper_timeout_ms"] = wt
         # Our window is in seconds, the wrapper's deadline in ms. If ours is the shorter one,
         # a `no-answer` here cannot be distinguished from a bidder the wrapper itself dropped.
@@ -634,6 +654,13 @@ def selftest(sync_playwright):
                 self._send(200, json.dumps({"bids": [
                     {"placementId": "69ebPID", "width": 300, "height": 600,
                      "bidValue": 42.5, "html": "<div/>"}]}).encode())
+            elif self.path.startswith("/sync"):
+                # A cookie-sync hop carrying a bidder's name: contacted, never asked to bid.
+                self.send_response(302)
+                self.send_header("Location", "/nobid204")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             elif self.path.startswith("/beacon"):
                 # Analytics: answers 200, carries no price, and is not a bidder. The page
                 # fires more of these than it runs bidders.
@@ -681,7 +708,7 @@ window.YaHeaderBiddingSettings = {{
   timeout: 1200,
   biddersMap: {{betweenDigital: 'x', myTarget: 'y'}},
   adUnits: [{{code: 'top', bids: [{{bidder: 'betweendigital'}}, {{bidder: 'mytarget'}},
-                                  {{bidder: 'buzzoola'}}, {{bidder: 'astralab'}},
+                                  {{bidder: 'buzzoola'}}, {{bidder: 'astralab'}}, {{bidder: 'adriver'}},
                                   {{bidder: 'mediasniper', params: {{placementId: '41139'}}}},
                                   {{bidder: 'astralab2', params: {{placementId: '69ebPID'}}}}]}}]
 }};
@@ -707,6 +734,8 @@ ask('/err?bidder=unknownvendor', 0.1);
 // The market's real protocol: places + placementId out, {{"bids":[…]}} back.
 askAdfox('/adfox-nobid', '41139');
 askAdfox('/adfox-bid', '69ebPID');
+// A bidder's host, contacted for a cookie sync — named, but never asked to bid.
+fetch('{base}/sync?bidder=adriver', {{method: 'POST', body: '{{"u":"1"}}'}}).catch(function(e) {{}});
 // Not an auction message at all: no imp in the request, no seatbid in the answer.
 fetch('{base}/beacon?evt=pageview', {{method: 'POST', body: '{{"evt":"pv"}}'}}).catch(function(e) {{}});
 // Not text: a beacon's compressed blob. Reading it as UTF-8 raises.
@@ -726,7 +755,7 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     by = {}
     for r in rows:
         for name in ("betweendigital", "mytarget", "buzzoola", "astralab", "unknownvendor",
-                     "beacon", "binary", "refused", "adfox-nobid", "adfox-bid"):
+                     "beacon", "binary", "refused", "adfox-nobid", "adfox-bid", "/sync"):
             if name in r["url"]:
                 by[name] = r
 
@@ -735,7 +764,7 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     checks = [
         ("wrapper deadline read", load.get("wrapper_timeout_ms") == 1200),
         ("roster read from the page", "buzzoola" in (load.get("roster") or [])),
-        ("every asked bidder produced a row", len(by) == 10),
+        ("every asked bidder produced a row", len(by) == 11),
         ("priced answer classified", priced.get("outcome") == "priced"),
         # The whole reason the raw path travels with the number.
         ("price is the RAW price, not the adjusted decoy",
@@ -817,6 +846,14 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
          and "bidValue" in ((by.get("adfox-bid", {}).get("detail") or {}).get("bids_raw") or "")),
         ("a returned bid is never counted as a no-bid",
          by.get("adfox-bid", {}).get("outcome") != "no-bid"),
+
+        # A bidder's host being contacted is not that bidder being asked to bid.
+        ("a cookie-sync hop is redirect + attribution-only, not an asked bidder",
+         by.get("/sync", {}).get("outcome") == "redirect"
+         and by.get("/sync", {}).get("evidence_strength") == "attribution-only"),
+        ("a real bid exchange carries protocol evidence",
+         by.get("adfox-nobid", {}).get("evidence_strength") == "protocol"
+         and priced.get("evidence_strength") == "protocol"),
 
         # Assignment: alternating, and a label that claims nothing is refused.
         ("arms alternate per load, never in blocks",
