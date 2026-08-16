@@ -62,7 +62,7 @@ ROW_CAP = 600               # per page load; an exceeded cap is REPORTED, never 
 # The wrapper's own roster and deadline, read once after settle. Same object step 0 counted.
 WRAPPER_JS = r"""
 () => {
-  const out = {wrapper_timeout_ms: null, roster: [], adfox: false, pbjs: false};
+  const out = {wrapper_timeout_ms: null, roster: [], placements: {}, adfox: false, pbjs: false};
   try { out.adfox = typeof window.Ya !== 'undefined'; } catch (e) {}
   try { out.pbjs = Array.isArray(window._pbjsGlobals) && window._pbjsGlobals.length > 0; } catch (e) {}
   try {
@@ -73,7 +73,15 @@ WRAPPER_JS = r"""
       for (const n of Object.keys(s.biddersMap || {})) names[String(n).toLowerCase()] = 1;
       for (const u of (Array.isArray(s.adUnits) ? s.adUnits : [])) {
         for (const b of ((u && u.bids) || [])) {
-          if (b && b.bidder) names[String(b.bidder).toLowerCase()] = 1;
+          if (!b || !b.bidder) continue;
+          const name = String(b.bidder).toLowerCase();
+          names[name] = 1;
+          // placementId -> bidder. This is the ONE attribution that is exact on this market:
+          // each wrapper endpoint is a single bidder, and the id it is asked with is written
+          // in the publisher's own config. Measured on lenta.ru — 41139 -> mediasniper hit
+          // hb.bumlam.com, 69eb5feb… -> astralab hit ssp.al-adtech.com.
+          const pid = b.params && b.params.placementId;
+          if (pid !== undefined && pid !== null) out.placements[String(pid)] = name;
         }
       }
       out.roster = Object.keys(names).sort();
@@ -102,8 +110,20 @@ def load_domain_table(path=DOMAINS):
     return table
 
 
-def attribute(url, host, roster, table):
-    """Name a bidder only on evidence. `none` is a valid, and often the honest, answer."""
+def attribute(url, host, roster, table, placement_ids=None, placements=None):
+    """Name a bidder only on evidence. `none` is a valid, and often the honest, answer.
+
+    Strongest evidence first: the placement ids the REQUEST was made with, matched against the
+    publisher's own `placementId -> bidder` config. On this market each wrapper endpoint is one
+    bidder, so a request carrying only that bidder's ids names it exactly — no host list to
+    maintain and no substring luck.
+    """
+    if placement_ids and placements:
+        named = {placements[p] for p in placement_ids if p in placements}
+        if len(named) == 1:
+            return named.pop(), "placement-id"
+        if len(named) > 1:
+            return None, "ambiguous-placements:" + ",".join(sorted(named))
     for pattern, org in table:
         if host == pattern or host.endswith("." + pattern):
             return org, "host-table:" + pattern
@@ -142,8 +162,32 @@ def _walk_prices(node, path="$", out=None, depth=0):
     return out
 
 
+def _walk_numbers(node, path="$", out=None, depth=0):
+    """Every numeric leaf with its path — the raw material for identifying an unfamiliar
+    bidder's price field from a real bid instead of guessing at it."""
+    if out is None:
+        out = []
+    if depth > 8 or len(out) >= 60:
+        return out
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out.append({"path": f"{path}.{k}", "field": k, "value": float(v)})
+            else:
+                _walk_numbers(v, f"{path}.{k}", out, depth + 1)
+    elif isinstance(node, list):
+        for i, v in enumerate(node[:20]):
+            _walk_numbers(v, f"{path}[{i}]", out, depth + 1)
+    return out
+
+
 def parse_response(body_text):
-    """Classify a bidder's answer. Returns (outcome, detail)."""
+    """Classify an answer. Returns (outcome, detail).
+
+    `no-bid` here means "answered, and the answer carries no price". It is only a statement
+    about a BIDDER once the row is known to be bidder traffic — see `bid_evidence`; a
+    pixel that answers 200 is not a bidder declining to bid.
+    """
     if body_text is None:
         return "no-bid", {"reason": "empty-body"}
     t = body_text.strip()
@@ -153,15 +197,73 @@ def parse_response(body_text):
         doc = json.loads(t)
     except Exception:
         return "unparsed", {"reason": "not-json", "bytes": len(t)}
+    # The Adfox HB answer, measured: `{"bids":[]}` from both of lenta.ru's bidders. An empty
+    # array is a REAL no-bid from a real bidder — it is not the absence of an auction, and it
+    # is certainly not silence.
+    if isinstance(doc, dict) and isinstance(doc.get("bids"), list):
+        if not doc["bids"]:
+            return "no-bid", {"reason": "adfox-empty-bids", "has_bids_key": True}
+        prices = _walk_prices(doc)
+        if prices:
+            return "priced", {"prices": prices, "has_bids_key": True,
+                              "currency": doc.get("cur") or doc.get("currency"),
+                              "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
+        # A bid came back and nothing in it is called `price`. The field name is not something
+        # to guess: the raw objects and every numeric field found are recorded so the price key
+        # can be identified from a real bid rather than assumed from a schema we have not seen.
+        return "bid-returned", {"reason": "bids-present-no-price-key", "has_bids_key": True,
+                                "numeric_fields": _walk_numbers(doc["bids"][:3]),
+                                "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
+
     prices = _walk_prices(doc)
     cur = None
+    has_seatbid = False
     if isinstance(doc, dict):
         cur = doc.get("cur") or doc.get("currency")
+        has_seatbid = "seatbid" in doc
     if not prices:
         # An answer with no price IS a no-bid — a distinct fact from never answering.
-        return "no-bid", {"reason": "no-price-in-body",
+        return "no-bid", {"reason": "no-price-in-body", "has_seatbid": has_seatbid,
                           "seatbid": len(doc.get("seatbid", [])) if isinstance(doc, dict) else None}
-    return "priced", {"prices": prices, "currency": cur}
+    return "priced", {"prices": prices, "currency": cur, "has_seatbid": has_seatbid}
+
+
+def request_adfox_places(post_data):
+    """The Adfox HB request shape, measured on lenta.ru 2026-08-16:
+
+        {"places":[{"id":"begun_block_…","placementId":"41139","sizes":[[970,250]],
+                    "codeType":"combo","targetRef":"https://lenta.ru/"}, …]}
+
+    It is NOT OpenRTB — no `imp`, no `bidfloor` — so a collector that only knows OpenRTB
+    records this market's entire auction as uninteresting traffic. Returns the placement ids,
+    which are also the attribution key.
+    """
+    if not post_data:
+        return None
+    try:
+        doc = json.loads(post_data)
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("places"), list):
+        return None
+    ids = []
+    for pl in doc["places"][:60]:
+        if isinstance(pl, dict) and pl.get("placementId") is not None:
+            ids.append(str(pl["placementId"]))
+    return {"placement_ids": ids, "places": len(doc["places"])}
+
+
+def request_is_openrtb(post_data):
+    """Does the REQUEST look like a bid request? `imp` is OpenRTB's required inventory array
+    and no analytics beacon carries it. This is evidence, not proof, and it is recorded as
+    evidence — see `bid_evidence` on each row."""
+    if not post_data:
+        return False
+    try:
+        doc = json.loads(post_data)
+    except Exception:
+        return False
+    return isinstance(doc, dict) and isinstance(doc.get("imp"), list)
 
 
 def parse_request_floor(post_data):
@@ -231,6 +333,8 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
+                    "req_openrtb": request_is_openrtb(req.post_data),
+                    "req_adfox": request_adfox_places(req.post_data),
                     "outcome": None, "t_response_s": None, "status": None,
                 }
                 seen[req] = row
@@ -254,14 +358,24 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
                     row["detail"] = {"reason": "http-204"}
                     return
                 try:
-                    body = resp.text()
+                    raw = resp.body()
                 except Exception as e:
                     row["outcome"] = "unread"
                     row["detail"] = {"reason": f"body-unavailable: {type(e).__name__}"}
                     return
-                if len(body) > BODY_CAP:
+                if len(raw) > BODY_CAP:
                     row["outcome"] = "unread"
-                    row["detail"] = {"reason": "body-over-cap", "bytes": len(body)}
+                    row["detail"] = {"reason": "body-over-cap", "bytes": len(raw)}
+                    return
+                try:
+                    body = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Not text at all — a beacon's gif, a font, a compressed blob. Reading it
+                    # through `resp.text()` raised, and the first version filed 124 of these
+                    # as `unread`, which reads as "we failed to look" when the truth is "this
+                    # was never an auction message".
+                    row["outcome"] = "binary"
+                    row["detail"] = {"reason": "body-not-utf8", "bytes": len(raw)}
                     return
                 outcome, detail = parse_response(body)
                 row["outcome"] = outcome
@@ -283,8 +397,19 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
                     row["post_response_abort"] = True
                     row["abort_reason"] = (req.failure or "")[:80]
                     return
-                row["outcome"] = "no-answer"
-                row["detail"] = {"reason": f"failed: {(req.failure or '')[:80]}"}
+                fail = (req.failure or "")[:80]
+                # A connection that never happened is not a bidder declining to speak. DNS,
+                # TLS and refused connections are OUR network failing, and filing them as
+                # silence would hand the study phantom timeouts — on this node's first live
+                # capture, six rows failed ERR_CERT_AUTHORITY_INVALID and would have counted
+                # as three bidders going quiet.
+                net_fault = any(k in fail for k in (
+                    "CERT", "NAME_NOT_RESOLVED", "CONNECTION_REFUSED", "CONNECTION_RESET",
+                    "CONNECTION_CLOSED", "ADDRESS_UNREACHABLE", "INTERNET_DISCONNECTED",
+                    "SSL", "PROXY", "TUNNEL", "UNSAFE_PORT", "BLOCKED_BY_CLIENT"))
+                row["outcome"] = "error" if net_fault else "no-answer"
+                row["detail"] = {"reason": f"failed: {fail}",
+                                 "net_fault": net_fault}
                 row["t_response_s"] = rel()
             except Exception:
                 pass
@@ -335,7 +460,30 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
             # about our window; it is not the wrapper's timeout and is not a no-bid.
             row["outcome"] = "no-answer"
             row["detail"] = {"reason": "no-response-in-window"}
-        row["bidder"], row["match_by"] = attribute(row["url"], row["host"], roster, table)
+        pids = (row.get("req_adfox") or {}).get("placement_ids")
+        row["bidder"], row["match_by"] = attribute(
+            row["url"], row["host"], roster, table, pids, load.get("placements") or {})
+        # A page fires far more xhr/fetch than it runs bidders: analytics, error beacons,
+        # recommendation widgets. The first live capture put 194 rows on disk and 13 of them
+        # landed in `no-bid` off metrica and error-reporting endpoints — a pixel that answers
+        # 200 is not a bidder declining to bid, and counting it as one poisons exactly the
+        # column the study reads. So an outcome is only a statement about a BIDDER when there
+        # is evidence the row is bidder traffic, and the evidence is listed rather than
+        # collapsed into a boolean somebody has to trust.
+        d = row.get("detail") or {}
+        evidence = []
+        if row.get("req_openrtb"):
+            evidence.append("openrtb-request")
+        if row.get("req_adfox"):
+            evidence.append("adfox-hb-request")
+        if d.get("has_bids_key"):
+            evidence.append("adfox-hb-response")
+        if d.get("has_seatbid") or row["outcome"] == "priced":
+            evidence.append("openrtb-response")
+        if row.get("bidder"):
+            evidence.append("attributed:" + str(row.get("match_by")))
+        row["bid_evidence"] = evidence
+        row["is_bid_candidate"] = bool(evidence)
         row["wrapper_timeout_ms"] = wt
         # Our window is in seconds, the wrapper's deadline in ms. If ours is the shorter one,
         # a `no-answer` here cannot be distinguished from a bidder the wrapper itself dropped.
@@ -390,14 +538,19 @@ def main():
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
                     fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            # Two tallies, never one: the outcome counts that MATTER are the candidate ones,
+            # and printing a single mixed number is how a page's analytics traffic gets read
+            # as an auction.
+            cand = [r for r in rows if r.get("is_bid_candidate")]
             tally = {}
-            for r in rows:
+            for r in cand:
                 tally[r["outcome"]] = tally.get(r["outcome"], 0) + 1
-            named = sum(1 for r in rows if r.get("bidder"))
+            named = sum(1 for r in cand if r.get("bidder"))
             print(f"[{i}/{len(urls)}] {u} load={load['load_id']} "
                   f"status={load.get('http_status')} wrapper_timeout={load.get('wrapper_timeout_ms')} "
-                  f"roster={len(load.get('roster') or [])} rows={len(rows)} named={named} "
-                  f"{' '.join(f'{k}={v}' for k, v in sorted(tally.items()))}")
+                  f"roster={len(load.get('roster') or [])} rows={len(rows)} "
+                  f"candidates={len(cand)} named={named} "
+                  f"{' '.join(f'{k}={v}' for k, v in sorted(tally.items())) or '(no candidate rows)'}")
             sys.stdout.flush()
     return 0
 
@@ -445,6 +598,22 @@ def selftest(sync_playwright):
                 self._send(200, EMPTY.encode())
             elif self.path.startswith("/err"):
                 self._send(500, b"{}")
+            elif self.path.startswith("/adfox-nobid"):
+                # The measured shape: a real bidder, answering, declining.
+                self._send(200, b'{"bids":[]}')
+            elif self.path.startswith("/adfox-bid"):
+                # A bid came back and nothing in it is called `price`. The collector must not
+                # invent a price field; it records the raw bid and every number in it.
+                self._send(200, json.dumps({"bids": [
+                    {"placementId": "69ebPID", "width": 300, "height": 600,
+                     "bidValue": 42.5, "html": "<div/>"}]}).encode())
+            elif self.path.startswith("/beacon"):
+                # Analytics: answers 200, carries no price, and is not a bidder. The page
+                # fires more of these than it runs bidders.
+                self._send(200, b'{"ok":1}')
+            elif self.path.startswith("/binary"):
+                self._send(200, bytes([0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0x00, 0x80]),
+                           "application/octet-stream")
             elif self.path.startswith("/silent"):
                 # Answers long after the capture window closes: asked, never answered.
                 time.sleep(60)
@@ -468,6 +637,14 @@ def selftest(sync_playwright):
     srv = TS(("127.0.0.1", 0), H)
     port = srv.server_address[1]
     base = f"http://127.0.0.1:{port}"
+    # A port nothing listens on, taken from the kernel and released — Chrome refuses the
+    # low ports outright (ERR_UNSAFE_PORT), which is a different failure from a refused
+    # connection and would let this leg pass for the wrong reason.
+    import socket as _socket
+    _s = _socket.socket()
+    _s.bind(("127.0.0.1", 0))
+    dead_port = _s.getsockname()[1]
+    _s.close()
     # A wrapper page: a roster and a deadline in the same shape the live sites carry, and one
     # request per bidder, each with the floor stated in the request the way OpenRTB states it.
     PAGE = f"""<html><body>fixture
@@ -477,8 +654,18 @@ window.YaHeaderBiddingSettings = {{
   timeout: 1200,
   biddersMap: {{betweenDigital: 'x', myTarget: 'y'}},
   adUnits: [{{code: 'top', bids: [{{bidder: 'betweendigital'}}, {{bidder: 'mytarget'}},
-                                  {{bidder: 'buzzoola'}}, {{bidder: 'astralab'}}]}}]
+                                  {{bidder: 'buzzoola'}}, {{bidder: 'astralab'}},
+                                  {{bidder: 'mediasniper', params: {{placementId: '41139'}}}},
+                                  {{bidder: 'astralab2', params: {{placementId: '69ebPID'}}}}]}}]
 }};
+function askAdfox(path, pid) {{
+  return fetch('{base}' + path, {{
+    method: 'POST',
+    body: JSON.stringify({{places: [{{id: 'begun_block_1', placementId: pid,
+                                     sizes: [[970, 250]], codeType: 'combo',
+                                     targetRef: location.href}}]}})
+  }}).catch(function(e) {{}});
+}}
 function ask(path, floor) {{
   return fetch('{base}' + path, {{
     method: 'POST',
@@ -490,6 +677,15 @@ ask('/nobid204?bidder=mytarget', 0.5);
 ask('/nobid-empty?bidder=buzzoola', 0.7);
 ask('/silent?bidder=astralab', 0.9);
 ask('/err?bidder=unknownvendor', 0.1);
+// The market's real protocol: places + placementId out, {{"bids":[…]}} back.
+askAdfox('/adfox-nobid', '41139');
+askAdfox('/adfox-bid', '69ebPID');
+// Not an auction message at all: no imp in the request, no seatbid in the answer.
+fetch('{base}/beacon?evt=pageview', {{method: 'POST', body: '{{"evt":"pv"}}'}}).catch(function(e) {{}});
+// Not text: a beacon's compressed blob. Reading it as UTF-8 raises.
+fetch('{base}/binary?evt=px', {{method: 'POST', body: '{{"evt":"px"}}'}}).catch(function(e) {{}});
+// The network failing is not a bidder going quiet.
+fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[{{"id":"1"}}]}}'}}).catch(function(e) {{}});
 </script></body></html>"""
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -502,7 +698,8 @@ ask('/err?bidder=unknownvendor', 0.1);
 
     by = {}
     for r in rows:
-        for name in ("betweendigital", "mytarget", "buzzoola", "astralab", "unknownvendor"):
+        for name in ("betweendigital", "mytarget", "buzzoola", "astralab", "unknownvendor",
+                     "beacon", "binary", "refused", "adfox-nobid", "adfox-bid"):
             if name in r["url"]:
                 by[name] = r
 
@@ -511,7 +708,7 @@ ask('/err?bidder=unknownvendor', 0.1);
     checks = [
         ("wrapper deadline read", load.get("wrapper_timeout_ms") == 1200),
         ("roster read from the page", "buzzoola" in (load.get("roster") or [])),
-        ("every asked bidder produced a row", len(by) == 5),
+        ("every asked bidder produced a row", len(by) == 10),
         ("priced answer classified", priced.get("outcome") == "priced"),
         # The whole reason the raw path travels with the number.
         ("price is the RAW price, not the adjusted decoy",
@@ -552,6 +749,47 @@ ask('/err?bidder=unknownvendor', 0.1);
              and r.get("egress_ip") == "test-ip" and r.get("profile_age_s") == 0 for r in rows)),
         ("load row carries the vantage and the hour",
          load.get("egress_ip") == "test-ip" and isinstance(load.get("hour_utc"), int)),
+        # Bidder traffic is identified by evidence that is listed, not by a boolean to trust.
+        ("a real bid exchange is a candidate on both halves",
+         priced.get("is_bid_candidate") is True
+         and "openrtb-request" in (priced.get("bid_evidence") or [])
+         and "openrtb-response" in (priced.get("bid_evidence") or [])),
+        # The live capture's actual failure: 13 analytics answers landed in `no-bid`.
+        ("an analytics beacon is not a bidder declining to bid",
+         by.get("beacon", {}).get("is_bid_candidate") is False
+         and by.get("beacon", {}).get("bid_evidence") == []),
+        ("a non-utf8 body is classified, not filed as unread",
+         by.get("binary", {}).get("outcome") == "binary"
+         and by.get("binary", {}).get("is_bid_candidate") is False),
+        # DNS/TLS/refused is our network failing; as silence it would mint phantom timeouts.
+        ("a refused connection is an error, never no-answer",
+         by.get("refused", {}).get("outcome") == "error"
+         and (by.get("refused", {}).get("detail") or {}).get("net_fault") is True),
+        # ...and the abort case must still read as silence, or the split above is vacuous.
+        ("an aborted-in-flight request is still no-answer, not error",
+         by.get("astralab", {}).get("outcome") == "no-answer"),
+
+        # The market's actual protocol. A collector that only knows OpenRTB records this
+        # entire auction as uninteresting traffic — which is what the first live capture did:
+        # 197 rows, zero candidates, while two bidders were answering on the wire.
+        ("adfox `places` request is recognised as an auction message",
+         "adfox-hb-request" in (by.get("adfox-nobid", {}).get("bid_evidence") or [])
+         and by.get("adfox-nobid", {}).get("is_bid_candidate") is True),
+        ("empty `bids` array is a real no-bid, not silence",
+         by.get("adfox-nobid", {}).get("outcome") == "no-bid"
+         and (by.get("adfox-nobid", {}).get("detail") or {}).get("reason") == "adfox-empty-bids"),
+        # Exact attribution from the publisher's own config, no host list, no substring luck.
+        ("placement id names the bidder",
+         by.get("adfox-nobid", {}).get("bidder") == "mediasniper"
+         and by.get("adfox-nobid", {}).get("match_by") == "placement-id"),
+        # An unfamiliar bid must not be given an invented price field.
+        ("a bid with no `price` key is kept as bid-returned, with the raw object",
+         by.get("adfox-bid", {}).get("outcome") == "bid-returned"
+         and any(f["field"] == "bidValue" and f["value"] == 42.5
+                 for f in (by.get("adfox-bid", {}).get("detail") or {}).get("numeric_fields", []))
+         and "bidValue" in ((by.get("adfox-bid", {}).get("detail") or {}).get("bids_raw") or "")),
+        ("a returned bid is never counted as a no-bid",
+         by.get("adfox-bid", {}).get("outcome") != "no-bid"),
     ]
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
