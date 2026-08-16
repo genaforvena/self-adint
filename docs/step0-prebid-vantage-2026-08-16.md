@@ -10,13 +10,29 @@ IP). **Read it with** `tools/adint-stage0-report`, never off a console tail.
 
 ## The corpus limitation, stated first because it conditions every number below
 
-This node's egress measures to **Montréal, Canada — 38.49.216.141, AS26832 Rica Web Services,
-`hosting: true`** (ip-api, 2026-08-16). Not the NL the node card claims, and not the geo being
-measured.
+**Correction, same night (05:35Z): the Montréal exit was a PROXY's, not this node's.** This
+shell exports `HTTP_PROXY=HTTPS_PROXY=ALL_PROXY=http://127.0.0.1:8118` — privoxy, forwarding to
+socks5 on 1080 — and both curl and Chromium honour it. So the vantage named below was measured
+through that proxy and every capture took the same path:
+
+| path | exit | where |
+|---|---|---|
+| proxied (the default here) | `38.49.216.141` | Montréal, CA, AS26832 Rica Web Services |
+| direct (the node's own route) | `77.246.104.228` | Amsterdam, NL, AS216071 Servers Tech Fzco |
+
+The node card said NL and the node is NL; I "corrected" it to Montréal off the proxied
+measurement and had to put it back. What follows was true of the path the sweeps took, and the
+qualitative conclusion survives — both exits are `hosting: true` datacenter ASNs outside the geo
+being measured — but the country, the ASN and every `ERR_TUNNEL_CONNECTION_FAILED` belong to
+privoxy, not to this node.
+
+This node's sweeps egressed at **Montréal, Canada — 38.49.216.141, AS26832 Rica Web Services,
+`hosting: true`** (ip-api, 2026-08-16), through the proxy above. Not the geo being measured.
 
 Both halves matter and they compound:
 
-- **Wrong geo.** Runet publishers sell runet audiences. Demand for a Canadian impression is
+- **Wrong geo.** Runet publishers sell runet audiences (and the direct path, Amsterdam, is no
+  closer to being runet than Montréal). Demand for a Canadian impression is
   thin to absent regardless of how well the page runs.
 - **Datacenter ASN.** `hosting: true` is what invalid-traffic filters exist to drop. An SSP that
   answers a residential IP will decline a hosting one, and it declines it *silently* — as a
