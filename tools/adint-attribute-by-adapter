@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Name an unattributed bidder host by an adapter that publishes the same endpoint — or refuse.
+
+The publisher's own wrapper names most bidders: `YaHeaderBiddingSettings.adUnits[].bids[]`
+carries a bidder name and, on the Adfox protocol, a `placementId` that the request repeats. When
+that map has the host, `adint-hb-capture` already attributes it and this tool has nothing to add.
+
+What is left over is the hard half: 154 candidate requests on this node's corpus whose host no
+placement id ever names — r.ussp.io, ad.vqserve.com, ssp.24smi.net and friends. They are real
+auction messages to somebody, and the wrapper never says who.
+
+The evidence source here is somebody ELSE's published source: a Prebid.js bid adapter states its
+own endpoint as a literal in the module that carries its `BIDDER_CODE`. If a module's text
+contains `ad.vqserve.com`, the company that wrote that module owns that endpoint, and it named
+itself in the same file. That is a citation, not an inference.
+
+Two rules keep it a citation:
+
+* **The host must be present LITERALLY in the fetched file.** GitHub's code search tokenises, so
+  a query for `ussp` matches `anzuSSP` — a different company entirely. Search only proposes
+  files; the verdict is `host in text`, checked against the bytes.
+* **A different subdomain is a WEAKER claim and is labelled as one.** `hb.bumlam.com` is not the
+  string `sapi.bumlam.com` that mediasniper's adapter publishes. Same registrable domain is good
+  evidence about the COMPANY and no evidence about that particular endpoint's purpose, so it
+  renders `domain` and never `exact`.
+
+Registrable domain here is the last two labels. That is correct for every TLD in this corpus
+(.com .io .ru .net .bid) and WRONG for multi-part public suffixes (.co.uk, .com.br); there is no
+PSL on this node, so a host under one of those must not be graded `domain` without one.
+
+Nothing here writes an attribution back into the log. It prints what can be cited and what
+cannot, and the corpus stays as it was measured.
+
+  adint-attribute-by-adapter                 # every unattributed candidate host in the log
+  adint-attribute-by-adapter ad.vqserve.com  # one host
+  adint-attribute-by-adapter --test
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
+SOURCE_REPO = "prebid/Prebid.js"
+RAW = "https://raw.githubusercontent.com/prebid/Prebid.js/master/"
+
+# This shell exports a proxy whose blocklist eats ad domains and whose exit is another country.
+# Every fetch here is about SOURCE CODE, so it goes by the node's own route, like the sweeps do.
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy")
+
+
+def clean_env():
+    return {k: v for k, v in os.environ.items() if k not in PROXY_VARS}
+
+
+def registrable(host):
+    parts = (host or "").lower().strip(".").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (host or "")
+
+
+def search_token(host):
+    """The most distinctive label of a host, for a search that only PROPOSES files."""
+    parts = [p for p in (host or "").lower().split(".") if p not in ("www", "com", "net",
+                                                                     "ru", "io", "bid", "org")]
+    return max(parts, key=len) if parts else host
+
+
+def grade(host, text):
+    """exact | domain | none — from the file's bytes, never from a search rank."""
+    t = text or ""
+    if host and host in t:
+        return "exact"
+    reg = registrable(host)
+    # A bare registrable domain is only evidence when it appears as part of a hostname, not as a
+    # word: `bumlam.com` inside `sapi.bumlam.com` counts, `bid` inside `bidder` does not.
+    if reg and re.search(r"[A-Za-z0-9.-]*\b" + re.escape(reg) + r"\b", t):
+        return "domain"
+    return "none"
+
+
+def bidder_code(text):
+    m = re.search(r"""BIDDER_CODE\s*[:=]\s*['"]([^'"]+)['"]""", text or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"""\bcode\s*[:=]\s*['"]([A-Za-z0-9_-]+)['"]""", text or "")
+    return m.group(1) if m else None
+
+
+def unattributed_hosts(log_path):
+    """Candidate hosts the publisher's own config never names. From the log, not from a list."""
+    counts = collections.Counter()
+    for line in open(log_path, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("kind") != "request" or not r.get("is_bid_candidate"):
+            continue
+        if r.get("bidder"):
+            continue
+        if r.get("host"):
+            counts[r["host"]] += 1
+    return counts
+
+
+def gh_search(token, timeout=90):
+    """Files that MENTION the token. Proposals only — the grade comes from the bytes."""
+    try:
+        r = subprocess.run(["gh", "search", "code", token, "--repo", SOURCE_REPO,
+                            "--limit", "20", "--json", "path"],
+                           capture_output=True, text=True, timeout=timeout, env=clean_env())
+        if r.returncode != 0:
+            return None
+        return sorted({row.get("path") for row in json.loads(r.stdout or "[]")
+                       if (row.get("path") or "").endswith((".js", ".ts"))})
+    except Exception:
+        return None
+
+
+def fetch(path, timeout=45):
+    try:
+        r = subprocess.run(["curl", "-s", "--max-time", str(timeout), RAW + path],
+                           capture_output=True, text=True, timeout=timeout + 10, env=clean_env())
+        return r.stdout if r.returncode == 0 and r.stdout else None
+    except Exception:
+        return None
+
+
+def attribute(host, search=gh_search, get=fetch):
+    """One host -> the best CITED verdict, with the file that carries it."""
+    paths = search(search_token(host))
+    if paths is None:
+        return {"host": host, "verdict": "unknown", "why": "the source repo could not be searched"}
+    best = {"host": host, "verdict": "none", "why": "no adapter publishes this host",
+            "checked": len(paths)}
+    for p in paths:
+        text = get(p)
+        if text is None:
+            continue
+        g = grade(host, text)
+        if g == "none":
+            continue
+        cand = {"host": host, "verdict": g, "company": bidder_code(text), "file": p,
+                "why": ("the adapter's own source contains this host"
+                        if g == "exact" else
+                        f"same registrable domain ({registrable(host)}), different subdomain — "
+                        "evidence about the company, not about this endpoint"),
+                "checked": len(paths)}
+        if g == "exact":
+            return cand
+        if best["verdict"] == "none":
+            best = cand
+    return best
+
+
+def selftest():
+    ok = True
+    # Real adapter text, trimmed. The fixtures go through the SAME grade()/bidder_code() the live
+    # path uses — a fixture that bypasses the parser tests nothing.
+    VIQEO = ("const BIDDER_CODE = 'viqeo';\n"
+             "const VIQEO_ENDPOINT = 'https://ad.vqserve.com/ads/prebid';\n")
+    MEDIASNIPER = ("const BIDDER_CODE = 'mediasniper';\n"
+                   "const ENDPOINT = 'https://sapi.bumlam.com/prebid/';\n")
+    ANZU = ("const BIDDER_CODE = 'anzuSSP';\n"
+            "const ENDPOINT = 'https://bid.anzu.io/rtb';\n")
+    KIMBER = ("const BIDDER_CODE = 'kimberlite';\n"
+              "export const ENDPOINT_URL = 'https://kimberlite.io/rtb/bid/pbjs';\n")
+
+    checks = [
+        ("a host the adapter states literally is exact",
+         grade("ad.vqserve.com", VIQEO) == "exact"),
+        ("and the company comes from the same file",
+         bidder_code(VIQEO) == "viqeo"),
+        # The trap that made this tool necessary: `ussp` matches `anzuSSP` in a search index.
+        ("a search hit whose file does not contain the host is NOT an attribution",
+         grade("r.ussp.io", ANZU) == "none"),
+        ("a different subdomain of the same registrable domain is `domain`, never `exact`",
+         grade("hb.bumlam.com", MEDIASNIPER) == "domain"),
+        ("an unrelated file grades none",
+         grade("ssp.24smi.net", KIMBER) == "none"),
+        # A registrable domain must match as a HOSTNAME, not as a word inside another word.
+        ("a domain that appears only inside a longer word is not a match",
+         grade("x.ohmy.bid", "const c = 'bidder'; const d = 'ohmybid';") == "none"),
+        ("registrable domain is the last two labels",
+         registrable("hb-bidder.skcrtxr.com") == "skcrtxr.com"
+         and registrable("kimberlite.io") == "kimberlite.io"),
+        ("the search token is the distinctive label, not the tld",
+         search_token("ad.vqserve.com") == "vqserve"
+         and search_token("hb.bumlam.com") == "bumlam"),
+    ]
+
+    # The whole path, with search and fetch stubbed: a proposal that fails verification must not
+    # become a verdict, and an exact hit must win over a domain hit no matter the search order.
+    FILES = {"modules/anzuSSPBidAdapter.ts": ANZU,
+             "modules/viqeoBidAdapter.js": VIQEO,
+             "modules/mediasniperBidAdapter.js": MEDIASNIPER}
+    res_v = attribute("ad.vqserve.com",
+                      search=lambda t: ["modules/anzuSSPBidAdapter.ts",
+                                        "modules/viqeoBidAdapter.js"],
+                      get=FILES.get)
+    res_u = attribute("r.ussp.io",
+                      search=lambda t: ["modules/anzuSSPBidAdapter.ts"], get=FILES.get)
+    res_b = attribute("hb.bumlam.com",
+                      search=lambda t: ["modules/mediasniperBidAdapter.js"], get=FILES.get)
+    res_n = attribute("ssp.24smi.net", search=lambda t: None, get=FILES.get)
+    # CONSTRUCTED, not a real adapter: a second file that states the exact host, offered AFTER
+    # the weaker sibling. Without it, "exact wins" is untested — the real fixtures happen to put
+    # the exact hit first, and a tool that simply returned the first non-`none` proposal passed.
+    FILES_ORDER = dict(FILES)
+    FILES_ORDER["modules/constructedExactBidAdapter.js"] = (
+        "const BIDDER_CODE = 'constructed';\n"
+        "const ENDPOINT = 'https://hb.bumlam.com/yhb';\n")
+    res_o = attribute("hb.bumlam.com",
+                      search=lambda t: ["modules/mediasniperBidAdapter.js",
+                                        "modules/constructedExactBidAdapter.js"],
+                      get=FILES_ORDER.get)
+    checks += [
+        ("end to end: the exact hit wins and cites its file",
+         res_v["verdict"] == "exact" and res_v["company"] == "viqeo"
+         and res_v["file"] == "modules/viqeoBidAdapter.js"),
+        ("end to end: a tokeniser's false friend stays unattributed",
+         res_u["verdict"] == "none" and "company" not in res_u),
+        ("end to end: a sibling subdomain is reported as the weaker claim",
+         res_b["verdict"] == "domain" and res_b["company"] == "mediasniper"
+         and "not about this endpoint" in res_b["why"]),
+        # A search that could not run is UNKNOWN. Rendering it as `none` would turn an outage
+        # into the finding "nobody publishes this host".
+        ("a search that could not run is unknown, never none",
+         res_n["verdict"] == "unknown"),
+        ("an exact hit wins even when a weaker one was proposed first",
+         res_o["verdict"] == "exact" and res_o["company"] == "constructed"),
+    ]
+
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("hosts", nargs="*")
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("--min-requests", type=int, default=1,
+                    help="skip hosts seen fewer times than this")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+
+    if args.hosts:
+        targets = [(h, None) for h in args.hosts]
+    else:
+        if not os.path.exists(args.log):
+            print(f"n/a: no log at {args.log}", file=sys.stderr)
+            return 2
+        counts = unattributed_hosts(args.log)
+        targets = [(h, n) for h, n in counts.most_common() if n >= args.min_requests]
+        if not targets:
+            print("n/a: no unattributed candidate hosts in the log", file=sys.stderr)
+            return 2
+
+    rows = []
+    for host, n in targets:
+        r = attribute(host)
+        r["requests"] = n
+        rows.append(r)
+        seen = f"{n:5}" if n is not None else "    -"
+        cite = r.get("file") or ""
+        print(f"{r['verdict']:8} {host:32} {seen}  {str(r.get('company') or '—'):16} {cite}")
+        sys.stdout.flush()
+
+    named = [r for r in rows if r["verdict"] in ("exact", "domain")]
+    print("")
+    print(f"-- {len(named)} of {len(rows)} host(s) carry a citation; "
+          f"{sum(1 for r in rows if r['verdict'] == 'none')} are published by nobody we can read; "
+          f"{sum(1 for r in rows if r['verdict'] == 'unknown')} could not be checked")
+    if any(r["verdict"] == "domain" for r in rows):
+        print("   a `domain` verdict names the COMPANY and says nothing about that endpoint — "
+              "it is not the same claim as `exact` and must not be merged with one")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
