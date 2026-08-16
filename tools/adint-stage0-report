@@ -141,7 +141,16 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         p(f"-- Adfox HB rosters ({len(rosters)} of {len(sites)} observable site(s)) --")
         per_bidder = collections.Counter()
         for url, hb in sorted(rosters.items()):
-            bidders = hb.get("bidders") or sorted({canon(b) for b in (hb.get("biddersMap") or [])})
+            # Recomputed here, never taken on trust. Rows written before the probe learned
+            # to canonicalise carry no `bidders` field, and falling back to `biddersMap`
+            # alone silently DROPS every bidder that appears only in the adUnits — a
+            # plausible-looking undercount, which is the worst kind. When the stored field
+            # exists it is checked against this union rather than preferred to it.
+            bidders = sorted({canon(b) for b in (hb.get("biddersMap") or [])}
+                             | {canon(b) for b in (hb.get("bidderSlots") or {})})
+            stored = hb.get("bidders")
+            if stored is not None and sorted(stored) != bidders:
+                hb["_roster_disagrees"] = {"stored": sorted(stored), "recomputed": bidders}
             for b in bidders:
                 per_bidder[b] += 1
             slots = hb.get("bidderSlots") or {}
@@ -150,6 +159,10 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
               f"bidders={bidders}")
             if slots:
                 p(f"      slots={dict(sorted(slots.items()))}")
+            if hb.get("_roster_disagrees"):
+                d = hb["_roster_disagrees"]
+                p(f"      ROSTER DISAGREES with the row's own `bidders` field: "
+                  f"stored={d['stored']} recomputed={d['recomputed']}")
         p("")
         p("   bidder reach (sites, canonical names):")
         for b, n in per_bidder.most_common():
@@ -189,12 +202,14 @@ def selftest():
         {"url": "https://a.ru/", "run_idx": 0, "verdict": "none", "http_status": 403},
         {"schema": 4, "url": "https://a.ru/", "run_idx": 1, "verdict": "blocked",
          "http_status": 403, "egress_ip": "1.2.3.4"},
+        # `ohmybid` is asked on a slot but is absent from biddersMap — exactly the shape
+        # that a biddersMap-only fallback drops without saying so.
         {"schema": 4, "url": "https://b.ru/", "run_idx": 1, "verdict": "none",
          "egress_ip": "1.2.3.4", "adfox": {"ya": True, "hb_settings": True},
          "adfox_hb": {"present": True, "timeout": 3000, "adUnits": 2,
                       "biddersMap": ["betweenDigital", "myTarget"],
                       "bidders": ["betweendigital", "mytarget"],
-                      "bidderSlots": {"betweendigital": 2, "mytarget": 1}}},
+                      "bidderSlots": {"betweendigital": 2, "mytarget": 1, "ohmybid": 2}}},
         {"schema": 4, "url": "https://b.ru/", "run_idx": 2, "verdict": "pbjs-idle",
          "egress_ip": "1.2.3.4"},
         {"schema": 4, "url": "https://c.ru/", "run_idx": 1, "verdict": "auction",
@@ -238,6 +253,11 @@ def selftest():
         # Two rows for b.ru is one publisher. Counting rows would say 2 of 4.
         ("roster counted per site, not per row", "1 of 2 observable site(s)" in text),
         ("flap reported", res["flapped"] == 1 and "none -> pbjs-idle" in text),
+        # A bidder that appears only in the slots must survive into the reach count.
+        ("slot-only bidder kept in the roster", "ohmybid              1" in text),
+        # And the row's own stored roster, being short by that bidder, must be reported as
+        # disagreeing rather than quietly preferred or quietly overwritten.
+        ("stored roster disagreement is surfaced", "ROSTER DISAGREES" in text),
         # A timed-out bidder must stay visible as a distinct outcome, never folded to no-bid.
         ("timeout kept apart in the auction line", "timedOut=['betweendigital']" in text),
         ("no auction reads as not-observed, never as absence",
