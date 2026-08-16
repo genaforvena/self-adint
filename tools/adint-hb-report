@@ -236,6 +236,34 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         p(f"   unattributed candidate requests: {sum(unattributed.values())} "
           f"({dict(unattributed)}) — recorded, never assigned to a bidder")
 
+    # The study's central count, and the one most likely to be quoted out of its schema. A bidder
+    # "returning a bid" means a bid OBJECT came back — priced, unpriced or zero — as opposed to
+    # the far commoner `no-bid` (an answer declining) and `no-answer` (silence). Running this by
+    # hand over the whole log pooled schema-1 rows and produced two extra bidders that do not
+    # exist: `hb.bumlam.com` answered `["INCORRECT_UNPUT"]`, a vendor's error token in the bids
+    # array, which schema>=3 classifies as an error and schema 1 counted as a returned bid; and a
+    # publisher's own `currency.json` contributed a `price` of 84.54, a USD exchange rate. Both
+    # are already fixed in the collector — and both come back the moment a reader ignores the
+    # schema line. This section reads `kept`, so it cannot.
+    bid_obj = collections.defaultdict(collections.Counter)
+    answered_any = set()
+    for r in cands:
+        who = r.get("bidder") or f"UNATTRIBUTED:{r.get('host')}"
+        o = r.get("outcome")
+        if o in ("no-bid", "priced", "bid-returned", "bid-zero"):
+            answered_any.add(who)
+        if o in ("priced", "bid-returned", "bid-zero"):
+            bid_obj[who][o] += 1
+    p("")
+    p("-- who ever returned a bid object (schema %s only) --" % schema)
+    p(f"   {len(answered_any)} bidder(s) answered at all; {len(bid_obj)} ever returned a bid")
+    for who, c in sorted(bid_obj.items(), key=lambda kv: -sum(kv[1].values())):
+        p(f"   {who:34} {dict(sorted(c.items()))}")
+    if len(bid_obj) <= 1:
+        p("   -> ONE curve, not a set of shapes. A study of bid-distribution SHAPE per DSP "
+          "cannot be run on this corpus, and no fit to these prices describes a market.")
+    res_bid_returners = sorted(bid_obj)
+
     # Latency against the wrapper's own deadline. Our observation window is seconds wide and
     # the wrapper's deadline is often under one second, so an answer we recorded may have
     # arrived far too late for the auction to use it. Counting such an answer as participation
@@ -279,7 +307,9 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         arm_out[(by_load.get(r["load_id"]) or {}).get("arm")][r.get("outcome")] += 1
     for a in sorted(arm_out):
         c = arm_out[a]
-        p(f"   {a:8} n={sum(c.values()):4}  {dict(sorted(c.items()))}")
+        # A load with no arm at all is a real shape (a single-arm sweep predating the column),
+        # and formatting None as a width-8 field raises — the report died on such a corpus.
+        p(f"   {str(a):8} n={sum(c.values()):4}  {dict(sorted(c.items()))}")
     if unverified:
         p("   -> the proxy/direct split above is UNPROVEN on "
           f"{len(unverified)} load(s): same browser vantage on both sides, so every "
@@ -383,7 +413,8 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         p(f"   sites whose candidate set/outcome changed between visits: {len(disagree)}")
         for u in sorted(disagree)[:10]:
             p(f"      {u}")
-    return {"loads": len(loads), "candidates": len(cands), "rendered": len(rendered),
+    return {"bid_returners": res_bid_returners, "answered_any": len(answered_any),
+            "loads": len(loads), "candidates": len(cands), "rendered": len(rendered),
             "with_wrapper": len(with_wrapper), "silent_wrapper": len(silent_wrapper),
             "bidders": {b: dict(out_by_bidder[b]) for b in out_by_bidder},
             "latency": {b: {"answered": e["answered"], "late": e["late"]}
@@ -583,6 +614,31 @@ def selftest():
                    res_b["welded"] == 0 and "not welded" in text_b))
     checks.append(("both arms are counted separately",
                    set(res_w["arm_outcomes"]) == {"proxy", "direct"}))
+
+    checks.append(("only a bidder that returned a bid object is a bid returner",
+                   res["bid_returners"] == ["buzzoola"]
+                   and "a study of bid-distribution SHAPE per DSP" not in text
+                   and "ONE curve, not a set of shapes" in text))
+    checks.append(("a bidder that answers and declines is not one",
+                   res["answered_any"] >= 3 and "mediasniper" not in res["bid_returners"]))
+
+    # The pooling that produced two bidders which do not exist: an older schema's `bid-returned`
+    # must not be counted beside the current schema's rows. `kept` is one schema by construction;
+    # this asserts the section actually reads it.
+    mixed = [
+        {"schema": 1, "kind": "load", "load_id": "OLD", "url": "https://o.ru/", "http_status": 200},
+        {"schema": 1, "kind": "request", "load_id": "OLD", "bidder": "ghostbidder",
+         "outcome": "bid-returned", "is_bid_candidate": True, "evidence_strength": "protocol"},
+        {"schema": 3, "kind": "load", "load_id": "NEW", "url": "https://n.ru/", "http_status": 200},
+        {"schema": 3, "kind": "request", "load_id": "NEW", "bidder": "realbidder",
+         "outcome": "priced", "is_bid_candidate": True, "evidence_strength": "protocol"},
+        {"schema": 3, "kind": "request", "load_id": "NEW", "bidder": "quietbidder",
+         "outcome": "no-bid", "is_bid_candidate": True, "evidence_strength": "protocol"},
+    ]
+    res_m, text_m = run_on(mixed)
+    checks.append(("an older schema's bid returner is not pooled with the current one",
+                   res_m["bid_returners"] == ["realbidder"]
+                   and "(schema 3 only)" in text_m))
 
     # An arm nobody measured must not be readable as a condition. The welded/balanced
     # fixtures above carry proxy/direct arms with no `vantage_verified` — exactly the shape
