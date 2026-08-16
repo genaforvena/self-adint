@@ -111,6 +111,32 @@ letting silence read as stable.
    6. Nothing in the output looked broken, which is the whole hazard. The union is recomputed
    every time and the stored field is *checked* against it, never preferred to it.
 
+## Addendum, same night: the auction DOES run here — and every bidder declines
+
+The collector (`tools/adint-hb-capture`) reads the wire instead of the JS API, and on
+lenta.ru it finds the auction the pbjs probe could not see:
+
+```
+POST hb.bumlam.com/yandex/            {"places":[{"id":"begun_block_…","placementId":"41139",
+POST ssp.al-adtech.com/api/adfox/bids   "sizes":[[970,250]],"codeType":"combo",…}]}  ->  {"bids":[]}
+```
+
+Three things follow, and they sharpen the headline above rather than contradict it:
+
+- **The market's protocol is not OpenRTB.** No `imp`, no `bidfloor`, no `seatbid`. A collector
+  built to the expected schema recorded 197 rows and zero candidates while two bidders were
+  answering the whole time.
+- **`{"bids":[]}` is a real no-bid** — a bidder that was asked, answered, and declined. It is
+  neither silence nor an absent auction, and the three must never be folded.
+- **Attribution is exact here.** `placementId → bidder` comes from the publisher's own wrapper
+  config and each endpoint is one bidder: 41139 → mediasniper, 69eb5feb… → astralab, both
+  confirmed live. No host list, no substring matching.
+
+So the vantage's effect is now visible in its actual shape: the wrapper fires, the bidders
+answer, and the answer is always no. Everything the design needs except the price column —
+who is asked, when, with what floor, who answers, how fast, who stays silent — is measurable
+from this node today. Only the prices need the right body.
+
 ## What this forces
 
 Guerre–Perrigne–Vuong estimates a bid distribution. From this vantage there are **no bids** —
