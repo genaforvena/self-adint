@@ -130,6 +130,41 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         p(f"   unattributed candidate requests: {sum(unattributed.values())} "
           f"({dict(unattributed)}) — recorded, never assigned to a bidder")
 
+    # Latency against the wrapper's own deadline. Our observation window is seconds wide and
+    # the wrapper's deadline is often under one second, so an answer we recorded may have
+    # arrived far too late for the auction to use it. Counting such an answer as participation
+    # would overstate a slow bidder's presence and understate the fast ones' advantage — and
+    # the row carries everything needed to tell them apart, so there is no excuse to fold.
+    p("")
+    p("-- answers against the wrapper's deadline --")
+    lat = collections.defaultdict(lambda: {"answered": 0, "late": 0, "ms": []})
+    no_deadline = 0
+    for r in cands:
+        if r.get("t_request_s") is None or r.get("t_response_s") is None:
+            continue
+        if r.get("outcome") not in ("priced", "bid-returned", "no-bid"):
+            continue
+        wt = r.get("wrapper_timeout_ms")
+        ms = (r["t_response_s"] - r["t_request_s"]) * 1000.0
+        e = lat[r.get("bidder") or "(unattributed)"]
+        e["answered"] += 1
+        e["ms"].append(ms)
+        if wt is None:
+            no_deadline += 1
+        elif ms > wt:
+            e["late"] += 1
+    if not lat:
+        p("   no timed answer in this corpus")
+    for b, e in sorted(lat.items(), key=lambda kv: -kv[1]["answered"]):
+        med = sorted(e["ms"])[len(e["ms"]) // 2]
+        p(f"   {b:22} answered={e['answered']:3} after-deadline={e['late']:3} "
+          f"median={med:.0f}ms")
+    if no_deadline:
+        p(f"   {no_deadline} answer(s) on loads with NO wrapper deadline read — lateness is "
+          f"undecidable there, and is left uncounted rather than assumed on time")
+    p("   an answer after the deadline is not a bid the auction could use; it is kept as an "
+      "answer and counted separately, never silently as participation")
+
     # Per site, with the load count beside it, because rows inside a load are not independent.
     p("")
     p("-- per site --")
@@ -200,6 +235,9 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     return {"loads": len(loads), "candidates": len(cands), "rendered": len(rendered),
             "with_wrapper": len(with_wrapper), "silent_wrapper": len(silent_wrapper),
             "bidders": {b: dict(out_by_bidder[b]) for b in out_by_bidder},
+            "latency": {b: {"answered": e["answered"], "late": e["late"]}
+                        for b, e in lat.items()},
+            "no_deadline": no_deadline,
             "sites_by_bidder": {b: len(v) for b, v in sites_by_bidder.items()},
             "repeated": len(repeated)}
 
@@ -215,9 +253,16 @@ def selftest():
         {"schema": 1, "kind": "load", "load_id": "L1", "url": "https://a.ru/", "arm": "A",
          "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
          "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        # Answers at 400ms against a 3000ms deadline: in time.
         {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "mediasniper",
-         "outcome": "no-bid", "is_bid_candidate": True,
+         "outcome": "no-bid", "is_bid_candidate": True, "wrapper_timeout_ms": 3000,
+         "t_request_s": 8.0, "t_response_s": 8.4,
          "req_adfox": {"placement_ids": ["41139"], "places": 3}},
+        # Answers at 4.5s against the same deadline: the auction was over. Still an answer.
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "buzzoola",
+         "outcome": "priced", "is_bid_candidate": True, "wrapper_timeout_ms": 3000,
+         "t_request_s": 8.0, "t_response_s": 12.5,
+         "req_adfox": {"placement_ids": ["777"], "places": 3}},
         {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "astralab",
          "outcome": "no-answer", "is_bid_candidate": True,
          "req_adfox": {"placement_ids": ["69eb"], "places": 3}},
@@ -225,8 +270,11 @@ def selftest():
         {"schema": 1, "kind": "load", "load_id": "L2", "url": "https://a.ru/", "arm": "B",
          "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
          "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        # Timed, but the wrapper's deadline was never read on this load: lateness is
+        # undecidable and must not default to "on time".
         {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "mediasniper",
-         "outcome": "no-bid", "is_bid_candidate": True,
+         "outcome": "no-bid", "is_bid_candidate": True, "wrapper_timeout_ms": None,
+         "t_request_s": 8.0, "t_response_s": 9.9,
          "req_adfox": {"placement_ids": ["41139"], "places": 3}},
         # A load that ran a wrapper and produced nothing: a coverage gap, not zero demand.
         {"schema": 1, "kind": "load", "load_id": "L3", "url": "https://b.ru/", "arm": "A",
@@ -274,6 +322,12 @@ def selftest():
          res["repeated"] == 1 and "changed between visits: 1" in text),
         ("placement stratum is reported",
          "41139" in text and "69eb" in text),
+        # An answer the auction could not have used must not read as participation.
+        ("a late answer is counted, and counted as late",
+         res["latency"].get("buzzoola") == {"answered": 1, "late": 1}
+         and res["latency"].get("mediasniper", {}).get("late") == 0),
+        ("lateness is undecidable without a deadline and is left uncounted",
+         res["no_deadline"] == 1),
     ]
 
     # A corpus where every site was seen once must say the stability claim is unavailable.
