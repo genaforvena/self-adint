@@ -73,6 +73,52 @@ PROBE_JS = r"""
     };
   } catch (e) { out.adfox = {err: String(e)}; }
 
+  // The wrapper's own roster. On a market that is mostly Adfox HB rather than prebid, the
+  // question "which bidders does this publisher ask" is answered HERE and nowhere else —
+  // and it is answered by config the page ships, so it survives a vantage whose geo and
+  // ASN suppress the auction itself. That is the whole reason it is read separately from
+  // the auction: a roster is not a bid, and this tool must never let the first stand in
+  // for the second.
+  try {
+    const s = window.YaHeaderBiddingSettings;
+    if (s && typeof s === 'object') {
+      const hb = {present: true, keys: Object.keys(s).slice(0, 40)};
+      try { hb.timeout = typeof s.timeout === 'number' ? s.timeout : null; } catch (e) {}
+      try {
+        hb.biddersMap = s.biddersMap && typeof s.biddersMap === 'object'
+          ? Object.keys(s.biddersMap).sort() : null;
+      } catch (e) {}
+      try {
+        const units = Array.isArray(s.adUnits) ? s.adUnits : [];
+        hb.adUnits = units.length;
+        const seen = {}, params = {};
+        for (const u of units) {
+          for (const b of (u && Array.isArray(u.bids) ? u.bids : [])) {
+            const name = b && b.bidder;
+            if (!name) continue;
+            seen[name] = (seen[name] || 0) + 1;
+            if (b.params && typeof b.params === 'object' && !params[name]) {
+              const p = {};
+              for (const k of Object.keys(b.params).slice(0, 12)) {
+                const v = b.params[k];
+                p[k] = (v === null || typeof v === 'object')
+                  ? typeof v : String(v).slice(0, 64);
+              }
+              params[name] = p;
+            }
+          }
+        }
+        // Per-bidder SLOT COUNTS, not a flat name list: how many units a bidder is asked on
+        // is the stratification axis downstream, and a set would throw it away.
+        hb.bidderSlots = seen;
+        hb.bidderParams = params;
+      } catch (e) { hb.adUnitsErr = String(e); }
+      out.adfox_hb = hb;
+    } else {
+      out.adfox_hb = {present: false};
+    }
+  } catch (e) { out.adfox_hb = {err: String(e)}; }
+
   try {
     out.cmp = {
       tcf: typeof window.__tcfapi === 'function',
@@ -204,7 +250,7 @@ def scan_frames(page):
     "unreadable" and "no prebid" are the same distinction this whole tool is built around.
     """
     out = {"frames_total": 0, "frames_read": 0, "frames_err": 0, "frames_skipped": 0,
-           "subframes": []}
+           "frames_hb": 0, "subframes": [], "subframe_hb": []}
     try:
         frames = page.frames
     except Exception as e:
@@ -225,6 +271,15 @@ def scan_frames(page):
             out["frames_err"] += 1
             continue
         out["frames_read"] += 1
+        # A wrapper roster inside an ad frame is the same finding as one at the top, but it
+        # is NOT a prebid global and must not be counted as one — kept in its own list so a
+        # verdict is never earned by a config object.
+        if (d.get("adfox_hb") or {}).get("present"):
+            out["frames_hb"] += 1
+            if len(out["subframe_hb"]) < 5:
+                hb = dict(d["adfox_hb"])
+                hb["frame_url"] = (fr.url or "")[:200]
+                out["subframe_hb"].append(hb)
         if not d.get("globals"):
             continue
         for rec in d.get("prebid") or []:
@@ -250,7 +305,9 @@ def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
         # schema 1 folded 4xx/5xx into `none` and had no auction/idle split; schema 2 read
         # the TOP FRAME ONLY, so its `none` rows are silent about subframes rather than
         # evidence of absence. Rows of an older schema must not be pooled with these.
-        "schema": 3,
+        # schema 4 adds the Adfox HB roster (`adfox_hb`); verdicts mean the same as in 3,
+        # but a schema-3 row is silent about the wrapper — absent field, not empty roster.
+        "schema": 4,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "url": url,
         "run_idx": run_idx,
@@ -468,11 +525,35 @@ def selftest(sync_playwright):
                        and (d3.get("prebid") or [{}])[0].get("version") == "9.0.0"))
 
         # Adfox/Yandex wrapper detection, since a runet corpus may be mostly this.
-        d4 = fresh("<html><body><script>window.Ya={adfoxCode:{}};"
-                   "window.YaHeaderBiddingSettings={biddersMap:{}};</script></body></html>")
+        d4 = fresh(
+            "<html><body><script>window.Ya={adfoxCode:{}};"
+            "window.YaHeaderBiddingSettings={timeout:500,"
+            "biddersMap:{betweendigital:'adfox_bid_1',myTarget:'adfox_bid_2'},"
+            "adUnits:["
+            "{code:'top',bids:[{bidder:'betweendigital',params:{placementId:'12345'}},"
+            "                  {bidder:'myTarget',params:{placementId:'999'}}]},"
+            "{code:'side',bids:[{bidder:'betweendigital',params:{placementId:'67890'}}]}"
+            "]};</script></body></html>")
         checks.append(("adfox wrapper detected", (d4.get("adfox") or {}).get("adfoxCode") is True
                        and (d4.get("adfox") or {}).get("hb_settings") is True))
         checks.append(("adfox page is not counted as prebid", d4.get("globals") == []))
+
+        # The roster is the reading this market actually yields: which bidders a publisher
+        # asks, from config the page ships, independent of whether our vantage sees a bid.
+        hb = d4.get("adfox_hb") or {}
+        checks.append(("wrapper roster read", hb.get("present") is True
+                       and hb.get("biddersMap") == ["betweendigital", "myTarget"]))
+        checks.append(("wrapper timeout read", hb.get("timeout") == 500))
+        # Counts, not a set: a bidder asked on two units and one asked on one are different
+        # facts, and the stratification downstream is bidder x adUnit.
+        checks.append(("per-bidder slot counts kept",
+                       hb.get("bidderSlots") == {"betweendigital": 2, "myTarget": 1}))
+        checks.append(("bidder params kept",
+                       (hb.get("bidderParams") or {}).get("myTarget") == {"placementId": "999"}))
+        checks.append(("no wrapper -> present false, not absent field",
+                       (d2.get("adfox_hb") or {}).get("present") is False))
+        # A roster is not an auction. The verdict ladder must be untouched by it.
+        checks.append(("roster does not manufacture a prebid global", d4.get("prebid") == []))
 
         ctx.close()
         browser.close()
