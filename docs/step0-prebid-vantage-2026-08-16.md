@@ -169,3 +169,66 @@ built and gated against a local fixture from here. Only the *answers* need the r
 vantage — his phone on LTE is the mesh's only candidate. Until then step 0 yields the roster and
 the wrapper's structure, which is real and is enough to design the collector against, and it does
 not yield a single bid.
+
+---
+
+## Correction, 2026-08-16 10:30Z: the "direct" arm was never direct, and the silence it measured was privoxy's
+
+The section above puts the proxy in the right place, but it left a claim standing that was not
+true: that a browser launched with `--no-proxy-server` takes the node's own route. It does not.
+Measured on this node the same afternoon, three launches of the same chromium:
+
+| launch | exit read from INSIDE the browser | `ads.betweendigital.com` |
+|---|---|---|
+| default (inherits the shell's proxy) | `38.49.216.141` | `ERR_TUNNEL_CONNECTION_FAILED` |
+| `--no-proxy-server` only | `38.49.216.141` | `ERR_TUNNEL_CONNECTION_FAILED` |
+| proxy vars stripped from the child's env | `77.246.104.228` | HTTP 400 (a bare GET, answered) |
+
+The inherited `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` beats the flag. So the `--treatment proxy`
+sweep — 117 loads labelled `proxy`, 117 labelled `direct` — ran both arms through privoxy. It is
+an **A/A null wearing a treatment's name**, and the difference it showed (29 priced rows on one
+side, 4 on the other) is the corpus disagreeing with itself, not an effect of vantage.
+
+The consequence for the bidder roster is larger than the arm. `ERR_TUNNEL_CONNECTION_FAILED` is
+an error only a proxy CONNECT can produce: it says privoxy refused the host, and privoxy ships an
+ad-domain blocklist. Every "this bidder is 100% error" line in this study's earlier notes was a
+statement about that blocklist.
+
+**What the four blocked bidders actually do, asked from the node's own route** (15 sites,
+`--via direct`, 15/15 loads with the exit verified from inside the browser as `77.246.104.228`):
+
+| bidder | through privoxy | direct, verified |
+|---|---|---|
+| betweendigital | 562 × `error` | 26 no-bid · 10 redirect (cookie-sync) · 7 no-answer · **0 error** |
+| MyTarget/VK | 131 × `error` | 13 no-bid · 5 no-answer · 1 unparsed · **0 error** |
+| videonow | 24 × `error` | 1 no-bid · 2 no-answer |
+| segmento | 36 × `error` | 2 no-answer · 1 error |
+
+Hand-verified against the raw bodies: betweendigital's `no-bid` is HTTP 200 with an empty `bids`
+array (a real decline), its `redirect` is a 302 cookie-sync hop (`/match?bidder_id=45632`) that
+is attribution-only and never an auction answer, and its `no-answer` is `ERR_ABORTED` past the
+wrapper's deadline with `net_fault: false` — honest silence, not our network. 31 distinct bidders
+answered at least one auction message in these 15 loads.
+
+**What did not change.** Still exactly one bidder returns a price: sparrow, 14 more non-zero
+prices here (47 total), all RUB. Everyone else declines. The study's aim — the SHAPE of a
+marginal bid distribution *per DSP* — remains out of reach from any vantage this node has: one
+curve is not a set of shapes.
+
+**What the new lane corrects in the price story.** The earlier note that sparrow "returns the same
+computed value for one placement hours apart, so the price is a function of the slot" does not
+survive three visits: placement `326146` (74.ru) returned `4.809109`, then `4.0`, then
+`4.396624`; `320892` (fontanka.ru) returned `0.573035`, `1.146862` ×3, `1.029160`. Repeats happen
+and are exact, but a placement's price MOVES. The round atoms are still there and still atoms —
+`2.5` at `319804` across four loads, `4.0` at `320828` (raw body `"cpm": 4`, repeated as
+`'cpm': 4` inside the returned `displayCode`) — but they appear at placements that compute a long
+decimal at other moments, so "the atom is that slot's fixed price" is refuted too. A fixed price
+and a floor-follower still cannot be separated here: the Adfox protocol carries no `floorData`.
+
+**How the tooling now prevents the repeat.** The arm is measured where it exists — from inside
+the browser, per load, before the site is opened (`browser_egress_ip` + `vantage_verified` on the
+load and on every request row, schema 5). A sweep whose two arms come back with the same exit
+refuses to start. The old gate that looked like coverage compared `egress_ip` against
+`browser_used_proxy` — two fields the same code writes from one argument — and every other leg
+runs against `127.0.0.1`, which chromium exempts from any proxy, so a localhost fixture cannot
+tell a bypassed proxy from an obeyed one. Commits `f0d53af`, `5915151`, `945836d`.
