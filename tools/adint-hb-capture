@@ -174,6 +174,31 @@ def _walk_prices(node, path="$", out=None, depth=0):
     return out
 
 
+def _bid_prices(bids):
+    """A price per bid OBJECT, with the field it came from.
+
+    Field preference is deliberate and narrow. Where a bid carries `price`, that is the price
+    and `cpm` beside it is ignored — in a prebid-shaped object `cpm` is the value AFTER
+    bidCpmAdjustment and FX, and the design forbids reading it. Where a bid has no `price` at
+    all, `cpm` is the bidder's own field: sparrow answers
+    `{"placementId":"320892","currency":"RUB","cpm":1.6466…,"displayCode":"<!-- Sparrow -->…"}`
+    and there is no other number in it. The field name travels with the value so the two can
+    never be confused downstream.
+    """
+    out = []
+    for i, b in enumerate(bids[:20]):
+        if not isinstance(b, dict):
+            continue
+        for field in ("price", "cpm", "bid"):
+            v = b.get(field)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out.append({"path": f"$[{i}].{field}", "field": field, "value": float(v),
+                            "currency": b.get("currency") or b.get("cur"),
+                            "placementId": b.get("placementId")})
+                break
+    return out
+
+
 def _walk_numbers(node, path="$", out=None, depth=0):
     """Every numeric leaf with its path — the raw material for identifying an unfamiliar
     bidder's price field from a real bid instead of guessing at it."""
@@ -221,11 +246,16 @@ def parse_response(body_text):
             # protocol, not a bid — as `bid-returned` it would read as demand we do not have.
             return "error", {"reason": "bids-not-objects", "has_bids_key": True,
                              "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
-        prices = _walk_prices(doc)
+        prices = _bid_prices(doc["bids"])
         if prices:
-            return "priced", {"prices": prices, "has_bids_key": True,
-                              "currency": doc.get("cur") or doc.get("currency"),
-                              "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
+            # A bid of ZERO is a returned bid with no value. It is not demand and it must not
+            # inflate a priced count, so it gets its own outcome rather than a footnote.
+            nonzero = [x for x in prices if x["value"] > 0]
+            return ("priced" if nonzero else "bid-zero"), {
+                "prices": prices, "has_bids_key": True,
+                "currency": doc.get("cur") or doc.get("currency")
+                or (prices[0].get("currency") if prices else None),
+                "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
         # A bid came back and nothing in it is called `price`. The field name is not something
         # to guess: the raw objects and every numeric field found are recorded so the price key
         # can be identified from a real bid rather than assumed from a schema we have not seen.
@@ -736,6 +766,19 @@ def selftest(sync_playwright):
             elif self.path.startswith("/adfox-nobid"):
                 # The measured shape: a real bidder, answering, declining.
                 self._send(200, b'{"bids":[]}')
+            elif self.path.startswith("/adfox-cpm"):
+                # sparrow's real shape, measured on fontanka.ru: no `price` key at all.
+                self._send(200, json.dumps({"bids": [
+                    {"placementId": "320892", "currency": "RUB", "cpm": 1.6466222636311705,
+                     "codeType": "html", "displayCode": "<!-- Sparrow -->"}]}).encode())
+            elif self.path.startswith("/adfox-both"):
+                # Both fields present: `price` is the bid, `cpm` is post-adjustment.
+                self._send(200, json.dumps({"bids": [
+                    {"placementId": "1", "currency": "RUB", "price": 1.23, "cpm": 9.99}]}).encode())
+            elif self.path.startswith("/adfox-zero"):
+                # A returned bid worth nothing. Not demand.
+                self._send(200, json.dumps({"bids": [
+                    {"placementId": "2", "currency": "RUB", "cpm": 0.0}]}).encode())
             elif self.path.startswith("/adfox-bid"):
                 # A bid came back and nothing in it is called `price`. The collector must not
                 # invent a price field; it records the raw bid and every number in it.
@@ -829,6 +872,9 @@ ask('/err?bidder=unknownvendor', 0.1);
 // The market's real protocol: places + placementId out, {{"bids":[…]}} back.
 askAdfox('/adfox-nobid', '41139');
 askAdfox('/adfox-bid', '69ebPID');
+askAdfox('/adfox-cpm', '320892');
+askAdfox('/adfox-both', '41139');
+askAdfox('/adfox-zero', '69ebPID');
 askAdfox('/currency', '41139');
 askAdfox('/badbids', '69ebPID');
 // A bidder's host, contacted for a cookie sync — named, but never asked to bid.
@@ -863,7 +909,7 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     for r in rows:
         for name in ("betweendigital", "mytarget", "buzzoola", "astralab", "unknownvendor",
                      "beacon", "binary", "refused", "adfox-nobid", "adfox-bid", "/sync",
-                     "currency", "badbids"):
+                     "currency", "badbids", "adfox-cpm", "adfox-both", "adfox-zero"):
             if name in r["url"]:
                 by[name] = r
 
@@ -872,7 +918,7 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     checks = [
         ("wrapper deadline read", load.get("wrapper_timeout_ms") == 1200),
         ("roster read from the page", "buzzoola" in (load.get("roster") or [])),
-        ("every asked bidder produced a row", len(by) == 13),
+        ("every asked bidder produced a row", len(by) == 16),
         ("priced answer classified", priced.get("outcome") == "priced"),
         # The whole reason the raw path travels with the number.
         ("price is the RAW price, not the adjusted decoy",
@@ -969,6 +1015,20 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
          and "bidValue" in ((by.get("adfox-bid", {}).get("detail") or {}).get("bids_raw") or "")),
         ("a returned bid is never counted as a no-bid",
          by.get("adfox-bid", {}).get("outcome") != "no-bid"),
+
+        # The market's real bid, measured on fontanka.ru: a `cpm` field and no `price` at all.
+        ("a bidder's own cpm field is read when there is no price field",
+         by.get("adfox-cpm", {}).get("outcome") == "priced"
+         and [(x["field"], round(x["value"], 4), x["currency"])
+              for x in (by.get("adfox-cpm", {}).get("detail") or {}).get("prices", [])]
+         == [("cpm", 1.6466, "RUB")]),
+        # ...and never when a price sits beside it: that cpm is post-adjustment.
+        ("price wins over cpm inside the same bid",
+         [(x["field"], x["value"]) for x in
+          (by.get("adfox-both", {}).get("detail") or {}).get("prices", [])] == [("price", 1.23)]),
+        # A zero bid is a returned bid worth nothing, and must not inflate a priced count.
+        ("a zero bid is its own outcome, not a price",
+         by.get("adfox-zero", {}).get("outcome") == "bid-zero"),
 
         # A key named `price` outside a bid container is not a price a bidder offered.
         ("a currency ticker is not a bid",
