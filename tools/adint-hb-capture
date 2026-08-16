@@ -319,16 +319,38 @@ def arms_need_note(arms, note):
     return len(arms) > 1 and not note
 
 
-def egress_ip(timeout=15):
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy")
+
+
+def _curl_ip(env, timeout=15):
     try:
         r = subprocess.run(["curl", "-s", "--max-time", str(timeout), "https://api.ipify.org"],
-                           capture_output=True, text=True, timeout=timeout + 5)
+                           capture_output=True, text=True, timeout=timeout + 5, env=env)
         return r.stdout.strip() or None
     except Exception:
         return None
 
 
-def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None):
+def egress_ips(timeout=15):
+    """BOTH paths, because this node has two and they land in different countries.
+
+    A shell here inherits HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=http://127.0.0.1:8118 (privoxy,
+    forwarding to socks5 127.0.0.1:1080). curl honours those variables and so does Chromium,
+    so the first sweeps of this study measured the PROXY's exit and recorded it as the node's:
+    38.49.216.141 (Montréal) is privoxy's far end, while the node's own default route leaves
+    at 77.246.104.228 (Amsterdam). Measuring one and labelling it "our vantage" is how a
+    corpus acquires a geo it never had.
+    """
+    proxied = _curl_ip(os.environ.copy(), timeout)
+    clean = {k: v for k, v in os.environ.items() if k not in PROXY_VARS}
+    direct = _curl_ip(clean, timeout)
+    return {"egress_ip_proxied": proxied, "egress_ip_direct": direct,
+            "proxy_env": os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY")}
+
+
+def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None,
+            use_proxy=True):
     """One page load. Returns (load_row, request_rows)."""
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
@@ -337,9 +359,20 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # `redirect` outcome. schema 3 fixed the price column itself: a schema-2 row
         # could carry a `price` read from any JSON key of that name — a currency
         # widget among them — so its prices are not this column and must not pool.
-        "schema": 3, "kind": "load", "load_id": load_id,
+        # schema 4 records WHICH egress the browser used. Schema<=3 rows carry an
+        # `egress_ip` that was measured through the inherited proxy whether or not
+        # the browser used it, so their vantage column is not this one.
+        "schema": 4, "kind": "load", "load_id": load_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
-        "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note, "egress_ip": ip,
+        "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note,
+        # `egress_ip` is the address the BROWSER left from, never whichever one was easiest to
+        # measure. The other path is recorded beside it so the row is unambiguous on its own.
+        "egress_ip": (ip.get("egress_ip_proxied") if use_proxy else ip.get("egress_ip_direct"))
+        if isinstance(ip, dict) else ip,
+        "browser_used_proxy": use_proxy,
+        "egress_ip_proxied": ip.get("egress_ip_proxied") if isinstance(ip, dict) else None,
+        "egress_ip_direct": ip.get("egress_ip_direct") if isinstance(ip, dict) else None,
+        "proxy_env": ip.get("proxy_env") if isinstance(ip, dict) else None,
         # Fresh context per load: the profile has no history, so cookie age can never become
         # an unrecorded covariate. It is stated rather than assumed.
         "profile_age_s": 0, "window_s": settle,
@@ -354,7 +387,10 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         return round(time.time() - t0, 3)
 
     try:
-        browser = pw.chromium.launch(headless=not headed)
+        # --no-proxy-server overrides the inherited env for this browser only; it
+        # changes nothing on the node and raises nothing.
+        browser = pw.chromium.launch(headless=not headed,
+                                     args=[] if use_proxy else ["--no-proxy-server"])
         ctx = browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow",
                                   viewport={"width": 1366, "height": 900})
         page = ctx.new_page()
@@ -369,7 +405,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 from urllib.parse import urlparse
                 host = (urlparse(req.url).hostname or "").lower()
                 row = {
-                    "schema": 3, "kind": "request", "load_id": load_id,
+                    "schema": 4, "kind": "request", "load_id": load_id,
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
@@ -548,7 +584,8 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # a `no-answer` here cannot be distinguished from a bidder the wrapper itself dropped.
         row["window_shorter_than_wrapper"] = bool(
             wt is not None and (load.get("window_s") or 0) * 1000 < wt)
-        for k in ("run_idx", "arm", "arm_note", "egress_ip", "hour_utc", "profile_age_s"):
+        for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
+                  "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
 
@@ -565,6 +602,10 @@ def main():
                                    "blocks: the hour is the dominant confounder)")
     ap.add_argument("--arm-note", help="what the arms actually differ in; REQUIRED with --arms, "
                                        "because a label is not a treatment")
+    ap.add_argument("--treatment", choices=["proxy"],
+                    help="make the arms a REAL treatment. `proxy` requires --arms proxy,direct "
+                         "and runs the browser through the inherited privoxy on one arm and on "
+                         "the node's own route on the other")
     ap.add_argument("--arm-offset", type=int, default=0,
                     help="shift the alternation; use 1 on the next pass so a site does not "
                          "always land in the same arm (see arm_plan)")
@@ -596,6 +637,15 @@ def main():
 
     arms = [a.strip() for a in (args.arms or args.arm).split(",") if a.strip()]
     plan = arm_plan(len(urls), arms, args.arm_offset)
+    if args.treatment == "proxy":
+        if sorted(arms) != ["direct", "proxy"]:
+            print("refusing: --treatment proxy needs --arms proxy,direct", file=sys.stderr)
+            return 2
+        # The note is GENERATED here rather than typed, so it cannot drift from what the code
+        # actually does — this node spent a whole sweep believing a hand-written vantage.
+        args.arm_note = ("treatment=proxy: arm `proxy` leaves through the inherited privoxy "
+                         "(127.0.0.1:8118 -> socks5 1080), arm `direct` through the node's own "
+                         "default route")
     if arms_need_note(arms, args.arm_note):
         # An arm label with no stated treatment is a column that LOOKS like an experiment.
         # Somebody reading `arm: A` / `arm: B` months later will believe two conditions were
@@ -606,12 +656,18 @@ def main():
               file=sys.stderr)
         return 2
 
-    ip = egress_ip()
+    ip = egress_ips()
+    if ip.get("proxy_env") and args.treatment != "proxy":
+        print(f"note: this shell exports a proxy ({ip['proxy_env']}); the browser inherits it. "
+              f"proxied exit {ip.get('egress_ip_proxied')} · direct exit "
+              f"{ip.get('egress_ip_direct')}", file=sys.stderr)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with sync_playwright() as pw:
         for i, u in enumerate(urls, 1):
+            arm = plan[i - 1]
+            use_proxy = (arm == "proxy") if args.treatment == "proxy" else True
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
-                                 plan[i - 1], arm_note=args.arm_note)
+                                 arm, arm_note=args.arm_note, use_proxy=use_proxy)
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
@@ -624,7 +680,8 @@ def main():
             for r in cand:
                 tally[r["outcome"]] = tally.get(r["outcome"], 0) + 1
             named = sum(1 for r in cand if r.get("bidder"))
-            print(f"[{i}/{len(urls)}] {u} load={load['load_id']} "
+            print(f"[{i}/{len(urls)}] {u} arm={load.get('arm')} "
+                  f"proxy={load.get('browser_used_proxy')} load={load['load_id']} "
                   f"status={load.get('http_status')} wrapper_timeout={load.get('wrapper_timeout_ms')} "
                   f"roster={len(load.get('roster') or [])} rows={len(rows)} "
                   f"candidates={len(cand)} named={named} "
@@ -787,7 +844,17 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
 
     try:
         with sync_playwright() as pw:
-            load, rows = capture(pw, f"{base}/page", 2, 20, "test-ip", 7, "B")
+            load, rows = capture(pw, f"{base}/page", 2, 20,
+                                 {"egress_ip_proxied": "proxy-ip",
+                                  "egress_ip_direct": "direct-ip",
+                                  "proxy_env": "http://127.0.0.1:8118"}, 7, "B")
+            # The same fixture on the node's own route: the browser must be launched with the
+            # inherited proxy disabled, and the row must say which exit it used.
+            load_d, rows_d = capture(pw, f"{base}/page", 2, 20,
+                                     {"egress_ip_proxied": "proxy-ip",
+                                      "egress_ip_direct": "direct-ip",
+                                      "proxy_env": "http://127.0.0.1:8118"}, 7, "direct",
+                                     use_proxy=False)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -843,9 +910,24 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
          and by.get("unknownvendor", {}).get("match_by") == "none"),
         ("contamination columns on every row",
          all(r.get("run_idx") == 7 and r.get("arm") == "B" and r.get("load_id") == load["load_id"]
-             and r.get("egress_ip") == "test-ip" and r.get("profile_age_s") == 0 for r in rows)),
+             and r.get("egress_ip") == "proxy-ip" and r.get("profile_age_s") == 0 for r in rows)),
         ("load row carries the vantage and the hour",
-         load.get("egress_ip") == "test-ip" and isinstance(load.get("hour_utc"), int)),
+         load.get("egress_ip") == "proxy-ip" and isinstance(load.get("hour_utc"), int)),
+        # The failure that mislabelled this study's whole vantage: the recorded exit must be
+        # the one the BROWSER used, not whichever was easiest to measure, and both are kept.
+        ("the recorded exit is the one the browser actually used",
+         load.get("browser_used_proxy") is True and load.get("egress_ip") == "proxy-ip"
+         and load_d.get("browser_used_proxy") is False
+         and load_d.get("egress_ip") == "direct-ip"),
+        ("both exits and the proxy env travel on the load row",
+         load.get("egress_ip_proxied") == "proxy-ip"
+         and load.get("egress_ip_direct") == "direct-ip"
+         and load.get("proxy_env") == "http://127.0.0.1:8118"),
+        ("the proxy arm is a column on every request row",
+         all(r.get("browser_used_proxy") is True for r in rows)
+         and all(r.get("browser_used_proxy") is False for r in rows_d)),
+        ("the un-proxied arm still reads the auction",
+         any(r.get("evidence_strength") == "protocol" for r in rows_d)),
         # Bidder traffic is identified by evidence that is listed, not by a boolean to trust.
         ("a real bid exchange is a candidate on both halves",
          priced.get("is_bid_candidate") is True
