@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Count the wire captures: who was asked, who answered, who stayed silent.
+
+Reads data/hb-auction.jsonl (written by adint-hb-capture) and counts it. Nothing here
+measures; the capture already did that. What this refuses to do is most of its content:
+
+  * It never pools schemas. A row written under an older schema meant something else.
+  * It never folds `no-answer` into `no-bid`. A bidder that was asked and said nothing is not
+    a bidder that declined; folding them makes selectivity a measurement of our own latency.
+  * It counts SITES, not rows. One publisher visited four times is one publisher, and a
+    bidder asked on eighteen slots of one page is one site's worth of evidence.
+  * It never reports a load that ran a wrapper but produced no candidate request as "no
+    demand". That is a coverage GAP — we did not observe the auction — and it is printed as
+    one, because those two readings point in opposite directions.
+  * It says what the arms actually were. `arm: A` / `arm: B` with an A/A note is a noise
+    floor, not an experiment, and the report says so rather than letting the column imply it.
+
+Rows inside one page load are NOT independent — the wrapper fires them together off one
+config — so every count that could mislead is reported alongside its load count.
+"""
+
+import argparse
+import collections
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
+
+# Outcomes that are statements about a BIDDER, in the order they are reported. `no-answer`
+# leads the silent half deliberately: it is the one most likely to be quietly absorbed.
+BIDDER_OUTCOMES = ("priced", "bid-returned", "no-bid", "no-answer", "error")
+
+
+def load(path, schema=None):
+    rows, bad = [], 0
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                bad += 1
+    for r in rows:
+        r.setdefault("schema", 1)
+    present = sorted({r["schema"] for r in rows})
+    if schema is None:
+        schema = present[-1] if present else 1
+    kept = [r for r in rows if r["schema"] == schema]
+    return kept, rows, schema, present, bad
+
+
+def report(kept, all_rows, schema, present, bad, out=sys.stdout):
+    p = lambda s="": print(s, file=out)
+    loads = [r for r in kept if r.get("kind") == "load"]
+    reqs = [r for r in kept if r.get("kind") == "request"]
+    cands = [r for r in reqs if r.get("is_bid_candidate")]
+    by_load = {l["load_id"]: l for l in loads}
+
+    p(f"== hb capture read-out — schema {schema} ==")
+    p(f"rows {len(all_rows)} · counted {len(kept)} · set aside "
+      f"{len(all_rows) - len(kept)} (other schemas {[s for s in present if s != schema]}) · "
+      f"unparseable {bad}")
+
+    # The vantage and the arms, before any count that could be read as an experiment.
+    ips = collections.Counter(l.get("egress_ip") for l in loads)
+    notes = {l.get("arm_note") for l in loads if l.get("arm_note")}
+    arms = collections.Counter(l.get("arm") for l in loads)
+    p("")
+    p("-- vantage and assignment --")
+    for ip, n in ips.most_common():
+        p(f"   egress {ip or 'unknown'}  loads={n}")
+    p(f"   arms: {dict(sorted(arms.items()))}")
+    if notes:
+        for n in sorted(notes):
+            p(f"   arm note: {n}")
+        if any("A/A" in n or "identical" in n.lower() for n in notes):
+            p("   -> these arms are a NOISE FLOOR, not an experiment. Any difference between "
+              "them is the corpus disagreeing with itself.")
+    elif len(arms) > 1:
+        p("   !! more than one arm and NO note on the load rows — the treatment is unstated, "
+          "so these labels cannot be read as conditions")
+
+    # Coverage first: what fraction of loads could say anything at all.
+    rendered = [l for l in loads if (l.get("http_status") or 0) < 400 and not l.get("error")]
+    with_wrapper = [l for l in rendered if l.get("wrapper_timeout_ms") is not None
+                    or (l.get("roster") or [])]
+    cand_loads = {r["load_id"] for r in cands}
+    silent_wrapper = [l for l in with_wrapper if l["load_id"] not in cand_loads]
+    p("")
+    p("-- coverage --")
+    p(f"   loads {len(loads)} · rendered {len(rendered)} · carrying a wrapper "
+      f"{len(with_wrapper)} · with at least one candidate request {len(cand_loads)}")
+    p(f"   loads that ran a wrapper and produced NO candidate request: {len(silent_wrapper)}")
+    p("   that is a coverage gap — the auction was not observed on those loads — and it is "
+      "NOT a reading of no demand.")
+    for l in silent_wrapper[:10]:
+        p(f"      {l['url']} (load {l['load_id']}, roster {len(l.get('roster') or [])}, "
+          f"wrapper_timeout {l.get('wrapper_timeout_ms')})")
+    if len(silent_wrapper) > 10:
+        p(f"      … and {len(silent_wrapper) - 10} more")
+
+    # Per bidder. Sites, not rows: the unit of evidence is a publisher.
+    p("")
+    p("-- per bidder (sites, then requests; outcomes never folded) --")
+    sites_by_bidder = collections.defaultdict(set)
+    out_by_bidder = collections.defaultdict(collections.Counter)
+    unattributed = collections.Counter()
+    for r in cands:
+        site = (by_load.get(r["load_id"]) or {}).get("url", "?")
+        b = r.get("bidder")
+        if not b:
+            unattributed[r.get("match_by") or "none"] += 1
+            continue
+        sites_by_bidder[b].add(site)
+        out_by_bidder[b][r.get("outcome")] += 1
+    if not sites_by_bidder:
+        p("   no attributed bidder request in this corpus")
+    for b in sorted(sites_by_bidder, key=lambda x: (-len(sites_by_bidder[x]), x)):
+        counts = out_by_bidder[b]
+        cells = " ".join(f"{o}={counts.get(o, 0)}" for o in BIDDER_OUTCOMES
+                         if counts.get(o))
+        other = {k: v for k, v in counts.items() if k not in BIDDER_OUTCOMES}
+        p(f"   {b:22} sites={len(sites_by_bidder[b]):3} requests={sum(counts.values()):3}  "
+          f"{cells}" + (f"  other={other}" if other else ""))
+    if unattributed:
+        p(f"   unattributed candidate requests: {sum(unattributed.values())} "
+          f"({dict(unattributed)}) — recorded, never assigned to a bidder")
+
+    # Per site, with the load count beside it, because rows inside a load are not independent.
+    p("")
+    p("-- per site --")
+    per_site = collections.defaultdict(lambda: {"loads": set(), "cands": 0,
+                                                "outcomes": collections.Counter(),
+                                                "bidders": set(), "timeout": None})
+    for l in loads:
+        s = per_site[l["url"]]
+        s["loads"].add(l["load_id"])
+        if l.get("wrapper_timeout_ms") is not None:
+            s["timeout"] = l["wrapper_timeout_ms"]
+    for r in cands:
+        s = per_site[(by_load.get(r["load_id"]) or {}).get("url", "?")]
+        s["cands"] += 1
+        s["outcomes"][r.get("outcome")] += 1
+        if r.get("bidder"):
+            s["bidders"].add(r["bidder"])
+    for url in sorted(per_site, key=lambda u: (-per_site[u]["cands"], u)):
+        s = per_site[url]
+        if not s["cands"]:
+            continue
+        p(f"   {url}")
+        p(f"      loads={len(s['loads'])} wrapper_timeout={s['timeout']} "
+          f"candidates={s['cands']} bidders={sorted(s['bidders'])}")
+        p(f"      outcomes={dict(sorted(s['outcomes'].items()))}")
+
+    # bidder x placement: the finest stratum the wire exposes on this market, since a
+    # placement is the adUnit the bidder was asked about.
+    p("")
+    p("-- strata: bidder x placement x site (top 20 by requests) --")
+    strata = collections.Counter()
+    for r in cands:
+        if not r.get("bidder"):
+            continue
+        site = (by_load.get(r["load_id"]) or {}).get("url", "?")
+        for pid in ((r.get("req_adfox") or {}).get("placement_ids") or ["?"]):
+            strata[(r["bidder"], pid, site)] += 1
+    for (b, pid, site), n in strata.most_common(20):
+        p(f"   {b:20} {pid:26} {site:32} n={n}")
+    if not strata:
+        p("   none")
+
+    # Repeats: the design's requirement that a verdict not rest on one visit.
+    p("")
+    p("-- repeats --")
+    visits = collections.Counter(l["url"] for l in loads)
+    repeated = {u: n for u, n in visits.items() if n > 1}
+    p(f"   sites visited more than once: {len(repeated)} of {len(visits)}")
+    if not repeated:
+        p("   NO site was visited twice — this corpus cannot support a stability claim, and "
+          "a single visit is a sample, not a site property")
+    else:
+        disagree = []
+        for u in repeated:
+            sigs = set()
+            for l in loads:
+                if l["url"] != u:
+                    continue
+                got = tuple(sorted(
+                    (r.get("bidder"), r.get("outcome")) for r in cands
+                    if r["load_id"] == l["load_id"]))
+                sigs.add(got)
+            if len(sigs) > 1:
+                disagree.append(u)
+        p(f"   sites whose candidate set/outcome changed between visits: {len(disagree)}")
+        for u in sorted(disagree)[:10]:
+            p(f"      {u}")
+    return {"loads": len(loads), "candidates": len(cands), "rendered": len(rendered),
+            "with_wrapper": len(with_wrapper), "silent_wrapper": len(silent_wrapper),
+            "bidders": {b: dict(out_by_bidder[b]) for b in out_by_bidder},
+            "sites_by_bidder": {b: len(v) for b, v in sites_by_bidder.items()},
+            "repeated": len(repeated)}
+
+
+def selftest():
+    import io
+    import tempfile
+    ok = True
+    rows = [
+        # An older schema whose `no-answer` did not exist: must not be pooled.
+        {"schema": 0, "kind": "request", "load_id": "old", "outcome": "no-bid",
+         "bidder": "mediasniper", "is_bid_candidate": True},
+        {"schema": 1, "kind": "load", "load_id": "L1", "url": "https://a.ru/", "arm": "A",
+         "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
+         "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "mediasniper",
+         "outcome": "no-bid", "is_bid_candidate": True,
+         "req_adfox": {"placement_ids": ["41139"], "places": 3}},
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "astralab",
+         "outcome": "no-answer", "is_bid_candidate": True,
+         "req_adfox": {"placement_ids": ["69eb"], "places": 3}},
+        # Same publisher, second visit: mediasniper answers again, astralab is absent.
+        {"schema": 1, "kind": "load", "load_id": "L2", "url": "https://a.ru/", "arm": "B",
+         "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
+         "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "mediasniper",
+         "outcome": "no-bid", "is_bid_candidate": True,
+         "req_adfox": {"placement_ids": ["41139"], "places": 3}},
+        # A load that ran a wrapper and produced nothing: a coverage gap, not zero demand.
+        {"schema": 1, "kind": "load", "load_id": "L3", "url": "https://b.ru/", "arm": "A",
+         "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
+         "http_status": 200, "wrapper_timeout_ms": 1000, "roster": ["mytarget"]},
+        # Analytics traffic: present in the log, never counted.
+        {"schema": 1, "kind": "request", "load_id": "L3", "bidder": None, "outcome": "no-bid",
+         "is_bid_candidate": False},
+        # A blocked load says nothing at all.
+        {"schema": 1, "kind": "load", "load_id": "L4", "url": "https://c.ru/", "arm": "B",
+         "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
+         "http_status": 403},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+        path = fh.name
+    buf = io.StringIO()
+    kept, allr, schema, present, bad = load(path)
+    res = report(kept, allr, schema, present, bad, out=buf)
+    text = buf.getvalue()
+    os.unlink(path)
+
+    checks = [
+        ("older schema set aside", res["loads"] == 4 and "set aside 1" in text),
+        # The fold the whole design turns on.
+        ("no-answer counted apart from no-bid",
+         res["bidders"].get("astralab") == {"no-answer": 1}
+         and res["bidders"].get("mediasniper") == {"no-bid": 2}),
+        # Two visits, one publisher.
+        ("bidder reach counted in sites, not requests",
+         res["sites_by_bidder"].get("mediasniper") == 1 and "requests=  2" in text),
+        ("a wrapper load with no candidate is a coverage gap",
+         res["silent_wrapper"] == 1 and "NOT a reading of no demand" in text
+         and "https://b.ru/" in text),
+        ("analytics traffic never reaches a bidder count",
+         "mytarget" not in res["bidders"]),
+        # A 403 page did not render, so it carries no wrapper and cannot be a coverage gap —
+        # counting it as one would invent an unobserved auction on a site we never saw.
+        ("a blocked load is neither rendered nor a gap",
+         res["rendered"] == 3 and res["with_wrapper"] == 3 and res["silent_wrapper"] == 1),
+        ("A/A arms are named as a noise floor, not an experiment",
+         "NOISE FLOOR, not an experiment" in text),
+        ("repeat visits are detected and the disagreement is named",
+         res["repeated"] == 1 and "changed between visits: 1" in text),
+        ("placement stratum is reported",
+         "41139" in text and "69eb" in text),
+    ]
+
+    # A corpus where every site was seen once must say the stability claim is unavailable.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write(json.dumps({"schema": 1, "kind": "load", "load_id": "S1",
+                             "url": "https://d.ru/", "http_status": 200}) + "\n")
+        path2 = fh.name
+    buf2 = io.StringIO()
+    k2, a2, s2, p2, b2 = load(path2)
+    report(k2, a2, s2, p2, b2, out=buf2)
+    os.unlink(path2)
+    checks.append(("single-visit corpus refuses a stability claim",
+                   "cannot support a stability claim" in buf2.getvalue()))
+
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("--schema", type=int)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not os.path.exists(args.log):
+        print(f"n/a: no log at {args.log}", file=sys.stderr)
+        return 2
+    kept, allr, schema, present, bad = load(args.log, args.schema)
+    if not kept:
+        print(f"n/a: no rows of schema {schema}", file=sys.stderr)
+        return 2
+    report(kept, allr, schema, present, bad)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
