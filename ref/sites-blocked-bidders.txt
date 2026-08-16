@@ -1,0 +1,28 @@
+# The sites that ask the four bidders privoxy blocks, so the question "do they answer at
+# all?" can be asked on the node's own route instead of through the tunnel.
+#
+# Derived from data/hb-auction.jsonl, not from memory: every site whose loads contain a
+# request to ads.betweendigital.com, ad.mail.ru, adx.videonow.ru or
+# adfox-hb-bidder.rutarget.ru. Through privoxy all 274 such requests failed
+# ERR_TUNNEL_CONNECTION_FAILED — an error only a proxy CONNECT produces, and a statement
+# about privoxy's blocklist rather than about any bidder. Unproxied curl from this node
+# reaches three of the four hosts (503, 302, 204) and chromium with the proxy stripped from
+# its env gets HTTP 400 from betweendigital, so the hosts are up; what is unknown is what
+# they say when a real page asks them.
+#
+# Run with:  adint-hb-capture --via direct --file ref/sites-blocked-bidders.txt
+https://74.ru/
+https://www.e1.ru/
+https://www.fontanka.ru/
+https://www.woman.ru/
+https://www.zr.ru/
+https://eva.ru/
+https://www.kp.ru/
+https://ura.news/
+https://www.sports.ru/
+https://www.ixbt.com/
+https://3dnews.ru/
+https://overclockers.ru/
+https://www.sport-express.ru/
+https://www.mk.ru/
+https://pikabu.ru/
