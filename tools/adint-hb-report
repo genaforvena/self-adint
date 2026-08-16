@@ -179,6 +179,41 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     p("   an answer after the deadline is not a bid the auction could use; it is kept as an "
       "answer and counted separately, never silently as participation")
 
+    # The arms, compared — and first, whether the comparison can mean anything at all.
+    p("")
+    p("-- arms compared --")
+    arm_out = collections.defaultdict(collections.Counter)
+    for r in cands:
+        arm_out[(by_load.get(r["load_id"]) or {}).get("arm")][r.get("outcome")] += 1
+    for a in sorted(arm_out):
+        c = arm_out[a]
+        p(f"   {a:8} n={sum(c.values()):4}  {dict(sorted(c.items()))}")
+
+    # A site that only ever ran arm X in pass N has arm and pass welded together: any
+    # difference between the arms is also a difference between two moments in time, and the
+    # hour is the dominant confounder on this market. Detected from the data rather than
+    # trusted from the design, because the design is what produced the weld.
+    pairs = collections.defaultdict(set)
+    for l in loads:
+        if l.get("arm") is not None and l.get("run_idx") is not None:
+            pairs[l["url"]].add((l["arm"], l["run_idx"]))
+    welded = []
+    for url, ps in pairs.items():
+        arms_here = {a for a, _ in ps}
+        runs_here = {r for _, r in ps}
+        if len(arms_here) > 1 and len(runs_here) > 1:
+            # arm is confounded with run when each arm appears in exactly one run
+            if all(len({r for a2, r in ps if a2 == a}) == 1 for a in arms_here) and \
+               len({r for _, r in ps}) == len(arms_here):
+                welded.append(url)
+    if welded:
+        p(f"   !! arm is CONFOUNDED WITH PASS on {len(welded)} of {len(pairs)} site(s): each arm "
+          f"ran in exactly one pass, so an arm difference is also a time difference")
+        p("   the counts above cannot separate the treatment from the pass; balance needs each "
+          "arm in BOTH passes (e.g. offsets 0,1,1,0 over four passes)")
+    else:
+        p("   each arm appears in more than one pass — arm and pass are not welded")
+
     # Per site, with the load count beside it, because rows inside a load are not independent.
     p("")
     p("-- per site --")
@@ -252,6 +287,7 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
             "latency": {b: {"answered": e["answered"], "late": e["late"]}
                         for b, e in lat.items()},
             "no_deadline": no_deadline, "attribution_only": len(attrib_only),
+            "arm_outcomes": {a: dict(c) for a, c in arm_out.items()}, "welded": len(welded),
             "unstated": len(unstated),
             "sites_by_bidder": {b: len(v) for b, v in sites_by_bidder.items()},
             "repeated": len(repeated)}
@@ -358,6 +394,44 @@ def selftest():
          res["unstated"] == 1 and "sape" not in res["bidders"]
          and "counted NOWHERE" in text),
     ]
+
+    # Arm/pass welding: the design that produced it, and the balanced design that does not.
+    welded_rows = []
+    for run, arm in ((0, "proxy"), (1, "direct")):
+        welded_rows.append({"schema": 1, "kind": "load", "load_id": f"W{run}",
+                            "url": "https://w.ru/", "arm": arm, "run_idx": run,
+                            "http_status": 200, "wrapper_timeout_ms": 1000})
+        welded_rows.append({"schema": 1, "kind": "request", "load_id": f"W{run}",
+                            "bidder": "sape", "outcome": "no-bid", "is_bid_candidate": True,
+                            "evidence_strength": "protocol"})
+    balanced_rows = []
+    for i, (run, arm) in enumerate(((0, "proxy"), (1, "direct"), (2, "direct"), (3, "proxy"))):
+        balanced_rows.append({"schema": 1, "kind": "load", "load_id": f"B{i}",
+                              "url": "https://b.ru/", "arm": arm, "run_idx": run,
+                              "http_status": 200, "wrapper_timeout_ms": 1000})
+        balanced_rows.append({"schema": 1, "kind": "request", "load_id": f"B{i}",
+                              "bidder": "sape", "outcome": "no-bid", "is_bid_candidate": True,
+                              "evidence_strength": "protocol"})
+
+    def run_on(rs):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for r in rs:
+                fh.write(json.dumps(r) + "\n")
+            pth = fh.name
+        b = io.StringIO()
+        kk, aa, ss, pp, bb = load(pth)
+        rr = report(kk, aa, ss, pp, bb, out=b)
+        os.unlink(pth)
+        return rr, b.getvalue()
+
+    res_w, text_w = run_on(welded_rows)
+    res_b, text_b = run_on(balanced_rows)
+    checks.append(("arm welded to pass is detected and refused",
+                   res_w["welded"] == 1 and "CONFOUNDED WITH PASS" in text_w))
+    checks.append(("a balanced design is not flagged",
+                   res_b["welded"] == 0 and "not welded" in text_b))
+    checks.append(("both arms are counted separately",
+                   set(res_w["arm_outcomes"]) == {"proxy", "direct"}))
 
     # A corpus where every site was seen once must say the stability claim is unavailable.
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
