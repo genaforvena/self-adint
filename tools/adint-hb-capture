@@ -138,6 +138,13 @@ def attribute(url, host, roster, table, placement_ids=None, placements=None):
     return None, "none"
 
 
+def _in_bid_container(path):
+    """Is this path inside a bid list? `$.seatbid[0].bid[0]` and `$.bids[0]` are; the rest of
+    a JSON document is not, whatever its keys are called."""
+    low = path.lower()
+    return ".seatbid" in low or ".bids" in low or ".bid[" in low or low.endswith(".bid")
+
+
 def _walk_prices(node, path="$", out=None, depth=0):
     """Find price-bearing nodes by structure, recording the PATH each came from.
 
@@ -152,7 +159,12 @@ def _walk_prices(node, path="$", out=None, depth=0):
         return out
     if isinstance(node, dict):
         for k, v in node.items():
-            if k == "price" and isinstance(v, (int, float)):
+            # A key named `price` is not a price a bidder offered. 3dnews.ru serves
+            # /currency.json, where `$.currency.USD.price = 84.54` is the dollar rate — it was
+            # classified as a bid, and under evidence grading it would have counted as protocol
+            # evidence and put 84.54 into the price column. The container is what makes a
+            # number a bid, so a price is only taken from inside a `seatbid`/`bid`/`bids` node.
+            if k == "price" and isinstance(v, (int, float)) and _in_bid_container(path):
                 out.append({"path": f"{path}.{k}", "field": k, "value": float(v)})
             else:
                 _walk_prices(v, f"{path}.{k}", out, depth + 1)
@@ -203,6 +215,12 @@ def parse_response(body_text):
     if isinstance(doc, dict) and isinstance(doc.get("bids"), list):
         if not doc["bids"]:
             return "no-bid", {"reason": "adfox-empty-bids", "has_bids_key": True}
+        if not all(isinstance(b, dict) for b in doc["bids"]):
+            # Measured: hb.bumlam.com answers {"bids":["INCORRECT_UNPUT"]} (their typo) when it
+            # rejects the request. A non-empty array of non-objects is the bidder refusing the
+            # protocol, not a bid — as `bid-returned` it would read as demand we do not have.
+            return "error", {"reason": "bids-not-objects", "has_bids_key": True,
+                             "bids_raw": json.dumps(doc["bids"][:3])[:2000]}
         prices = _walk_prices(doc)
         if prices:
             return "priced", {"prices": prices, "has_bids_key": True,
@@ -315,10 +333,11 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
     load = {
-        # schema 2 adds evidence_strength (protocol vs attribution-only) and the
-        # `redirect` outcome. A schema-1 row is SILENT about both — its "candidates"
-        # include cookie-sync hops, so the two must never be pooled.
-        "schema": 2, "kind": "load", "load_id": load_id,
+        # schema 2 added evidence_strength (protocol vs attribution-only) and the
+        # `redirect` outcome. schema 3 fixed the price column itself: a schema-2 row
+        # could carry a `price` read from any JSON key of that name — a currency
+        # widget among them — so its prices are not this column and must not pool.
+        "schema": 3, "kind": "load", "load_id": load_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note, "egress_ip": ip,
         # Fresh context per load: the profile has no history, so cookie age can never become
@@ -350,7 +369,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 from urllib.parse import urlparse
                 host = (urlparse(req.url).hostname or "").lower()
                 row = {
-                    "schema": 2, "kind": "request", "load_id": load_id,
+                    "schema": 3, "kind": "request", "load_id": load_id,
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
@@ -507,7 +526,9 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
             evidence.append("adfox-hb-request")
         if d.get("has_bids_key"):
             evidence.append("adfox-hb-response")
-        if d.get("has_seatbid") or row["outcome"] == "priced":
+        if d.get("has_seatbid"):
+            # Never `or outcome == "priced"`: that made the evidence a restatement of the
+            # verdict it exists to justify, and the currency ticker above rode in on it.
             evidence.append("openrtb-response")
         if row.get("bidder"):
             evidence.append("attributed:" + str(row.get("match_by")))
@@ -664,6 +685,13 @@ def selftest(sync_playwright):
                 self._send(200, json.dumps({"bids": [
                     {"placementId": "69ebPID", "width": 300, "height": 600,
                      "bidValue": 42.5, "html": "<div/>"}]}).encode())
+            elif self.path.startswith("/currency"):
+                # A widget, not an auction: `price` is a dollar rate. Answered to an
+                # auction-shaped request so the leg cannot pass on the request shape alone.
+                self._send(200, json.dumps({"currency": {"USD": {"price": 84.54}}}).encode())
+            elif self.path.startswith("/badbids"):
+                # The bidder rejecting the protocol, in its own words (their typo).
+                self._send(200, b'{"bids":["INCORRECT_UNPUT"]}')
             elif self.path.startswith("/sync"):
                 # A cookie-sync hop carrying a bidder's name: contacted, never asked to bid.
                 self.send_response(302)
@@ -744,6 +772,8 @@ ask('/err?bidder=unknownvendor', 0.1);
 // The market's real protocol: places + placementId out, {{"bids":[…]}} back.
 askAdfox('/adfox-nobid', '41139');
 askAdfox('/adfox-bid', '69ebPID');
+askAdfox('/currency', '41139');
+askAdfox('/badbids', '69ebPID');
 // A bidder's host, contacted for a cookie sync — named, but never asked to bid.
 fetch('{base}/sync?bidder=adriver', {{method: 'POST', body: '{{"u":"1"}}'}}).catch(function(e) {{}});
 // Not an auction message at all: no imp in the request, no seatbid in the answer.
@@ -765,7 +795,8 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     by = {}
     for r in rows:
         for name in ("betweendigital", "mytarget", "buzzoola", "astralab", "unknownvendor",
-                     "beacon", "binary", "refused", "adfox-nobid", "adfox-bid", "/sync"):
+                     "beacon", "binary", "refused", "adfox-nobid", "adfox-bid", "/sync",
+                     "currency", "badbids"):
             if name in r["url"]:
                 by[name] = r
 
@@ -774,7 +805,7 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     checks = [
         ("wrapper deadline read", load.get("wrapper_timeout_ms") == 1200),
         ("roster read from the page", "buzzoola" in (load.get("roster") or [])),
-        ("every asked bidder produced a row", len(by) == 11),
+        ("every asked bidder produced a row", len(by) == 13),
         ("priced answer classified", priced.get("outcome") == "priced"),
         # The whole reason the raw path travels with the number.
         ("price is the RAW price, not the adjusted decoy",
@@ -856,6 +887,18 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
          and "bidValue" in ((by.get("adfox-bid", {}).get("detail") or {}).get("bids_raw") or "")),
         ("a returned bid is never counted as a no-bid",
          by.get("adfox-bid", {}).get("outcome") != "no-bid"),
+
+        # A key named `price` outside a bid container is not a price a bidder offered.
+        ("a currency ticker is not a bid",
+         by.get("currency", {}).get("outcome") != "priced"
+         and not (by.get("currency", {}).get("detail") or {}).get("prices")),
+        ("and it never earns openrtb-response evidence",
+         "openrtb-response" not in (by.get("currency", {}).get("bid_evidence") or [])),
+        # A non-empty bids array of non-objects is the bidder refusing the protocol.
+        ("a bids array of non-objects is an error, not a returned bid",
+         by.get("badbids", {}).get("outcome") == "error"
+         and (by.get("badbids", {}).get("detail") or {}).get("reason") == "bids-not-objects"
+         and "INCORRECT_UNPUT" in ((by.get("badbids", {}).get("detail") or {}).get("bids_raw") or "")),
 
         # A bidder's host being contacted is not that bidder being asked to bid.
         ("a cookie-sync hop is redirect + attribution-only, not an asked bidder",
