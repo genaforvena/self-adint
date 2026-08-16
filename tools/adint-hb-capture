@@ -691,6 +691,10 @@ def main():
                     help="make the arms a REAL treatment. `proxy` requires --arms proxy,direct "
                          "and runs the browser through the inherited privoxy on one arm and on "
                          "the node's own route on the other")
+    ap.add_argument("--via", choices=["inherited-proxy", "direct"], default="inherited-proxy",
+                    help="which route the browser takes when there is no --treatment. Naming "
+                         "an arm `direct` does NOT make the run direct — the arm is a label "
+                         "and this is the switch")
     ap.add_argument("--arm-offset", type=int, default=0,
                     help="shift the alternation; use 1 on the next pass so a site does not "
                          "always land in the same arm (see arm_plan)")
@@ -742,7 +746,7 @@ def main():
         return 2
 
     ip = egress_ips()
-    if ip.get("proxy_env") and args.treatment != "proxy":
+    if ip.get("proxy_env") and args.treatment != "proxy" and args.via != "direct":
         print(f"note: this shell exports a proxy ({ip['proxy_env']}); the browser inherits it. "
               f"proxied exit {ip.get('egress_ip_proxied')} · direct exit "
               f"{ip.get('egress_ip_direct')}", file=sys.stderr)
@@ -781,9 +785,29 @@ def main():
                 ip["egress_ip_direct"] = seen_exits["direct"]
             if seen_exits["proxy"] != ip.get("egress_ip_proxied"):
                 ip["egress_ip_proxied"] = seen_exits["proxy"]
+        elif args.via == "direct":
+            # Same preflight for a single-arm sweep: a run asked to leave by the node's own
+            # route proves it once before spending an hour, rather than labelling every row.
+            env = {k: v for k, v in os.environ.items() if k not in PROXY_VARS}
+            b = pw.chromium.launch(headless=True, args=["--no-proxy-server"], env=env)
+            try:
+                seen = browser_egress(b.new_context())
+            finally:
+                b.close()
+            print(f"preflight vantage: via=direct exit={seen}", file=sys.stderr)
+            if seen is None:
+                print("refusing: the echo could not be read, so --via direct is unproven",
+                      file=sys.stderr)
+                return 2
+            if seen == ip.get("egress_ip_proxied"):
+                print(f"refusing: --via direct still leaves from {seen} (the proxy's exit)",
+                      file=sys.stderr)
+                return 1
+            ip["egress_ip_direct"] = seen
         for i, u in enumerate(urls, 1):
             arm = plan[i - 1]
-            use_proxy = (arm == "proxy") if args.treatment == "proxy" else True
+            use_proxy = ((arm == "proxy") if args.treatment == "proxy"
+                         else args.via != "direct")
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
                                  arm, arm_note=args.arm_note, use_proxy=use_proxy)
             with open(args.out, "a") as fh:
