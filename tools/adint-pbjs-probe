@@ -112,6 +112,14 @@ PROBE_JS = r"""
         // is the stratification axis downstream, and a set would throw it away.
         hb.bidderSlots = seen;
         hb.bidderParams = params;
+        // Live pages render the SAME bidder two ways: `biddersMap` carries the vendor's
+        // camelCase name (betweenDigital, myTarget) while a bid's `bidder` field is
+        // lowercase. Joining on the raw string splits one bidder into two, so a canonical
+        // union is published beside the raw forms rather than instead of them.
+        const canon = {};
+        for (const n of (hb.biddersMap || [])) canon[String(n).toLowerCase()] = 1;
+        for (const n of Object.keys(seen)) canon[String(n).toLowerCase()] = 1;
+        hb.bidders = Object.keys(canon).sort();
       } catch (e) { hb.adUnitsErr = String(e); }
       out.adfox_hb = hb;
     } else {
@@ -528,7 +536,7 @@ def selftest(sync_playwright):
         d4 = fresh(
             "<html><body><script>window.Ya={adfoxCode:{}};"
             "window.YaHeaderBiddingSettings={timeout:500,"
-            "biddersMap:{betweendigital:'adfox_bid_1',myTarget:'adfox_bid_2'},"
+            "biddersMap:{betweenDigital:'adfox_bid_1',myTarget:'adfox_bid_2'},"
             "adUnits:["
             "{code:'top',bids:[{bidder:'betweendigital',params:{placementId:'12345'}},"
             "                  {bidder:'myTarget',params:{placementId:'999'}}]},"
@@ -542,7 +550,11 @@ def selftest(sync_playwright):
         # asks, from config the page ships, independent of whether our vantage sees a bid.
         hb = d4.get("adfox_hb") or {}
         checks.append(("wrapper roster read", hb.get("present") is True
-                       and hb.get("biddersMap") == ["betweendigital", "myTarget"]))
+                       and hb.get("biddersMap") == ["betweenDigital", "myTarget"]))
+        # The fixture spells the bidders as live pages do: camelCase in biddersMap,
+        # lowercase in the bids. A join on the raw string would report four bidders here.
+        checks.append(("casing does not split one bidder into two",
+                       hb.get("bidders") == ["betweendigital", "mytarget"]))
         checks.append(("wrapper timeout read", hb.get("timeout") == 500))
         # Counts, not a set: a bidder asked on two units and one asked on one are different
         # facts, and the stratification downstream is bidder x adUnit.
