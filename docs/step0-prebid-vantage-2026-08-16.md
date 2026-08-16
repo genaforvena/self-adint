@@ -232,3 +232,67 @@ refuses to start. The old gate that looked like coverage compared `egress_ip` ag
 `browser_used_proxy` — two fields the same code writes from one argument — and every other leg
 runs against `127.0.0.1`, which chromium exempts from any proxy, so a localhost fixture cannot
 tell a bypassed proxy from an obeyed one. Commits `f0d53af`, `5915151`, `945836d`.
+
+---
+
+## 2026-08-16 11:00Z — the price distribution on the proven route, and the hosts the wrapper never names
+
+**39 loads, every one with its exit verified from inside the browser as `77.246.104.228`**
+(6 passes over the four sparrow sites plus the 15-site sweep above). 79 non-zero sparrow prices
+now, still all RUB, still sparrow alone.
+
+### The round values are a set, not an atom, and the split is per placement
+
+| kind | n | values |
+|---|---|---|
+| round (≤2 decimals) | 12 | 2.5 ×5 · 3.0 ×3 · 4.0 ×3 · 7.5 ×1 — **every one a multiple of 0.5** |
+| computed (15–18 decimals) | 67 | **none** lands on a 0.5 grid |
+
+Hand-verified against the raw bodies, each with the price echoed a second time inside the
+returned `displayCode`: `"cpm": 4` at `320828`, `"cpm": 3` at `320828`, `"cpm": 7.5` at
+`326146`.
+
+Three readings die here, and it is worth naming them because each was mine:
+
+* **"RUB 2.5 is THE atom."** There are four round values, not one.
+* **"The atom is that slot's fixed price."** `326146` returned 2.5, 4.0, 4.396624, 4.809109 and
+  7.5 across five visits; `319804` returned 2.5 three times and then 6.363761.
+* **"A round value is a page-wide fallback."** Atoms and computed values arrive in the SAME
+  response set — 74.ru at 07:22:44Z answered 3 round and 5 computed prices in one load, e1.ru at
+  10:44:06Z answered 1 and 6. The split is per placement, per moment.
+
+What survives: 4 of the 19 repeatedly-observed placements ever emit a round value, and neither
+the site nor the price level predicts which. `319806` (woman.ru) and `326116` (74.ru) sit in the
+same 1–7 RUB band as every atom-bearing slot and have never emitted one; `320828` has emitted
+nothing else in three visits. **A fixed price and a floor-follower still cannot be separated**:
+the Adfox protocol carries no `floorData`, so the floor these numbers might be tracking is not
+on the wire at all.
+
+### The hosts the publisher's config never names
+
+`tools/adint-attribute-by-adapter` (new) searches Prebid.js for each unattributed candidate host,
+then **fetches the proposed file and requires the host literally in its bytes** before naming
+anybody. 17 hosts, ≥5 requests each:
+
+| verdict | host | requests | adapter code | file |
+|---|---|---|---|---|
+| exact | px.adhigh.net | 422 | getintent | modules/getintentBidAdapter.js |
+| exact | kimberlite.io | 365 | kimberlite | modules/kimberliteBidAdapter.js |
+| exact | ad.vqserve.com | 57 | viqeo | modules/viqeoBidAdapter.js |
+| exact | pb.adriver.ru | 14 | adriver | modules/adriverBidAdapter.js |
+| exact | ads.betweendigital.com | 14 | between | modules/betweenBidAdapter.js |
+| exact | ssp.hybrid.ai | 14 | vox | modules/voxBidAdapter.js |
+| exact | ssp-rtb.sape.ru | 14 | rtbsape | modules/rtbsapeBidAdapter.js |
+| domain | hb.bumlam.com | 419 | mediasniper | modules/mediasniperBidAdapter.js |
+| domain | yhb.p.otm-r.com | 288 | otm | modules/otmBidAdapter.js |
+| none | hb-bidder.skcrtxr.com · ssp.al-adtech.com · sp.ohmy.bid · r.ussp.io · adfox-hb-bidder.rutarget.ru · pbs.alfasense.com · ssp.bidvol.com · widget.sparrow.ru | 29–420 | — | — |
+
+Two cautions the table cannot carry on its own. **`domain` is a weaker claim than `exact`**:
+`hb.bumlam.com` is not the `sapi.bumlam.com` mediasniper's adapter publishes, so it is evidence
+about the company and none about that endpoint. And **an adapter's `BIDDER_CODE` is a code name,
+not a brand** — `ssp.hybrid.ai` cites `vox`, which is Prebid's name for that adapter, while this
+study's roster calls the same participant `hybrid`.
+
+Eight hosts stay unattributed, and they stay that way. `r.ussp.io` is the reason the tool
+verifies bytes: GitHub's code search answers a query for `ussp` with `anzuSSP` — a different
+company that a ranking-trusting tool would have written down as the owner.
