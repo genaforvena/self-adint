@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""The shape of one bidder's prices: how many, how precise, and whether any value is an ATOM.
+
+The study classifies DSPs by the SHAPE of their marginal bid distribution, and the first
+question a shape asks is whether the support is continuous or has mass sitting on particular
+values. This reads that off the captured bids and refuses to say more than the count allows.
+
+What it will not do:
+
+  * Pool currencies. RUB 2.5 and USD 2.5 are not the same value, and a distribution over two
+    units is a distribution over nothing.
+  * Call a repeat an atom when the sample cannot support it. With n prices and d distinct
+    values, a single duplicate at n=3 is unremarkable; the report states n beside every claim
+    and withholds the word `atom` below --min-n (default 8) and below --min-repeats (3).
+  * Ignore PRECISION, which is the strongest evidence here and costs nothing. A price computed
+    by an optimiser arrives as 4.809109470545412; a price set by a rule arrives as 2.5. When
+    one bidder emits both, the round value repeating is not a coincidence of rounding — the
+    bidder is not rounding anything else. So decimals are counted per value and reported.
+  * Mix in zero bids. A returned bid of 0 is not a point in the price distribution; it is a
+    refusal wearing a bid's clothes, and it gets its own line.
+"""
+
+import argparse
+import collections
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
+
+
+def decimals(v):
+    """Significant decimals in the value as printed. `2.5` has 1, `4.809109470545412` has 15 —
+    the difference between a rule and a computation."""
+    s = repr(float(v))
+    if "e" in s or "E" in s:
+        return None
+    return len(s.split(".")[1].rstrip("0")) if "." in s else 0
+
+
+def collect(rows, schema=None):
+    if schema is None:
+        schema = max((r.get("schema", 1) for r in rows), default=1)
+    prices = []
+    zeros = 0
+    for r in rows:
+        if r.get("schema", 1) != schema or r.get("kind") != "request":
+            continue
+        if r.get("outcome") not in ("priced", "bid-zero"):
+            continue
+        d = r.get("detail") or {}
+        for x in d.get("prices") or []:
+            v = float(x["value"])
+            rec = {"bidder": r.get("bidder_canon") or r.get("bidder"), "value": v,
+                   "currency": x.get("currency") or d.get("currency"),
+                   "field": x.get("field"), "path": x.get("path"),
+                   "placement": x.get("placementId"), "arm": r.get("arm"),
+                   "load_id": r.get("load_id"), "decimals": decimals(v)}
+            if v == 0:
+                zeros += 1
+            else:
+                prices.append(rec)
+    return prices, zeros, schema
+
+
+def report(prices, zeros, schema, min_n=8, min_repeats=3, out=sys.stdout):
+    p = lambda s="": print(s, file=out)
+    p(f"== price shape — schema {schema} ==")
+    p(f"non-zero prices {len(prices)} · zero bids {zeros} (kept out of the distribution: a bid "
+      f"of 0 is a refusal wearing a bid's clothes)")
+    result = {"atoms": {}, "groups": {}}
+    groups = collections.defaultdict(list)
+    for r in prices:
+        groups[(r["bidder"], r["currency"])].append(r)
+    if not groups:
+        p("   no non-zero price in this corpus")
+        return result
+    for (bidder, cur), rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        vals = [r["value"] for r in rs]
+        n = len(vals)
+        counts = collections.Counter(vals)
+        distinct = len(counts)
+        p("")
+        p(f"-- {bidder} / {cur or 'currency unstated'} --")
+        p(f"   n={n} distinct={distinct} min={min(vals):.6g} max={max(vals):.6g}")
+        # Precision is reported before any claim, because it is what makes a repeat legible.
+        dec = collections.Counter(r["decimals"] for r in rs)
+        p(f"   decimals: {dict(sorted(dec.items()))} "
+          f"(a rule-set price is short; an optimised one is long)")
+        for v, c in counts.most_common():
+            mark = ""
+            if c >= min_repeats and n >= min_n:
+                mark = "  <- ATOM"
+                result["atoms"].setdefault(f"{bidder}/{cur}", []).append({"value": v, "count": c})
+            elif c > 1:
+                mark = f"  <- repeats {c}x, but n={n} is under the {min_n} this report needs " \
+                       f"before calling anything an atom"
+            p(f"      {v:<20.10g} x{c}  decimals={decimals(v)}{mark}")
+        result["groups"][f"{bidder}/{cur}"] = {"n": n, "distinct": distinct}
+        if n < min_n:
+            p(f"   n={n} is below --min-n {min_n}: this is a list of observations, not a "
+              f"distribution, and no shape claim is made from it")
+    return result
+
+
+def selftest():
+    ok = True
+    import io
+
+    def rows_for(vals, currency="RUB", bidder="sparrow", schema=4):
+        rs = []
+        for i, v in enumerate(vals):
+            rs.append({"schema": schema, "kind": "request", "bidder": bidder, "load_id": f"L{i}",
+                       "outcome": "bid-zero" if v == 0 else "priced", "arm": "direct",
+                       "detail": {"prices": [{"value": v, "field": "cpm", "currency": currency,
+                                              "path": "$[0].cpm"}]}})
+        return rs
+
+    # A real-shaped sample: computed values plus a round one repeating.
+    vals = [4.809109470545412, 0.573, 0.1212, 0.0852, 0.0475, 2.5, 2.5, 2.5, 1.6466222636311705,
+            0.0]
+    prices, zeros, schema = collect(rows_for(vals))
+    buf = io.StringIO()
+    res = report(prices, zeros, schema, out=buf)
+    text = buf.getvalue()
+    checks = [
+        ("zero bid kept out of the distribution", zeros == 1 and len(prices) == 9),
+        ("the repeated round value is named an atom",
+         res["atoms"].get("sparrow/RUB") == [{"value": 2.5, "count": 3}]),
+        # Precision is the evidence that makes the repeat legible, so it must be reported.
+        ("precision is reported per value", "decimals=1" in text and "decimals=15" in text),
+    ]
+
+    # The same repeat in a sample too small to support the word.
+    small = collect(rows_for([2.5, 2.5, 2.5, 0.1]))
+    buf2 = io.StringIO()
+    res2 = report(small[0], small[1], small[2], out=buf2)
+    checks.append(("a repeat below min-n is not called an atom",
+                   not res2["atoms"] and "is under the 8" in buf2.getvalue()
+                   and "not a distribution" in buf2.getvalue()))
+
+    # Two currencies must never be pooled into one distribution.
+    mixed = rows_for([2.5] * 5, currency="RUB") + rows_for([2.5] * 5, currency="USD")
+    pm, zm, sm = collect(mixed)
+    buf3 = io.StringIO()
+    res3 = report(pm, zm, sm, out=buf3)
+    checks.append(("currencies are not pooled",
+                   set(res3["groups"]) == {"sparrow/RUB", "sparrow/USD"}
+                   and all(g["n"] == 5 for g in res3["groups"].values())))
+
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("--schema", type=int)
+    ap.add_argument("--min-n", type=int, default=8)
+    ap.add_argument("--min-repeats", type=int, default=3)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not os.path.exists(args.log):
+        print(f"n/a: no log at {args.log}", file=sys.stderr)
+        return 2
+    rows = []
+    with open(args.log) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    prices, zeros, schema = collect(rows, args.schema)
+    report(prices, zeros, schema, args.min_n, args.min_repeats)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
