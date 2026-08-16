@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
@@ -111,18 +112,46 @@ def unattributed_hosts(log_path):
     return counts
 
 
+class SearchUnavailable(Exception):
+    """The index could not answer. Distinct from `it answered, with nothing`.
+
+    `kind` is the classification; the message is prose. A gate that greps the message passes
+    on ANY message quoting the failing text — a 403 body parsed as garbage still contains the
+    words "rate limit", so the substring test greened a mutant that had lost the check entirely.
+    """
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
 def gh_search(token, timeout=90):
-    """Files that MENTION the token. Proposals only — the grade comes from the bytes."""
+    """Files that MENTION the token. Proposals only — the grade comes from the bytes.
+
+    GitHub's code search allows ~10 queries a minute; over that it answers 403 on stdout with
+    rc=0, so the failure arrives looking like an empty result set. Sweeping a corpus of hosts
+    hits that limit around the tenth one — which is exactly when a tool that read the empty
+    answer literally would start reporting `none` for every remaining host.
+    """
     try:
         r = subprocess.run(["gh", "search", "code", token, "--repo", SOURCE_REPO,
                             "--limit", "20", "--json", "path"],
                            capture_output=True, text=True, timeout=timeout, env=clean_env())
-        if r.returncode != 0:
-            return None
-        return sorted({row.get("path") for row in json.loads(r.stdout or "[]")
-                       if (row.get("path") or "").endswith((".js", ".ts"))})
+    except Exception as e:
+        raise SearchUnavailable("exec", f"{type(e).__name__}: {e}"[:120])
+    blob = (r.stdout or "") + (r.stderr or "")
+    if "rate limit" in blob.lower():
+        raise SearchUnavailable("rate-limit",
+                                "github code search rate limit (~10/min) — pace or wait")
+    if r.returncode != 0:
+        raise SearchUnavailable("rc", (r.stderr or "search failed").strip()[:120])
+    try:
+        rows = json.loads(r.stdout or "[]")
     except Exception:
-        return None
+        raise SearchUnavailable("unparsable",
+                                f"unparsable search answer: {blob.strip()[:100]}")
+    return sorted({row.get("path") for row in rows
+                   if (row.get("path") or "").endswith((".js", ".ts"))})
 
 
 def fetch(path, timeout=45):
@@ -136,7 +165,10 @@ def fetch(path, timeout=45):
 
 def attribute(host, search=gh_search, get=fetch):
     """One host -> the best CITED verdict, with the file that carries it."""
-    paths = search(search_token(host))
+    try:
+        paths = search(search_token(host))
+    except SearchUnavailable as e:
+        return {"host": host, "verdict": "unknown", "why": str(e)}
     if paths is None:
         return {"host": host, "verdict": "unknown", "why": "the source repo could not be searched"}
     best = {"host": host, "verdict": "none", "why": "no adapter publishes this host",
@@ -239,6 +271,33 @@ def selftest():
          res_o["verdict"] == "exact" and res_o["company"] == "constructed"),
     ]
 
+    # The failure that actually happened mid-sweep: the index answers 403 on STDOUT with rc=0,
+    # so a rate limit arrives shaped exactly like "no adapter mentions this token". Seven hosts
+    # would have been published as `none` on the strength of a quota.
+    class _R:
+        def __init__(self, rc, out, err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    saved = subprocess.run
+    try:
+        limited = ("HTTP 403: API rate limit exceeded for user ID 3873554. "
+                   "(https://api.github.com/search/code?q=adriver)")
+        subprocess.run = lambda *a, **k: _R(0, limited)
+        try:
+            gh_search("adriver")
+            hit_limit = False
+        except SearchUnavailable as e:
+            hit_limit = e.kind == "rate-limit"
+        subprocess.run = lambda *a, **k: _R(0, '[{"path":"modules/viqeoBidAdapter.js"}]')
+        normal = gh_search("vqserve")
+    finally:
+        subprocess.run = saved
+    checks += [
+        ("a 403 rate limit on stdout is classified as one, not as garbage", hit_limit),
+        ("a real answer still parses to its paths",
+         normal == ["modules/viqeoBidAdapter.js"]),
+    ]
+
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
         ok = ok and good
@@ -252,6 +311,8 @@ def main():
     ap.add_argument("--log", default=LOG)
     ap.add_argument("--min-requests", type=int, default=1,
                     help="skip hosts seen fewer times than this")
+    ap.add_argument("--pace", type=float, default=7.0,
+                    help="seconds between hosts; github code search allows ~10 queries a minute")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
     if args.test:
@@ -270,7 +331,11 @@ def main():
             return 2
 
     rows = []
-    for host, n in targets:
+    for i, (host, n) in enumerate(targets):
+        # ~10 code searches a minute is the published ceiling; a sweep that ignores it converts
+        # its own tail into `unknown`.
+        if i and args.pace:
+            time.sleep(args.pace)
         r = attribute(host)
         r["requests"] = n
         rows.append(r)
