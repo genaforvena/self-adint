@@ -296,3 +296,52 @@ study's roster calls the same participant `hybrid`.
 Eight hosts stay unattributed, and they stay that way. `r.ussp.io` is the reason the tool
 verifies bytes: GitHub's code search answers a query for `ussp` with `anzuSSP` — a different
 company that a ranking-trusting tool would have written down as the owner.
+
+---
+
+## 2026-08-16 11:45Z — the census: 84 verified loads, 32 bidders answering, one returning a bid
+
+Three more passes over the 15 sites, `--via direct`, run-idx 20/21/22. The whole schema-5 corpus
+is now **84 loads, every one with its exit read from inside the browser as `77.246.104.228`** —
+one arm, no unverified rows.
+
+**Question (a): does anybody but sparrow ever return a bid?** No. 32 bidders answered at least
+one auction message; exactly one ever returned a bid object (sparrow: 89 priced, 7 zero). This
+is the sentence the study turns on and it is now printed by `adint-hb-report` under the schema it
+was computed on, because computing it by hand over the whole log pools schema-1 rows and answers
+*three* — `hb.bumlam.com`'s `["INCORRECT_UNPUT"]` (a vendor's error token in the bids array) and
+a publisher's own `currency.json` (a USD rate of 84.54), both already fixed in the collector and
+both back the moment a reader ignores the schema line.
+
+**Question (b): does the 0.5-grid property survive a larger n?** Yes, and the vocabulary did not
+grow. 89 sparrow prices at schema 5: **17 round — 2.5 ×3, 3.0 ×6, 4.0 ×7, 7.5 ×1, all multiples
+of 0.5** — against **72 computed values, none of which lands on that grid**. Four distinct round
+values at n=12 this morning; the same four at n=17.
+
+**And the split is predicted by price level, which I said this morning it was not.** Per
+placement, schema 5:
+
+| placement | site | n | max | ever round |
+|---|---|---|---|---|
+| 326146 | 74.ru | 6 | 7.5000 | yes |
+| 326116 | 74.ru | 5 | 6.8241 | yes |
+| 326112 | 74.ru | 5 | 4.4352 | yes |
+| 320828 | e1.ru | 5 | 4.0000 | yes |
+| 326110 | 74.ru | 2 | 3.6099 | yes |
+| 320892 | fontanka.ru | 6 | 1.9008 | — |
+| …13 more, max 1.90 down to 0.0534 | | | | — |
+
+Clean separation, no overlap: every placement whose price ever reached **3.61 or above** emits
+round values; every placement topping out at **1.90 or below** never has. That looks circular —
+a round value of 2.5 or more is itself large — so the same cut with round values EXCLUDED: the
+round-emitting placements' *computed* prices reach 3.61–6.82, the others' top out at 1.90.
+`320828` is the extreme case: five observations, all round, no computed price ever seen.
+
+Two of my own claims die here, both small-n artifacts of this morning: `326116` "has never
+emitted a round value" (it now has, 3.0 and 4.0), and "neither the site nor the price level
+predicts which placements do" (the level predicts it perfectly across these 18 placements).
+
+What this still cannot decide: whether the round numbers are a rate card, a floor that only binds
+on expensive inventory, or a rounding rule above a threshold. The Adfox protocol carries no
+`floorData` — the floor, if there is one, is not on the wire. And the whole finding is one
+bidder's behaviour: **one curve, not a set of shapes.**
