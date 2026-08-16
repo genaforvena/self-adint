@@ -283,6 +283,17 @@ def parse_request_floor(post_data):
     return floors or None
 
 
+def arm_plan(count, arms):
+    """Which arm each load runs, in load order. Alternating, never blocked: the hour is the
+    dominant confounder, so a block design hands whichever hour it ran in to one arm."""
+    return [arms[i % len(arms)] for i in range(count)]
+
+
+def arms_need_note(arms, note):
+    """More than one arm without a stated treatment is refused — see main()."""
+    return len(arms) > 1 and not note
+
+
 def egress_ip(timeout=15):
     try:
         r = subprocess.run(["curl", "-s", "--max-time", str(timeout), "https://api.ipify.org"],
@@ -292,14 +303,14 @@ def egress_ip(timeout=15):
         return None
 
 
-def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
+def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None):
     """One page load. Returns (load_row, request_rows)."""
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
     load = {
         "schema": 1, "kind": "load", "load_id": load_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
-        "url": url, "run_idx": run_idx, "arm": arm, "egress_ip": ip,
+        "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note, "egress_ip": ip,
         # Fresh context per load: the profile has no history, so cookie age can never become
         # an unrecorded covariate. It is stated rather than assumed.
         "profile_age_s": 0, "window_s": settle,
@@ -489,7 +500,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False):
         # a `no-answer` here cannot be distinguished from a bidder the wrapper itself dropped.
         row["window_shorter_than_wrapper"] = bool(
             wt is not None and (load.get("window_s") or 0) * 1000 < wt)
-        for k in ("run_idx", "arm", "egress_ip", "hour_utc", "profile_age_s"):
+        for k in ("run_idx", "arm", "arm_note", "egress_ip", "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
 
@@ -502,6 +513,10 @@ def main():
     ap.add_argument("--nav-timeout", type=int, default=30)
     ap.add_argument("--run-idx", type=int, default=0)
     ap.add_argument("--arm", default="A", help="contamination column: which interleaved arm")
+    ap.add_argument("--arms", help="comma-separated arm labels, alternated PER LOAD (never in "
+                                   "blocks: the hour is the dominant confounder)")
+    ap.add_argument("--arm-note", help="what the arms actually differ in; REQUIRED with --arms, "
+                                       "because a label is not a treatment")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test", action="store_true")
@@ -528,12 +543,24 @@ def main():
         print("no urls", file=sys.stderr)
         return 2
 
+    arms = [a.strip() for a in (args.arms or args.arm).split(",") if a.strip()]
+    plan = arm_plan(len(urls), arms)
+    if arms_need_note(arms, args.arm_note):
+        # An arm label with no stated treatment is a column that LOOKS like an experiment.
+        # Somebody reading `arm: A` / `arm: B` months later will believe two conditions were
+        # run; if they were identical, the honest name for that is an A/A null and it has to
+        # be said on the row, not remembered.
+        print("refusing: --arms without --arm-note. State what the arms differ in "
+              "(use --arm-note 'A/A null: identical treatment' if they do not).",
+              file=sys.stderr)
+        return 2
+
     ip = egress_ip()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with sync_playwright() as pw:
         for i, u in enumerate(urls, 1):
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
-                                 args.arm)
+                                 plan[i - 1], arm_note=args.arm_note)
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
@@ -790,6 +817,15 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
          and "bidValue" in ((by.get("adfox-bid", {}).get("detail") or {}).get("bids_raw") or "")),
         ("a returned bid is never counted as a no-bid",
          by.get("adfox-bid", {}).get("outcome") != "no-bid"),
+
+        # Assignment: alternating, and a label that claims nothing is refused.
+        ("arms alternate per load, never in blocks",
+         arm_plan(6, ["A", "B"]) == ["A", "B", "A", "B", "A", "B"]),
+        ("a single arm needs no note", not arms_need_note(["A"], None)),
+        ("two arms without a stated treatment are refused",
+         arms_need_note(["A", "B"], None) and not arms_need_note(["A", "B"], "A/A null")),
+        ("the arm note travels on every row, not just the load",
+         all("arm_note" in r for r in rows)),
     ]
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
