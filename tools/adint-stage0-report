@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Stage 0 read-out: what the probe's log actually says, counted from the log.
+
+Nothing here re-measures anything. It exists because the stage-0 numbers were twice
+quoted from a console tail, and a console tail is not the corpus — the corpus is
+data/pbjs-probe.jsonl, whose rows carry the schema that says what a verdict MEANT when
+it was written.
+
+The one rule this tool enforces above all others: ROWS OF DIFFERENT SCHEMAS ARE NEVER
+POOLED. schema 1 folded 4xx/5xx into `none`, so its `none` count includes geo-blocked
+sites; schema 2 read the top frame only, so its `none` is silent about subframes;
+schema 3 is silent about the wrapper roster. Counting them together produces a number
+that is not a measurement of anything. The report picks ONE schema, says which, and
+says out loud how many rows it set aside.
+
+Two more things it refuses to do:
+  - fold `blocked`/`error` into the denominator. A site that answered 403 said nothing
+    about prebid, and dividing by it manufactures an absence rate.
+  - join bidder names on the raw string. `biddersMap` renders betweenDigital while a
+    bid renders betweendigital; the canonical form is what gets counted, the raw form
+    is what gets cited.
+"""
+
+import argparse
+import collections
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG = os.path.join(REPO, "data", "pbjs-probe.jsonl")
+
+# A verdict that says the page did not render is not a reading about prebid.
+NON_READINGS = ("blocked", "error")
+
+
+def load(path, schema=None, run_idx=None):
+    rows = []
+    bad = 0
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                bad += 1
+    # schema 1 predates the field entirely; treat its absence as the number it was.
+    for r in rows:
+        r.setdefault("schema", 1)
+    present = sorted({r["schema"] for r in rows})
+    if schema is None:
+        schema = present[-1] if present else 1
+    kept = [r for r in rows if r["schema"] == schema]
+    if run_idx is not None:
+        kept = [r for r in kept if r.get("run_idx") == run_idx]
+    return kept, rows, schema, present, bad
+
+
+def canon(name):
+    return str(name).lower() if name else None
+
+
+def report(kept, all_rows, schema, present, bad, out=sys.stdout):
+    p = lambda s="": print(s, file=out)
+    setaside = len(all_rows) - len([r for r in all_rows if r["schema"] == schema])
+    p(f"== stage 0 read-out — schema {schema} ==")
+    p(f"rows in log {len(all_rows)} · counted {len(kept)} · set aside {setaside} "
+      f"(other schemas: {[s for s in present if s != schema]}) · unparseable {bad}")
+    p("schemas are not pooled: an older row's verdict was written under different rules "
+      "and is not the same measurement.")
+
+    # The vantage is a column of the corpus, not a footnote: every count below was taken
+    # from these IPs, and this node does not egress in the geo it is measuring.
+    ips = collections.Counter(r.get("egress_ip") for r in kept)
+    p("")
+    p("-- vantage --")
+    for ip, n in ips.most_common():
+        p(f"   {ip or 'unknown'}  rows={n}")
+
+    runs = sorted({r.get("run_idx") for r in kept})
+    p("")
+    p(f"-- verdicts (runs {runs}) --")
+    counts = collections.Counter(r.get("verdict") for r in kept)
+    for v, n in counts.most_common():
+        p(f"   {v:18} {n}")
+    denom = sum(n for v, n in counts.items() if v not in NON_READINGS)
+    nonread = sum(n for v, n in counts.items() if v in NON_READINGS)
+    p(f"   observable denominator = {denom} "
+      f"({nonread} row(s) excluded: the page did not render, which is not an absence)")
+
+    # An auction is the only row the study can actually use, so it is printed per site
+    # with the columns the design requires, never as a count.
+    p("")
+    p("-- observed auctions (asked / responded / timed-out kept apart) --")
+    any_auction = False
+    for r in kept:
+        if r.get("verdict") not in ("auction", "auction-in-frame"):
+            continue
+        any_auction = True
+        for rec in (r.get("prebid") or []) + [
+                {"name": f"[frame] {s.get('frame_url')}", **s} for s in (r.get("subframes") or [])]:
+            asked = rec.get("biddersAsked")
+            asked = asked if asked is not None else rec.get("asked")
+            p(f"   {r['url']}  [{r['verdict']}] {rec.get('name')}")
+            p(f"      asked={asked} responded={rec.get('biddersResponded', rec.get('responded'))} "
+              f"timedOut={rec.get('biddersTimedOut', rec.get('timedOut'))}")
+            p(f"      bids={rec.get('bidsReceived')} originalCpm={rec.get('bidsWithOriginalCpm')} "
+              f"floorData={rec.get('bidsWithFloorData')} currencies={rec.get('currencies')} "
+              f"bidderTimeout={rec.get('bidderTimeout')}")
+    if not any_auction:
+        p("   none. Not 'publishers run no auction' — from this vantage no auction was "
+          "OBSERVED, and the vantage above is a datacenter ASN outside the measured geo.")
+
+    p("")
+    p("-- wrapper markers (a site may carry several) --")
+    marks = collections.Counter()
+    sites = set()
+    for r in kept:
+        if r.get("verdict") in NON_READINGS:
+            continue
+        sites.add(r["url"])
+        a = r.get("adfox") or {}
+        for k in ("ya", "adfoxCode", "hb_settings", "ya_context"):
+            if a.get(k):
+                marks[k] += 1
+    for k, n in marks.most_common():
+        p(f"   {k:14} {n} row(s)")
+
+    # The roster survives a vantage that never sees a bid, so it is the reading this
+    # sweep actually yields. Counted per SITE, not per row: three visits to one site is
+    # one publisher, and counting rows would triple it.
+    rosters = {}
+    for r in kept:
+        hb = r.get("adfox_hb") or {}
+        if hb.get("present"):
+            rosters.setdefault(r["url"], hb)
+    if rosters:
+        p("")
+        p(f"-- Adfox HB rosters ({len(rosters)} of {len(sites)} observable site(s)) --")
+        per_bidder = collections.Counter()
+        for url, hb in sorted(rosters.items()):
+            bidders = hb.get("bidders") or sorted({canon(b) for b in (hb.get("biddersMap") or [])})
+            for b in bidders:
+                per_bidder[b] += 1
+            slots = hb.get("bidderSlots") or {}
+            p(f"   {url}")
+            p(f"      timeout={hb.get('timeout')} adUnits={hb.get('adUnits')} "
+              f"bidders={bidders}")
+            if slots:
+                p(f"      slots={dict(sorted(slots.items()))}")
+        p("")
+        p("   bidder reach (sites, canonical names):")
+        for b, n in per_bidder.most_common():
+            p(f"      {b:20} {n}")
+    else:
+        p("")
+        p("-- Adfox HB rosters --")
+        p("   no roster field in these rows (schema < 4 is SILENT about the wrapper — "
+          "that is an absent field, not an empty roster)")
+
+    # A verdict from one visit is a sample. If a site was visited more than once in this
+    # schema and disagreed with itself, no single-visit corpus built from it is stable.
+    p("")
+    p("-- stability across repeat visits --")
+    by = collections.defaultdict(list)
+    for r in kept:
+        by[r["url"]].append(r.get("verdict"))
+    repeats = {u: v for u, v in by.items() if len(v) > 1}
+    flapped = {u: v for u, v in repeats.items() if len(set(v)) > 1}
+    if not repeats:
+        p("   no site was visited twice in this schema — stability is UNMEASURED here, "
+          "which is not the same as stable")
+    else:
+        p(f"   {len(flapped)} of {len(repeats)} repeat-visited site(s) changed verdict")
+        for u, v in sorted(flapped.items()):
+            p(f"      {u}: {' -> '.join(v)}")
+    return {"counts": dict(counts), "denominator": denom, "rosters": len(rosters),
+            "flapped": len(flapped) if repeats else 0, "schema": schema,
+            "set_aside": setaside}
+
+
+def selftest():
+    import tempfile
+    ok = True
+    rows = [
+        # schema 1: its `none` includes a geo-blocked site. Must never be pooled.
+        {"url": "https://a.ru/", "run_idx": 0, "verdict": "none", "http_status": 403},
+        {"schema": 4, "url": "https://a.ru/", "run_idx": 1, "verdict": "blocked",
+         "http_status": 403, "egress_ip": "1.2.3.4"},
+        {"schema": 4, "url": "https://b.ru/", "run_idx": 1, "verdict": "none",
+         "egress_ip": "1.2.3.4", "adfox": {"ya": True, "hb_settings": True},
+         "adfox_hb": {"present": True, "timeout": 3000, "adUnits": 2,
+                      "biddersMap": ["betweenDigital", "myTarget"],
+                      "bidders": ["betweendigital", "mytarget"],
+                      "bidderSlots": {"betweendigital": 2, "mytarget": 1}}},
+        {"schema": 4, "url": "https://b.ru/", "run_idx": 2, "verdict": "pbjs-idle",
+         "egress_ip": "1.2.3.4"},
+        {"schema": 4, "url": "https://c.ru/", "run_idx": 1, "verdict": "auction",
+         "egress_ip": "1.2.3.4",
+         "prebid": [{"name": "pbjs", "biddersAsked": ["betweendigital"],
+                     "biddersResponded": [], "biddersTimedOut": ["betweendigital"],
+                     "bidsReceived": 0, "bidsWithOriginalCpm": 0, "bidsWithFloorData": 0}]},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+        path = fh.name
+    import io
+    buf = io.StringIO()
+    kept, allr, schema, present, bad = load(path)
+    res = report(kept, allr, schema, present, bad, out=buf)
+    text = buf.getvalue()
+    os.unlink(path)
+
+    # A log whose only readings are non-auctions: the sentence it prints is the whole
+    # point of the split, so it is asserted rather than assumed.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write(json.dumps({"schema": 4, "url": "https://d.ru/", "run_idx": 1,
+                             "verdict": "none", "egress_ip": "1.2.3.4"}) + "\n")
+        path2 = fh.name
+    buf2 = io.StringIO()
+    k2, a2, s2, p2, b2 = load(path2)
+    report(k2, a2, s2, p2, b2, out=buf2)
+    text2 = buf2.getvalue()
+    os.unlink(path2)
+
+    checks = [
+        ("latest schema chosen, older set aside", res["schema"] == 4 and res["set_aside"] == 1),
+        # The failure this whole split exists for: a 403 must not be counted as an absence.
+        ("blocked excluded from denominator", res["denominator"] == 3
+         and res["counts"].get("blocked") == 1),
+        # The schema-1 row is a 403 written down as `none`. Pooling it would show two.
+        ("schema-1 `none` not pooled with schema-4", res["counts"].get("none") == 1),
+        ("one bidder, not two spellings", "betweendigital     " in text
+         and "betweenDigital " not in text.split("bidder reach")[1]),
+        # Two rows for b.ru is one publisher. Counting rows would say 2 of 4.
+        ("roster counted per site, not per row", "1 of 2 observable site(s)" in text),
+        ("flap reported", res["flapped"] == 1 and "none -> pbjs-idle" in text),
+        # A timed-out bidder must stay visible as a distinct outcome, never folded to no-bid.
+        ("timeout kept apart in the auction line", "timedOut=['betweendigital']" in text),
+        ("no auction reads as not-observed, never as absence",
+         "no auction was OBSERVED" in text2 and "publishers run no auction" not in
+         text2.replace("Not 'publishers run no auction'", "")),
+        # One visit each: the tool must say stability is unmeasured rather than imply stable.
+        ("single-visit corpus reports stability as unmeasured",
+         "stability is UNMEASURED" in text2),
+    ]
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", default=LOG)
+    ap.add_argument("--schema", type=int, help="which schema to count (default: newest present)")
+    ap.add_argument("--run-idx", type=int, help="restrict to one run")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not os.path.exists(args.log):
+        print(f"n/a: no log at {args.log}", file=sys.stderr)
+        return 2
+    kept, allr, schema, present, bad = load(args.log, args.schema, args.run_idx)
+    if not kept:
+        print(f"n/a: no rows of schema {schema} in {args.log}", file=sys.stderr)
+        return 2
+    report(kept, allr, schema, present, bad)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
