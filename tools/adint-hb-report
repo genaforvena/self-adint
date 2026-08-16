@@ -27,10 +27,58 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
+ALIASES = os.path.join(REPO, "ref", "org-aliases.tsv")
 
 # Outcomes that are statements about a BIDDER, in the order they are reported. `no-answer`
 # leads the silent half deliberately: it is the one most likely to be quietly absorbed.
 BIDDER_OUTCOMES = ("priced", "bid-returned", "no-bid", "no-answer", "error")
+
+
+def _norm(name):
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def load_aliases(path=ALIASES):
+    """One vocabulary. The roster calls a bidder `mytarget`; ref/exchange-domains.tsv calls the
+    same company `MyTarget/VK`; both land on ad.mail.ru. Counted raw they are two bidders with
+    half the evidence each — the same split that cost a roster count earlier, one layer up."""
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    out[_norm(parts[0])] = parts[1]
+                    out[_norm(parts[1])] = parts[1]
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def learn_host_bidders(rows, aliases):
+    """host -> bidder, learned ONLY from placement-id attributions.
+
+    A placement id comes from the publisher's own config and names one bidder exactly, so a
+    host seen under it is evidence. A host learned this way can then name the SAME host on a
+    load where the roster was never read — which is most of them: 261 of ~770 candidate rows in
+    the schema-4 corpus had no attribution while their host was named by placement id
+    elsewhere. What is refused: learning from weaker attributions (a roster name in a URL is a
+    substring, not a fact), and learning from a host that has ever named two different bidders.
+    """
+    seen = collections.defaultdict(collections.Counter)
+    for r in rows:
+        if r.get("match_by") == "placement-id" and r.get("bidder") and r.get("host"):
+            seen[r["host"]][aliases.get(_norm(r["bidder"]), r["bidder"])] += 1
+    learned, ambiguous = {}, {}
+    for host, names in seen.items():
+        if len(names) == 1:
+            name, n = next(iter(names.items()))
+            learned[host] = (name, n)
+        else:
+            ambiguous[host] = dict(names)
+    return learned, ambiguous
 
 
 def load(path, schema=None):
@@ -66,6 +114,22 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     attrib_only = [r for r in reqs if r.get("evidence_strength") == "attribution-only"]
     unstated = [r for r in reqs if r.get("is_bid_candidate") and not r.get("evidence_strength")]
     by_load = {l["load_id"]: l for l in loads}
+
+    aliases = load_aliases()
+    learned, ambiguous_hosts = learn_host_bidders(cands, aliases)
+    learned_applied = 0
+    for r in cands:
+        if r.get("bidder"):
+            r["bidder_canon"] = aliases.get(_norm(r["bidder"]), r["bidder"])
+            r["attribution"] = r.get("match_by")
+        elif r.get("host") in learned:
+            name, n = learned[r["host"]]
+            r["bidder_canon"] = name
+            r["attribution"] = f"learned-host(n={n})"
+            learned_applied += 1
+        else:
+            r["bidder_canon"] = None
+            r["attribution"] = r.get("match_by")
 
     p(f"== hb capture read-out — schema {schema} ==")
     p(f"rows {len(all_rows)} · counted {len(kept)} · set aside "
@@ -125,7 +189,7 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     unattributed = collections.Counter()
     for r in cands:
         site = (by_load.get(r["load_id"]) or {}).get("url", "?")
-        b = r.get("bidder")
+        b = r.get("bidder_canon")
         if not b:
             unattributed[r.get("match_by") or "none"] += 1
             continue
@@ -140,6 +204,12 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         other = {k: v for k, v in counts.items() if k not in BIDDER_OUTCOMES}
         p(f"   {b:22} sites={len(sites_by_bidder[b]):3} requests={sum(counts.values()):3}  "
           f"{cells}" + (f"  other={other}" if other else ""))
+    p(f"   attribution: {len(cands) - learned_applied - sum(unattributed.values())} direct, "
+      f"{learned_applied} by host learned from placement ids ({len(learned)} host(s) learned), "
+      f"{sum(unattributed.values())} unattributed")
+    if ambiguous_hosts:
+        p(f"   hosts refused for learning (more than one bidder seen under a placement id): "
+          f"{ambiguous_hosts}")
     if unattributed:
         p(f"   unattributed candidate requests: {sum(unattributed.values())} "
           f"({dict(unattributed)}) — recorded, never assigned to a bidder")
@@ -291,6 +361,8 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
                         for b, e in lat.items()},
             "no_deadline": no_deadline, "attribution_only": len(attrib_only),
             "arm_outcomes": {a: dict(c) for a, c in arm_out.items()}, "welded": len(welded),
+            "learned_applied": learned_applied, "learned_hosts": len(learned),
+            "ambiguous_hosts": ambiguous_hosts,
             "unstated": len(unstated),
             "sites_by_bidder": {b: len(v) for b, v in sites_by_bidder.items()},
             "repeated": len(repeated)}
@@ -324,6 +396,32 @@ def selftest():
         {"schema": 1, "kind": "load", "load_id": "L2", "url": "https://a.ru/", "arm": "B",
          "arm_note": "A/A null: identical treatment", "egress_ip": "1.2.3.4",
          "http_status": 200, "wrapper_timeout_ms": 3000, "roster": ["mediasniper", "astralab"]},
+        # Attribution evidence: ad.mail.ru named by placement id on one load...
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "mytarget",
+         "host": "ad.mail.ru", "match_by": "placement-id", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        # ...the SAME host unattributed on another, which the learned map should name.
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": None,
+         "host": "ad.mail.ru", "match_by": "none", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        # The other vocabulary for the same company, from the host table.
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "MyTarget/VK",
+         "host": "ad.mail.ru", "match_by": "host-table:mail.ru", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        # A host named only by a URL substring must NOT teach the map.
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "buzzoola",
+         "host": "weak.example", "match_by": "roster-name-in-url", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": None,
+         "host": "weak.example", "match_by": "none", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        # A host that placement ids have named TWO ways teaches nothing.
+        {"schema": 1, "kind": "request", "load_id": "L1", "bidder": "gnezdo",
+         "host": "shared.example", "match_by": "placement-id", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
+        {"schema": 1, "kind": "request", "load_id": "L2", "bidder": "smi2",
+         "host": "shared.example", "match_by": "placement-id", "outcome": "no-bid",
+         "is_bid_candidate": True, "evidence_strength": "protocol"},
         # Unattributed (bidder None) on a repeat-visited site: sorting this against a named
         # row is what crashed the read-out.
         {"schema": 1, "kind": "request", "load_id": "L2", "bidder": None,
@@ -384,6 +482,18 @@ def selftest():
          res["rendered"] == 3 and res["with_wrapper"] == 3 and res["silent_wrapper"] == 1),
         ("A/A arms are named as a noise floor, not an experiment",
          "NOISE FLOOR, not an experiment" in text),
+        # One company, two vocabularies, one host — counted raw it is two bidders with half
+        # the evidence each.
+        ("alias table collapses mytarget and MyTarget/VK into one bidder",
+         "MyTarget/VK" in res["sites_by_bidder"] and "mytarget" not in res["sites_by_bidder"]),
+        # A host named by a placement id can name the same host where the roster was not read.
+        ("an unattributed row is named by a host learned from placement ids",
+         res["learned_applied"] == 1 and "by host learned from placement ids" in text),
+        # ...but only from that evidence, and only when the host is unambiguous.
+        ("a host known only from a URL substring teaches nothing",
+         "weak.example" not in str(res.get("ambiguous_hosts")) and res["learned_hosts"] == 1),
+        ("a host that named two bidders is refused and reported",
+         "shared.example" in res["ambiguous_hosts"] and "refused for learning" in text),
         ("an unattributed row does not crash the repeats section",
          "-- repeats --" in text and "sites visited more than once" in text),
         ("repeat visits are detected and the disagreement is named",
