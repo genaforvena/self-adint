@@ -155,6 +155,28 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         p("   !! more than one arm and NO note on the load rows — the treatment is unstated, "
           "so these labels cannot be read as conditions")
 
+    # A stated treatment is still only a claim until the row carries the exit the BROWSER
+    # measured. Schema<=4 `proxy`/`direct` loads were launched with --no-proxy-server and
+    # nothing else, which does not override the inherited proxy env: both arms left through
+    # privoxy, and the `egress_ip` on the direct rows is the address the PARENT's curl
+    # reached, never that browser's. Those arms are an A/A null wearing a treatment's name.
+    verified = [l for l in loads if l.get("vantage_verified") is True]
+    unverified = [l for l in loads if l.get("arm") in ("proxy", "direct")
+                  and l.get("vantage_verified") is not True]
+    if unverified:
+        bad = collections.Counter(l.get("arm") for l in unverified)
+        p(f"   !! {len(unverified)} load(s) carry a proxy/direct arm with NO browser-measured "
+          f"exit {dict(sorted(bad.items()))} — the arm is unproven on those rows and the "
+          "proxy-vs-direct contrast below must be read as an A/A null, not a treatment")
+    if verified:
+        vips = collections.Counter((l.get("arm"), l.get("browser_egress_ip")) for l in verified)
+        p(f"   verified arms (exit read from inside the browser): "
+          f"{ {f'{a}:{i}': n for (a, i), n in vips.most_common()} }")
+    contaminated = [l for l in loads if l.get("vantage_verified") is False]
+    if contaminated:
+        p(f"   !! {len(contaminated)} load(s) left from an exit that is not their arm's — "
+          "their rows are contaminated, not merely unproven")
+
     # Coverage first: what fraction of loads could say anything at all.
     rendered = [l for l in loads if (l.get("http_status") or 0) < 400 and not l.get("error")]
     with_wrapper = [l for l in rendered if l.get("wrapper_timeout_ms") is not None
@@ -258,6 +280,10 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
     for a in sorted(arm_out):
         c = arm_out[a]
         p(f"   {a:8} n={sum(c.values()):4}  {dict(sorted(c.items()))}")
+    if unverified:
+        p("   -> the proxy/direct split above is UNPROVEN on "
+          f"{len(unverified)} load(s): same browser vantage on both sides, so every "
+          "difference here is the corpus disagreeing with itself")
 
     # A site that only ever ran arm X in pass N has arm and pass welded together: any
     # difference between the arms is also a difference between two moments in time, and the
@@ -557,6 +583,39 @@ def selftest():
                    res_b["welded"] == 0 and "not welded" in text_b))
     checks.append(("both arms are counted separately",
                    set(res_w["arm_outcomes"]) == {"proxy", "direct"}))
+
+    # An arm nobody measured must not be readable as a condition. The welded/balanced
+    # fixtures above carry proxy/direct arms with no `vantage_verified` — exactly the shape
+    # the live corpus has — so the warning has to fire on them...
+    checks.append(("a proxy/direct arm with no browser-measured exit is called unproven",
+                   "the arm is unproven on those rows" in text_b
+                   and "must be read as an A/A null" in text_b))
+    # ...and must NOT fire once each load carries the exit its own browser reported, or the
+    # warning is a constant and says nothing about any particular corpus.
+    proven_rows = []
+    for r in balanced_rows:
+        r = dict(r)
+        if r.get("kind") == "load":
+            r["vantage_verified"] = True
+            r["browser_egress_ip"] = ("38.49.216.141" if r.get("arm") == "proxy"
+                                      else "77.246.104.228")
+        proven_rows.append(r)
+    _, text_p = run_on(proven_rows)
+    checks.append(("a verified arm is not flagged, and its two exits are printed",
+                   "the arm is unproven on those rows" not in text_p
+                   and "verified arms (exit read from inside the browser)" in text_p
+                   and "direct:77.246.104.228" in text_p))
+    # A load whose browser left by the OTHER arm's exit is worse than unproven.
+    contam_rows = []
+    for r in proven_rows:
+        r = dict(r)
+        if r.get("kind") == "load" and r.get("arm") == "direct":
+            r["vantage_verified"] = False
+            r["browser_egress_ip"] = "38.49.216.141"
+        contam_rows.append(r)
+    _, text_c = run_on(contam_rows)
+    checks.append(("a load that left by the other arm's exit is called contaminated",
+                   "left from an exit that is not their arm's" in text_c))
 
     # A corpus where every site was seen once must say the stability claim is unavailable.
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:

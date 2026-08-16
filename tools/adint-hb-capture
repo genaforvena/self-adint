@@ -46,6 +46,7 @@ is a separate step over the log, on purpose.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -379,8 +380,33 @@ def egress_ips(timeout=15):
             "proxy_env": os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY")}
 
 
+IP_ECHO = "https://api.ipify.org"
+
+
+def browser_egress(ctx, timeout_ms=12000, echo=IP_ECHO):
+    """The exit address as the BROWSER sees it. None when the echo cannot be read.
+
+    None is not a failure of the arm — it is the absence of evidence about the arm, and it
+    must stay distinguishable from a verified match.
+    """
+    p = None
+    try:
+        p = ctx.new_page()
+        p.goto(echo, wait_until="domcontentloaded", timeout=timeout_ms)
+        txt = (p.inner_text("body") or "").strip()
+        return txt if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", txt or "") else None
+    except Exception:
+        return None
+    finally:
+        try:
+            if p is not None:
+                p.close()
+        except Exception:
+            pass
+
+
 def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None,
-            use_proxy=True):
+            use_proxy=True, vantage_probe=True):
     """One page load. Returns (load_row, request_rows)."""
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
@@ -392,7 +418,12 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # schema 4 records WHICH egress the browser used. Schema<=3 rows carry an
         # `egress_ip` that was measured through the inherited proxy whether or not
         # the browser used it, so their vantage column is not this one.
-        "schema": 4, "kind": "load", "load_id": load_id,
+        # schema 5 VERIFIES it from inside the browser. Schema-4 `direct` rows are
+        # mislabelled: the arm was launched with --no-proxy-server only, which does not
+        # override the inherited proxy env, so BOTH arms left through privoxy. Their
+        # `egress_ip: 77.246.104.228` is what the parent's curl measured, not where that
+        # browser went — schema-4 arms are an A/A null wearing a treatment's name.
+        "schema": 5, "kind": "load", "load_id": load_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note,
         # `egress_ip` is the address the BROWSER left from, never whichever one was easiest to
@@ -417,12 +448,35 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         return round(time.time() - t0, 3)
 
     try:
-        # --no-proxy-server overrides the inherited env for this browser only; it
-        # changes nothing on the node and raises nothing.
+        # `--no-proxy-server` DOES NOT bypass the inherited proxy here, and believing it did
+        # cost this study its entire treatment axis. Measured 2026-08-16, same node, same
+        # chromium: launched with the flag alone the browser still reported 38.49.216.141
+        # (privoxy's exit) from api.ipify.org, and every request to a host privoxy blocks
+        # still failed ERR_TUNNEL_CONNECTION_FAILED — an error only a proxy CONNECT can
+        # produce. Only stripping HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the CHILD's
+        # environment moved the exit to 77.246.104.228, and betweendigital answered
+        # (HTTP 400 to a bare GET) instead of failing. The env wins over the flag; the flag
+        # is kept because it is harmless and states the intent.
+        launch_env = None if use_proxy else {
+            k: v for k, v in os.environ.items() if k not in PROXY_VARS}
         browser = pw.chromium.launch(headless=not headed,
-                                     args=[] if use_proxy else ["--no-proxy-server"])
+                                     args=[] if use_proxy else ["--no-proxy-server"],
+                                     **({} if launch_env is None else {"env": launch_env}))
         ctx = browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow",
                                   viewport={"width": 1366, "height": 900})
+        # The arm is verified from INSIDE the browser, per load, before the site is opened.
+        # A launch flag is an intention and the parent's curl measures the parent; neither is
+        # this browser's vantage. Missing renders null — never the expected value.
+        if vantage_probe:
+            load["browser_egress_ip"] = browser_egress(ctx)
+            expected = load.get("egress_ip")
+            load["vantage_verified"] = (
+                None if load["browser_egress_ip"] is None
+                else (load["browser_egress_ip"] == expected))
+            if load["vantage_verified"] is False:
+                load["note_vantage"] = (
+                    f"arm `{arm}` claims {expected} but the browser left from "
+                    f"{load['browser_egress_ip']} — this load's vantage is NOT the arm's")
         page = ctx.new_page()
 
         def on_request(req):
@@ -435,7 +489,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 from urllib.parse import urlparse
                 host = (urlparse(req.url).hostname or "").lower()
                 row = {
-                    "schema": 4, "kind": "request", "load_id": load_id,
+                    "schema": 5, "kind": "request", "load_id": load_id,
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
@@ -615,6 +669,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         row["window_shorter_than_wrapper"] = bool(
             wt is not None and (load.get("window_s") or 0) * 1000 < wt)
         for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
+                  "browser_egress_ip", "vantage_verified",
                   "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
@@ -693,6 +748,39 @@ def main():
               f"{ip.get('egress_ip_direct')}", file=sys.stderr)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with sync_playwright() as pw:
+        # PREFLIGHT: prove the treatment exists before spending a sweep on it. The first
+        # proxy/direct sweep (117 loads per arm) was an A/A null nobody could see, because
+        # the only evidence for the arm was the flag we passed and a curl the parent ran.
+        if args.treatment == "proxy":
+            seen_exits = {}
+            for a in ("proxy", "direct"):
+                up = (a == "proxy")
+                env = None if up else {k: v for k, v in os.environ.items()
+                                       if k not in PROXY_VARS}
+                b = pw.chromium.launch(headless=True,
+                                       args=[] if up else ["--no-proxy-server"],
+                                       **({} if env is None else {"env": env}))
+                try:
+                    seen_exits[a] = browser_egress(b.new_context())
+                finally:
+                    b.close()
+            print(f"preflight vantage: proxy={seen_exits['proxy']} direct={seen_exits['direct']}",
+                  file=sys.stderr)
+            if None in seen_exits.values():
+                print("refusing: the echo could not be read, so the arms are unproven "
+                      "(no vantage evidence is not evidence of a vantage)", file=sys.stderr)
+                return 2
+            if seen_exits["proxy"] == seen_exits["direct"]:
+                print(f"refusing: both arms leave from {seen_exits['direct']} — the labels "
+                      "differ and the treatment does not", file=sys.stderr)
+                return 1
+            if seen_exits["direct"] != ip.get("egress_ip_direct"):
+                print(f"note: the browser's direct exit ({seen_exits['direct']}) is not the "
+                      f"parent's ({ip.get('egress_ip_direct')}); the ROW records the browser's",
+                      file=sys.stderr)
+                ip["egress_ip_direct"] = seen_exits["direct"]
+            if seen_exits["proxy"] != ip.get("egress_ip_proxied"):
+                ip["egress_ip_proxied"] = seen_exits["proxy"]
         for i, u in enumerate(urls, 1):
             arm = plan[i - 1]
             use_proxy = (arm == "proxy") if args.treatment == "proxy" else True
@@ -888,19 +976,46 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
 </script></body></html>"""
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
+    live = {"ran": False, "proxied": None, "direct": None, "load": None, "why": None}
     try:
         with sync_playwright() as pw:
             load, rows = capture(pw, f"{base}/page", 2, 20,
                                  {"egress_ip_proxied": "proxy-ip",
                                   "egress_ip_direct": "direct-ip",
-                                  "proxy_env": "http://127.0.0.1:8118"}, 7, "B")
+                                  "proxy_env": "http://127.0.0.1:8118"}, 7, "B",
+                                 vantage_probe=False)
             # The same fixture on the node's own route: the browser must be launched with the
             # inherited proxy disabled, and the row must say which exit it used.
             load_d, rows_d = capture(pw, f"{base}/page", 2, 20,
                                      {"egress_ip_proxied": "proxy-ip",
                                       "egress_ip_direct": "direct-ip",
                                       "proxy_env": "http://127.0.0.1:8118"}, 7, "direct",
-                                     use_proxy=False)
+                                     use_proxy=False, vantage_probe=False)
+            # THE LIVE LEG. Everything above runs against 127.0.0.1, which Chromium exempts
+            # from any proxy — so a localhost fixture cannot tell a bypassed proxy from an
+            # obeyed one, and the two legs above would pass unchanged with the browser going
+            # through privoxy (they did, for a whole sweep). This leg reads the exit from
+            # inside the browser on the real network, which is the only place the arm exists.
+            if not any(os.environ.get(v) for v in PROXY_VARS):
+                live["why"] = "no proxy in this shell's env — there is no treatment to verify"
+            else:
+                b_p = pw.chromium.launch(headless=True)
+                try:
+                    live["proxied"] = browser_egress(b_p.new_context())
+                finally:
+                    b_p.close()
+                real_ip = egress_ips()
+                # Driven through capture() itself, never a hand-built launch: the gate must
+                # fail when the PRODUCTION path stops stripping the env, not when a copy of
+                # it does.
+                live["load"], _ = capture(pw, f"{base}/page", 1, 20, real_ip, 7, "direct",
+                                          use_proxy=False, vantage_probe=True)
+                live["direct"] = live["load"].get("browser_egress_ip")
+                live["ran"] = True
+                if live["proxied"] is None or live["direct"] is None:
+                    live["ran"] = False
+                    live["why"] = ("the ip echo could not be read from the browser "
+                                   f"(proxied={live['proxied']} direct={live['direct']})")
     finally:
         srv.shutdown()
         srv.server_close()
@@ -1064,11 +1179,32 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
         ("the arm note travels on every row, not just the load",
          all("arm_note" in r for r in rows)),
     ]
+    if live["ran"]:
+        checks += [
+            # RED against the mutant: drop the env strip in capture() (flag only, the way
+            # this tool ran for 117 loads per arm) and the two exits become the same address.
+            ("the direct arm's browser leaves by a different exit than the proxy arm",
+             live["direct"] != live["proxied"]),
+            ("the direct exit is the node's own route, not privoxy's",
+             live["direct"] == egress_ips().get("egress_ip_direct")),
+            # A verified arm is a MEASURED arm; the boolean must come from the echo, not
+            # from the flag we passed.
+            ("the load row carries the browser-measured exit and verifies it",
+             live["load"].get("vantage_verified") is True
+             and live["load"].get("browser_egress_ip") == live["direct"]),
+        ]
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
         ok = ok and good
+    if not live["ran"]:
+        print("SKIP the live vantage leg: " + (live["why"] or "unknown"))
     print("--test:", "ok" if ok else "FAILED")
-    return 0 if ok else 1
+    if not ok:
+        return 1
+    # Green-but-unverified is not green. The arm is the one thing this tool cannot check
+    # against a localhost fixture, so when that leg could not run the test reports n/a
+    # rather than a pass that covers everything except the failure that already happened.
+    return 0 if live["ran"] else 2
 
 
 if __name__ == "__main__":
