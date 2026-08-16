@@ -299,8 +299,11 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
         s = per_site[(by_load.get(r["load_id"]) or {}).get("url", "?")]
         s["cands"] += 1
         s["outcomes"][r.get("outcome")] += 1
-        if r.get("bidder"):
-            s["bidders"].add(r["bidder"])
+        if r.get("bidder_canon"):
+            # The canonical name, same as the per-bidder table above. Printing the raw name
+            # here put `mytarget` in one section and `MyTarget/VK` in the other — one report,
+            # two vocabularies, which is the split this report exists to have already fixed.
+            s["bidders"].add(r["bidder_canon"])
     for url in sorted(per_site, key=lambda u: (-per_site[u]["cands"], u)):
         s = per_site[url]
         if not s["cands"]:
@@ -484,6 +487,8 @@ def selftest():
          "NOISE FLOOR, not an experiment" in text),
         # One company, two vocabularies, one host — counted raw it is two bidders with half
         # the evidence each.
+        ("per-site bidder lists use the same vocabulary as the per-bidder table",
+         "'mytarget'" not in text.split("-- per site --")[1]),
         ("alias table collapses mytarget and MyTarget/VK into one bidder",
          "MyTarget/VK" in res["sites_by_bidder"] and "mytarget" not in res["sites_by_bidder"]),
         # A host named by a placement id can name the same host where the roster was not read.
