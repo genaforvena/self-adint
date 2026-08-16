@@ -1,0 +1,52 @@
+# Stage 0 candidate frame — runet publishers likely to run client-side header bidding.
+# This is a CANDIDATE list, not a corpus: membership is decided by the live pbjs probe,
+# never by this file. Sites are here because they are ad-supported and high-traffic,
+# which is a guess about the population, and the guess is what the probe tests.
+# Chosen across verticals on purpose: if header bidding turns out to be vertical-specific
+# (news vs auto vs tech), a news-only frame would report that as "runet does not run it".
+
+# news / general
+https://lenta.ru/
+https://www.gazeta.ru/
+https://www.rbc.ru/
+https://iz.ru/
+https://www.mk.ru/
+https://aif.ru/
+https://www.kp.ru/
+https://rg.ru/
+https://www.fontanka.ru/
+https://ura.news/
+
+# business / finance
+https://www.vedomosti.ru/
+https://www.kommersant.ru/
+https://quote.rbc.ru/
+
+# tech
+https://www.ixbt.com/
+https://3dnews.ru/
+https://overclockers.ru/
+https://habr.com/ru/
+https://vc.ru/
+https://dtf.ru/
+
+# auto
+https://www.drive2.ru/
+https://www.zr.ru/
+
+# sport
+https://www.sports.ru/
+https://www.championat.com/
+https://www.sport-express.ru/
+
+# lifestyle / reviews / forums — historically the densest ad load
+https://www.woman.ru/
+https://eva.ru/
+https://irecommend.ru/
+https://otzovik.com/
+https://pikabu.ru/
+
+# regional network (Shkulev/Hearst — one owner, many domains; a single wrapper decision
+# here would show up as many "sites" that are really one)
+https://74.ru/
+https://www.e1.ru/

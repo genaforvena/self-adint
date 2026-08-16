@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Stage 0 of prebid-bidder-strategy-study: which sites actually RUN a client-side
+prebid auction, established by reading the live global out of the page.
+
+Why not grep the markup: a `<script src=...prebid...>` in the HTML says a string is
+present, not that an auction runs — the tag may be dead code, geo-gated, consent-gated,
+or injected by a tag manager that never fires. And the inverse is worse: publishers
+load prebid dynamically, so a curl-grep renders a live auction as ABSENT. Both errors
+point the study at the wrong corpus, so the only reading taken here is from a page that
+executed.
+
+Discovery is `window._pbjsGlobals`, not `window.pbjs`: prebid appends its global's NAME
+to that array whatever the publisher renamed it to, so a renamed global (common in
+wrappers) is found rather than counted as absent.
+
+Five outcomes are kept apart on purpose, because collapsing them fabricates a corpus:
+  auction   — a prebid global exists AND bidders were actually asked (events observed)
+  pbjs-idle — the global is there but no auction ran in our window: lazy-loaded on scroll,
+              consent-gated, or simply slower than --settle. NOT a confirmed auction, and
+              NOT an absence either; it is a site to revisit with a longer window.
+  none      — the page loaded with a 2xx and there is demonstrably no prebid global
+  blocked   — the server answered, but with 4xx/5xx. The page did not render, so it says
+              NOTHING about prebid. From this node that is mostly geo: our egress is not
+              in the geo being measured.
+  error     — no usable response at all (timeout, DNS, TLS). NOT evidence of absence.
+Neither `blocked` nor `error` ever counts toward "no prebid here". The first version of
+this tool folded 4xx/5xx into `none` and reported 9 geo-blocked sites as "runet publishers
+without prebid" — the exact fabrication the split exists to prevent.
+
+Output is append-only JSONL to data/pbjs-probe.jsonl; every row carries the egress IP and
+a run index, because this node's egress is NOT in the geo it is measuring and any later
+count has to be able to see that.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(REPO, "data", "pbjs-probe.jsonl")
+
+# Read out of the page after the auction has had time to run. Everything here is a
+# question about what the page DID, never about what its source text contains.
+PROBE_JS = r"""
+() => {
+  const out = {globals: [], prebid: [], adfox: {}, cmp: {}, ua_lang: null};
+  try { out.ua_lang = navigator.language; } catch (e) {}
+
+  // Yandex/Adfox header bidding — its own wrapper, which the study may have to take
+  // apart before prebid columns mean anything on these sites.
+  try {
+    out.adfox = {
+      ya: typeof window.Ya !== 'undefined',
+      adfoxCode: !!(window.Ya && window.Ya.adfoxCode),
+      hb_settings: typeof window.YaHeaderBiddingSettings !== 'undefined',
+      ya_context: typeof window.yaContextCb !== 'undefined',
+    };
+  } catch (e) { out.adfox = {err: String(e)}; }
+
+  try {
+    out.cmp = {
+      tcf: typeof window.__tcfapi === 'function',
+      usp: typeof window.__uspapi === 'function',
+      gpp: typeof window.__gpp === 'function',
+    };
+  } catch (e) { out.cmp = {err: String(e)}; }
+
+  // The honest discovery: prebid records its own global name here regardless of rename.
+  let names = [];
+  try { if (Array.isArray(window._pbjsGlobals)) names = window._pbjsGlobals.slice(); } catch (e) {}
+  // A page may carry the default global without the registry (very old builds).
+  try { if (window.pbjs && names.indexOf('pbjs') === -1) names.push('pbjs'); } catch (e) {}
+  out.globals = names;
+
+  for (const n of names) {
+    const rec = {name: n};
+    let g = null;
+    try { g = window[n]; } catch (e) { rec.err = String(e); }
+    if (!g) { rec.err = rec.err || 'global name registered but object absent'; out.prebid.push(rec); continue; }
+    try { rec.version = g.version || null; } catch (e) {}
+    try { rec.installedModules = Array.isArray(g.installedModules) ? g.installedModules.length : null; } catch (e) {}
+    try { rec.adUnits = Array.isArray(g.adUnits) ? g.adUnits.length : null; } catch (e) {}
+    try { rec.aliases = g.aliasRegistry ? Object.keys(g.aliasRegistry).length : null; } catch (e) {}
+
+    // Which bidders were ASKED, and which answered. getEvents is the record of the
+    // auction itself; getBidResponses only shows what came back, so a bidder that was
+    // called and timed out is invisible there — that distinction is a required column
+    // downstream and is established here.
+    try {
+      const ev = typeof g.getEvents === 'function' ? g.getEvents() : [];
+      rec.events = ev.length;
+      const byType = {};
+      const askedBidders = new Set();
+      const respBidders = new Set();
+      const toBidders = new Set();
+      for (const e of ev) {
+        byType[e.eventType] = (byType[e.eventType] || 0) + 1;
+        try {
+          if (e.eventType === 'bidRequested' && e.args && e.args.bidderCode) askedBidders.add(e.args.bidderCode);
+          if (e.eventType === 'bidResponse' && e.args && e.args.bidderCode) respBidders.add(e.args.bidderCode);
+          if (e.eventType === 'bidTimeout' && Array.isArray(e.args)) e.args.forEach(b => b && b.bidder && toBidders.add(b.bidder));
+        } catch (x) {}
+      }
+      rec.eventTypes = byType;
+      rec.biddersAsked = Array.from(askedBidders).sort();
+      rec.biddersResponded = Array.from(respBidders).sort();
+      rec.biddersTimedOut = Array.from(toBidders).sort();
+    } catch (e) { rec.eventsErr = String(e); }
+
+    // A shape sample only — the real collector comes later. originalCpm/originalCurrency
+    // and floorData are read here to prove up front that this site EXPOSES them; a site
+    // that does not is a site whose numbers would be invalid for the study.
+    try {
+      const br = typeof g.getBidResponses === 'function' ? g.getBidResponses() : {};
+      let n = 0, withOrig = 0, withFloor = 0, cur = {};
+      const sample = [];
+      for (const unit of Object.keys(br)) {
+        const bids = (br[unit] && br[unit].bids) || [];
+        for (const b of bids) {
+          n++;
+          if (b.originalCpm !== undefined) withOrig++;
+          if (b.floorData !== undefined) withFloor++;
+          const c = b.originalCurrency || b.currency || null;
+          if (c) cur[c] = (cur[c] || 0) + 1;
+          if (sample.length < 3) sample.push({
+            bidder: b.bidderCode || b.bidder || null,
+            hasOriginalCpm: b.originalCpm !== undefined,
+            hasFloorData: b.floorData !== undefined,
+            floorEnforced: b.floorData ? !!b.floorData.enforcements : null,
+            ttl: b.ttl || null,
+          });
+        }
+      }
+      rec.bidsReceived = n;
+      rec.bidsWithOriginalCpm = withOrig;
+      rec.bidsWithFloorData = withFloor;
+      rec.currencies = cur;
+      rec.sample = sample;
+    } catch (e) { rec.responsesErr = String(e); }
+
+    try {
+      const cfg = typeof g.getConfig === 'function' ? g.getConfig() : null;
+      if (cfg) {
+        rec.priceGranularity = cfg.priceGranularity || null;
+        rec.currencyCfg = cfg.currency ? (cfg.currency.adServerCurrency || true) : null;
+        rec.floorsCfg = !!cfg.floors;
+        rec.bidderTimeout = cfg.bidderTimeout || null;
+        rec.userSyncEnabled = cfg.userSync ? !!cfg.userSync.syncEnabled : null;
+      }
+    } catch (e) {}
+
+    try {
+      rec.userIds = typeof g.getUserIdsAsEids === 'function'
+        ? (g.getUserIdsAsEids() || []).map(x => x && x.source).filter(Boolean)
+        : null;
+    } catch (e) {}
+
+    out.prebid.push(rec);
+  }
+  return out;
+}
+"""
+
+
+def egress_ip(timeout=15):
+    """The vantage is a column, not a footnote: this node egresses through the router's
+    VPN and is NOT in the geo being measured."""
+    try:
+        r = subprocess.run(["curl", "-s", "--max-time", str(timeout), "https://api.ipify.org"],
+                           capture_output=True, text=True, timeout=timeout + 5)
+        ip = r.stdout.strip()
+        return ip if ip else None
+    except Exception:
+        return None
+
+
+def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
+    row = {
+        # schema 1 folded 4xx/5xx into `none` and had no auction/idle split; rows without
+        # this field are from that run and must not be pooled with these.
+        "schema": 2,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "url": url,
+        "run_idx": run_idx,
+        "egress_ip": ip,
+        "settle_s": settle,
+    }
+    browser = ctx = None
+    try:
+        browser = pw.chromium.launch(headless=not headed)
+        # A fresh context per site: a shared profile would carry ids between sites and
+        # the study's whole point is a FIXED input.
+        ctx = browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = ctx.new_page()
+        t0 = time.time()
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout * 1000)
+        status = resp.status if resp else None
+        row["http_status"] = status
+        row["final_url"] = page.url
+        if status is not None and status >= 400:
+            # The server refused us. Reading "no prebid" off a 403 body is reading an error
+            # page, so the row stops here and is never counted as an absence.
+            row["verdict"] = "blocked"
+            row["load_s"] = round(time.time() - t0, 1)
+            return row
+        # The auction is asynchronous; nothing here is valid until it has had time to run.
+        page.wait_for_timeout(settle * 1000)
+        # Much runet inventory is below the fold and its auction only starts when the slot
+        # approaches the viewport. Without this, a lazy-loading publisher is indistinguishable
+        # from one that runs no auction at all.
+        try:
+            for y in (600, 1600, 3000):
+                page.evaluate(f"window.scrollTo(0,{y})")
+                page.wait_for_timeout(1500)
+            page.evaluate("window.scrollTo(0,0)")
+            page.wait_for_timeout(settle * 1000)
+        except Exception as e:
+            row["scroll_err"] = f"{type(e).__name__}: {str(e)[:120]}"
+        row["load_s"] = round(time.time() - t0, 1)
+        data = page.evaluate(PROBE_JS)
+        row.update(data)
+        if not data.get("globals"):
+            row["verdict"] = "none"
+        else:
+            asked = 0
+            for rec in data.get("prebid") or []:
+                asked += len(rec.get("biddersAsked") or [])
+            # A global we can read is not an auction we observed. Only bidders actually
+            # requested make this site usable for the study.
+            row["verdict"] = "auction" if asked else "pbjs-idle"
+    except Exception as e:
+        row["verdict"] = "error"
+        row["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        try:
+            if ctx:
+                ctx.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+    return row
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("urls", nargs="*", help="URLs to probe")
+    ap.add_argument("--file", help="file with one URL per line (# comments ok)")
+    ap.add_argument("--settle", type=int, default=8, help="seconds to let the auction run")
+    ap.add_argument("--nav-timeout", type=int, default=30)
+    ap.add_argument("--run-idx", type=int, default=0, help="contamination column: which pass this is")
+    ap.add_argument("--out", default=OUT)
+    ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("n/a: no playwright in this interpreter "
+              "(use ~/.venv-browser/bin/python3)", file=sys.stderr)
+        return 2
+
+    if args.test:
+        return selftest(sync_playwright)
+
+    urls = list(args.urls)
+    if args.file:
+        with open(args.file) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    urls.append(line)
+    if not urls:
+        print("no urls", file=sys.stderr)
+        return 2
+
+    ip = egress_ip()
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    counts = {}
+    with sync_playwright() as pw:
+        for i, u in enumerate(urls, 1):
+            row = probe(pw, u, args.settle, args.nav_timeout, ip, args.run_idx, args.headed)
+            counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+            with open(args.out, "a") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            g = ",".join(row.get("globals") or []) or "-"
+            pb = (row.get("prebid") or [{}])[0]
+            asked = len(pb.get("biddersAsked") or [])
+            got = len(pb.get("biddersResponded") or [])
+            to = len(pb.get("biddersTimedOut") or [])
+            ad = row.get("adfox") or {}
+            admark = "adfox" if (ad.get("adfoxCode") or ad.get("hb_settings")) else ("ya" if ad.get("ya") else "-")
+            print(f"[{i}/{len(urls)}] {row['verdict']:9s} {u}  global={g} "
+                  f"asked={asked} resp={got} to={to} bids={pb.get('bidsReceived')} "
+                  f"ya={admark} status={row.get('http_status')}"
+                  + (f"  {row.get('error')}" if row.get("error") else ""))
+            sys.stdout.flush()
+    tally = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    denom = counts.get("auction", 0) + counts.get("pbjs-idle", 0) + counts.get("none", 0)
+    print(f"-- egress {ip} -- {tally} -- observable n={denom} of {len(urls)} "
+          f"(blocked/error say nothing about prebid and are excluded from the denominator)")
+    return 0
+
+
+def selftest(sync_playwright):
+    """Assert the probe reads a REAL prebid global out of a REAL page, and that the three
+    verdicts are actually distinguishable — a probe that cannot tell 'page did not load'
+    from 'no prebid here' would manufacture the corpus it is meant to discover."""
+    ok = True
+    html_pb = (
+        "<html><body><script>"
+        "window._pbjsGlobals=['pbjs'];"
+        "window.pbjs={version:'8.42.0',adUnits:[{code:'a'}],installedModules:['core'],"
+        "getEvents:function(){return ["
+        "  {eventType:'bidRequested',args:{bidderCode:'appnexus'}},"
+        "  {eventType:'bidRequested',args:{bidderCode:'rubicon'}},"
+        "  {eventType:'bidResponse',args:{bidderCode:'appnexus'}},"
+        "  {eventType:'bidTimeout',args:[{bidder:'rubicon'}]}"
+        "];},"
+        "getBidResponses:function(){return {slot1:{bids:[{bidderCode:'appnexus',cpm:1.5,"
+        "originalCpm:1.42,originalCurrency:'USD',floorData:{enforcements:{enforceJS:true}},ttl:300}]}};},"
+        "getConfig:function(){return {bidderTimeout:1200,floors:{},priceGranularity:'dense'};},"
+        "getUserIdsAsEids:function(){return [{source:'id5-sync.com'}];}"
+        "};</script>ok</body></html>"
+    )
+    html_plain = "<html><body>no ads here</body></html>"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context()
+
+        # A page per fixture, never one page reused. set_content rewrites the document but
+        # keeps the SAME window, so globals set by an earlier fixture survive into the next
+        # one: the first version of this test leaked window.pbjs into the "plain page" and
+        # "renamed global" cases and they went red. The leak was in the harness, but the
+        # failure it produced was indistinguishable from the probe over-reporting prebid —
+        # which is exactly the error this probe exists to avoid.
+        def fresh(html):
+            p = ctx.new_page()
+            p.set_content(html)
+            d = p.evaluate(PROBE_JS)
+            p.close()
+            return d
+
+        d = fresh(html_pb)
+        rec = (d.get("prebid") or [{}])[0]
+        checks = [
+            ("global discovered", d.get("globals") == ["pbjs"]),
+            ("version read", rec.get("version") == "8.42.0"),
+            ("asked bidders", rec.get("biddersAsked") == ["appnexus", "rubicon"]),
+            ("responded bidders", rec.get("biddersResponded") == ["appnexus"]),
+            # The required column: a timed-out bidder must NOT be silently folded into no-bid.
+            ("timeout kept separate", rec.get("biddersTimedOut") == ["rubicon"]),
+            ("originalCpm seen", rec.get("bidsWithOriginalCpm") == 1),
+            ("floorData seen", rec.get("bidsWithFloorData") == 1),
+            ("floor enforcement flag", rec.get("sample", [{}])[0].get("floorEnforced") is True),
+            ("currency from originalCurrency", rec.get("currencies") == {"USD": 1}),
+            ("bidderTimeout from config", rec.get("bidderTimeout") == 1200),
+            ("eids read", rec.get("userIds") == ["id5-sync.com"]),
+        ]
+        d2 = fresh(html_plain)
+        checks.append(("plain page yields no globals", d2.get("globals") == []))
+
+        # A renamed global must still be found — the whole reason discovery goes through
+        # _pbjsGlobals rather than window.pbjs.
+        d3 = fresh("<html><body><script>window._pbjsGlobals=['owlbid'];"
+                   "window.owlbid={version:'9.0.0'};</script></body></html>")
+        checks.append(("renamed global found", d3.get("globals") == ["owlbid"]
+                       and (d3.get("prebid") or [{}])[0].get("version") == "9.0.0"))
+
+        # Adfox/Yandex wrapper detection, since a runet corpus may be mostly this.
+        d4 = fresh("<html><body><script>window.Ya={adfoxCode:{}};"
+                   "window.YaHeaderBiddingSettings={biddersMap:{}};</script></body></html>")
+        checks.append(("adfox wrapper detected", (d4.get("adfox") or {}).get("adfoxCode") is True
+                       and (d4.get("adfox") or {}).get("hb_settings") is True))
+        checks.append(("adfox page is not counted as prebid", d4.get("globals") == []))
+
+        ctx.close()
+        browser.close()
+
+    # The error verdict must be reachable and must not read as 'none': a dead host is not
+    # a site without prebid.
+    with sync_playwright() as pw:
+        row = probe(pw, "http://127.0.0.1:9/", 1, 3, None, 0)
+    checks.append(("dead host -> error, not none", row.get("verdict") == "error"))
+    checks.append(("error row carries no false globals", not row.get("globals")))
+
+    # The verdict split is the whole corpus decision, so drive it against a real server
+    # rather than asserting on the classifier's arguments. Three routes, three verdicts.
+    import http.server
+    import socketserver
+    import threading
+
+    IDLE = ("<html><body><script>window._pbjsGlobals=['pbjs'];"
+            "window.pbjs={version:'8.0.0',getEvents:function(){return [];},"
+            "getBidResponses:function(){return {};}};</script>idle</body></html>")
+    LIVE = ("<html><body><script>window._pbjsGlobals=['pbjs'];"
+            "window.pbjs={version:'8.0.0',getEvents:function(){return ["
+            "{eventType:'bidRequested',args:{bidderCode:'betweendigital'}}];},"
+            "getBidResponses:function(){return {};}};</script>live</body></html>")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/403"):
+                body = b"<html><body>Access denied</body></html>"
+                self.send_response(403)
+            elif self.path.startswith("/idle"):
+                body = IDLE.encode()
+                self.send_response(200)
+            else:
+                body = LIVE.encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with sync_playwright() as pw:
+            r403 = probe(pw, f"http://127.0.0.1:{port}/403", 1, 10, None, 0)
+            ridle = probe(pw, f"http://127.0.0.1:{port}/idle", 1, 10, None, 0)
+            rlive = probe(pw, f"http://127.0.0.1:{port}/live", 1, 10, None, 0)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # This is the leg that was missing when the first sweep ran: 9 geo-blocked sites were
+    # counted as publishers without prebid.
+    checks.append(("403 -> blocked, not none", r403.get("verdict") == "blocked"))
+    checks.append(("blocked row reads no page content", "globals" not in r403))
+    # A readable global is not an observed auction.
+    checks.append(("global with no events -> pbjs-idle", ridle.get("verdict") == "pbjs-idle"))
+    checks.append(("bidders asked -> auction", rlive.get("verdict") == "auction"))
+    checks.append(("auction row names the bidder",
+                   (rlive.get("prebid") or [{}])[0].get("biddersAsked") == ["betweendigital"]))
+
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
