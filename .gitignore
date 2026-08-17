@@ -1,4 +1,11 @@
-# nothing from this tree is public — it holds his device identifiers and his profile
+# THIS REPO IS PUBLIC (github.com/genaforvena/self-adint, visibility PUBLIC — check with
+# `gh repo view --json visibility` before trusting this line). Everything tracked here —
+# README, PLAN, CLAUDE.md, docs/, tools/, receiver/, ref/, android/ — is world-readable.
+# What the patterns below keep out is the RAW CAPTURE, which is where his device identifiers
+# and his profile live. They are not a privacy boundary around the whole tree; there is no
+# such boundary. Before committing anything derived from a capture, assume a reader on the
+# internet: quote an advertising ID at the repo's eight-char convention, never in full, and
+# keep IMEI / MSISDN / precise location out of prose entirely.
 *.jsonl
 *.pcap
 .env
