@@ -356,7 +356,7 @@ PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 
 def _curl_ip(env, timeout=15):
     try:
-        r = subprocess.run(["curl", "-s", "--max-time", str(timeout), "https://api.ipify.org"],
+        r = subprocess.run(["curl", "-s", "--max-time", str(timeout), IP_ECHO],
                            capture_output=True, text=True, timeout=timeout + 5, env=env)
         return r.stdout.strip() or None
     except Exception:
@@ -373,23 +373,58 @@ def egress_ips(timeout=15):
     at 77.246.104.228 (Amsterdam). Measuring one and labelling it "our vantage" is how a
     corpus acquires a geo it never had.
     """
-    proxied = _curl_ip(os.environ.copy(), timeout)
+    # The proxied leg is only a MEASUREMENT when a proxy is actually configured. With no
+    # proxy var set, `proxied` and `direct` are the same command with the same environment,
+    # so their equality is a tautology — and the `--via direct` gate below reads that
+    # tautology as "the browser is still going through privoxy" and refuses a run that has no
+    # proxy to go through. That false refusal is not hypothetical: it blocked the 2026-08-18
+    # RU-vantage run, which executes in a network namespace where 127.0.0.1:8118 does not
+    # exist at all. Absent a proxy env there is nothing for the browser to inherit, so the
+    # leak the gate guards against cannot occur; the honest value is None (no evidence),
+    # never a number that makes an unrelated comparison fire.
+    proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY") \
+        or os.environ.get("HTTP_PROXY")
+    proxied = _curl_ip(os.environ.copy(), timeout) if proxy_env else None
     clean = {k: v for k, v in os.environ.items() if k not in PROXY_VARS}
     direct = _curl_ip(clean, timeout)
     return {"egress_ip_proxied": proxied, "egress_ip_direct": direct,
-            "proxy_env": os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY")}
+            "proxy_env": proxy_env,
+            "proxied_leg": "measured" if proxy_env else "n/a: no proxy in this environment"}
 
 
+# The echo host is part of the INSTRUMENT, and on a censored or mangling vantage it can be the
+# one host that does not work. Measured 2026-08-18 from the RU MTS vantage: MTS's own resolvers
+# (212.188.31.154/155) answer api.ipify.org AND example.com with 8.47.69.0 / 8.6.112.0 — the
+# same /24s Google answers with, last octet zeroed — and nothing listens there, so curl and
+# chromium both fail while every .ru host resolves identically. Choosing between "use the
+# subscriber's resolver" and "prove the vantage" is a false choice: keep the resolver, move the
+# echo. --ip-echo does that; it must return a bare IP and nothing else.
 IP_ECHO = "https://api.ipify.org"
 
 
-def browser_egress(ctx, timeout_ms=12000, echo=IP_ECHO):
+# How long the browser is given to read the IP echo. 12s was tuned on a fibre vantage and is
+# NOT a property of the check — on the 2026-08-18 HSDPA vantage curl read the echo in 25s while
+# the browser timed out at 12s, and the gate then refused a run whose exit was perfectly
+# provable. A timeout is not a refusal: the patience must scale with the link, so main() derives
+# this from --nav-timeout unless --echo-timeout says otherwise. The GATE is unchanged — an
+# unread echo still stops the run; only how long we wait before calling it unread moves.
+ECHO_TIMEOUT_MS = 12000
+
+
+def browser_egress(ctx, timeout_ms=None, echo=None):
     """The exit address as the BROWSER sees it. None when the echo cannot be read.
 
     None is not a failure of the arm — it is the absence of evidence about the arm, and it
     must stay distinguishable from a verified match.
     """
     p = None
+    # Both defaults resolve HERE, not in the signature: a default argument is bound once at
+    # def time, so `echo=IP_ECHO` in the signature would pin the module value and silently
+    # ignore --ip-echo.
+    if timeout_ms is None:
+        timeout_ms = ECHO_TIMEOUT_MS
+    if echo is None:
+        echo = IP_ECHO
     try:
         p = ctx.new_page()
         p.goto(echo, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -695,6 +730,14 @@ def main():
                     help="which route the browser takes when there is no --treatment. Naming "
                          "an arm `direct` does NOT make the run direct — the arm is a label "
                          "and this is the switch")
+    ap.add_argument("--ip-echo",
+                    help="URL returning a bare IP, used for BOTH the parent's curl and the "
+                         "browser's read (default https://api.ipify.org). Change it when the "
+                         "vantage's resolver mangles the default's records — see IP_ECHO")
+    ap.add_argument("--echo-timeout", type=int,
+                    help="seconds the browser gets to read the IP echo (default: --nav-timeout, "
+                         "min 12). Raise it on a slow vantage; it changes the patience, not the "
+                         "gate — an unread echo still refuses the run")
     ap.add_argument("--arm-offset", type=int, default=0,
                     help="shift the alternation; use 1 on the next pass so a site does not "
                          "always land in the same arm (see arm_plan)")
@@ -702,6 +745,13 @@ def main():
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
+
+    # Patience for the echo read, in ms. Derived from --nav-timeout so a vantage that needs a
+    # long navigation is not refused for a short echo, with the old 12s as the floor.
+    global ECHO_TIMEOUT_MS, IP_ECHO
+    ECHO_TIMEOUT_MS = max(12, args.echo_timeout or args.nav_timeout) * 1000
+    if args.ip_echo:
+        IP_ECHO = args.ip_echo
 
     try:
         from playwright.sync_api import sync_playwright
