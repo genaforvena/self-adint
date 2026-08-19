@@ -1,10 +1,10 @@
 # stage B frame — produced by tools/adint-frame-stageb, schema 3
 # universe: ru-universe-tranco-V3JQN.tsv (stage A, committed)
 # vantage: nl-direct · settle 8s · no-wrapper re-probed at 45s
-# generated: 2026-08-19T13:17:43Z
+# generated: 2026-08-19T15:30:55Z
 # The REJECTIONS are the other half of this artifact and live in the ledger beside it: frame-stageb-nl-direct-2026-08-19.jsonl
-# ledger tally: ad-serving-only=20 admit=13 blocked=33 no-web-apex=54 no-wrapper=33 rate-limited=1 unreachable=19 ya-generic-only=81
-# re-derived 35 row(s) written under an older stageb_schema: admit->ad-serving-only=7 blocked->blocked=5 error->no-web-apex=7 error->unreachable=1 no-wrapper->no-wrapper=7 rate-limited->rate-limited=1 ya-generic-only->ya-generic-only=7
+# ledger tally (ROWS, duplicates included; the frame below is one row per DOMAIN): ad-serving-only=31 admit=23 blocked=55 no-web-apex=271 no-wrapper=58 rate-limited=1 unreachable=35 ya-generic-only=130
+# re-derived 35 row(s) written under an older stageb_schema (schema1×35 schema3×569): admit->ad-serving-only=7 blocked->blocked=5 error->no-web-apex=7 error->unreachable=1 no-wrapper->no-wrapper=7 rate-limited->rate-limited=1 ya-generic-only->ya-generic-only=7
 # `blocked` / `rate-limited` / `error` are NOT evidence of absent header bidding — they are our own blindness, named.
 rank	domain	wrapper_evidence	settle_used_s	browser_egress_ip
 721	magnit.ru	YaHeaderBiddingSettings(bidders=3)	8	77.246.104.228
@@ -20,3 +20,13 @@ rank	domain	wrapper_evidence	settle_used_s	browser_egress_ip
 4678	liveinternet.ru	YaHeaderBiddingSettings(bidders=8)	8	77.246.104.228
 5813	sportbox.ru	YaHeaderBiddingSettings(bidders=14)	8	77.246.104.228
 6336	playground.ru	YaHeaderBiddingSettings(bidders=0)	8	77.246.104.228
+6494	gazeta.ru	YaHeaderBiddingSettings(bidders=5)	45	77.246.104.228
+6554	smotrim.ru	YaHeaderBiddingSettings(bidders=4)	8	77.246.104.228
+6559	news.ru	YaHeaderBiddingSettings(bidders=13)	8	77.246.104.228
+6648	ntv.ru	YaHeaderBiddingSettings(bidders=14)	8	77.246.104.228
+7007	kino-teatr.ru	YaHeaderBiddingSettings(bidders=12)	8	77.246.104.228
+7751	iamcook.ru	YaHeaderBiddingSettings(bidders=7)	8	77.246.104.228
+7967	championat.ru	YaHeaderBiddingSettings(bidders=2)	8	77.246.104.228
+8172	forbes.ru	YaHeaderBiddingSettings(bidders=2)	8	77.246.104.228
+8457	popcornnews.ru	YaHeaderBiddingSettings(bidders=13)+pbjs:pbjs	8	77.246.104.228
+9251	ngs.ru	YaHeaderBiddingSettings(bidders=25)	8	77.246.104.228

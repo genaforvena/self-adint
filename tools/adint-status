@@ -119,17 +119,54 @@ def frames(include_private):
     return out
 
 
+def run_of(path):
+    """`hb-paired-<run_id>.<arm>.jsonl` -> run_id. The two arms of one cell share it."""
+    b = os.path.basename(path)
+    b = b[len("hb-paired-"):] if b.startswith("hb-paired-") else b
+    return b.split(".")[0]
+
+
+def complete_pairs(by_run_arm):
+    """{run: {arm: {pair_id, ...}}} -> {run: n}, n = pairs present in EVERY arm.
+
+    A pair_id counted inside one arm's file is that arm's ATTEMPT, not a pair: the other
+    arm can refuse the load (vantage unproven) and write nothing, and the id still sits in
+    this file. Measured on the 2026-08-19 day cell — 14 NL loads, 10 RU loads, one id set
+    of 14 in the NL file. Publishing that 14 as `pairs` is the run summary's own defect one
+    layer up, in the table a reader actually sees.
+    """
+    out = {}
+    for run, arms in by_run_arm.items():
+        sets = [ids for ids in arms.values()]
+        out[run] = len(set.intersection(*sets)) if len(sets) > 1 else 0
+    return out
+
+
 def cells(include_private):
     """One paired run = one cell of the schedule."""
     out = []
     pats = [os.path.join(PUB, "hb-paired-*.jsonl")]
     if include_private:
         pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
-    for f in sorted(set(sum([glob.glob(p) for p in pats], []))):
+    files = sorted(set(sum([glob.glob(p) for p in pats], [])))
+    # Both arms are read BEFORE any row is emitted, because a pair is a fact about the cell
+    # and cannot be computed from one arm's file alone.
+    by_run_arm = {}
+    for f in files:
+        ld = [r for r in read_jsonl(f) if r.get("kind") == "load"]
+        if not ld:
+            continue
+        arm = ld[0].get("arm") or os.path.basename(f)
+        by_run_arm.setdefault(run_of(f), {})[arm] = {
+            r["pair_id"] for r in ld if r.get("pair_id")}
+    done = complete_pairs(by_run_arm)
+    for f in files:
         rows = [r for r in read_jsonl(f) if r.get("kind") == "load"]
         if not rows:
             continue
         out.append({
+            "run": run_of(f),
+            "complete_pairs": done.get(run_of(f), 0),
             "file": os.path.basename(f),
             "arm": rows[0].get("arm"),
             "loads": len(rows),
@@ -202,10 +239,15 @@ def block(include_private):
         L += ["### No cell of the schedule has been captured yet.", ""]
     else:
         L += ["### Captured cells", "",
-              "| arm | loads | sites | pairs | window | hours UTC | vantage verified |",
-              "|---|---:|---:|---:|---:|---|---:|"]
+              "`this arm` is what this arm attempted; **`both arms`** is the pair count — "
+              "the ids present in EVERY arm of the cell. They differ exactly when one arm "
+              "refused a load the other recorded, and only the second is a pair.", "",
+              "| cell | arm | loads | sites | this arm | **both arms** | window | "
+              "hours UTC | vantage verified |",
+              "|---|---|---:|---:|---:|---:|---|---|---:|"]
         for c in cl:
-            L.append(f"| `{c['arm']}` | {c['loads']} | {c['sites']} | {c['pairs']} | "
+            L.append(f"| `{c['run']}` | `{c['arm']}` | {c['loads']} | {c['sites']} | "
+                     f"{c['pairs']} | **{c['complete_pairs']}** | "
                      f"{'/'.join(str(w) for w in c['windows'])} s | "
                      f"{','.join(str(h) for h in c['hours'])} | "
                      f"{c['verified']}/{c['loads']} |")
@@ -283,6 +325,47 @@ def selftest():
           "No cell of the schedule has been captured yet" in b, True)
     check("the block is delimited so a splice cannot run away",
           b.startswith(BEGIN) and b.endswith(END), True)
+
+    # ── a pair needs BOTH arms ──
+    # The published `pairs` column was each arm's own id set, so an arm that refused four
+    # loads still published fourteen pairs. The intersection is the only count that is a
+    # fact about the CELL rather than about one of its halves.
+    check("a pair present in one arm only is not a pair",
+          complete_pairs({"c1": {"nl": {"a", "b", "c"}, "ru": {"a", "b"}}}), {"c1": 2})
+    check("a cell with only one arm on disk has no pairs at all, not its own count",
+          complete_pairs({"c1": {"nl": {"a", "b", "c"}}}), {"c1": 0})
+    check("three arms intersect, they do not union",
+          complete_pairs({"c1": {"a": {"x", "y"}, "b": {"x", "y"}, "c": {"y"}}}), {"c1": 1})
+    check("arms that share nothing yield zero, never the smaller arm",
+          complete_pairs({"c1": {"nl": {"a"}, "ru": {"b"}}}), {"c1": 0})
+    check("the run id is the filename between the prefix and the arm",
+          run_of("/x/hb-paired-2026-08-19-day-2026081914.ru.jsonl"),
+          "2026-08-19-day-2026081914")
+
+    # Asserting the FUNCTION is not asserting the TABLE. This drives block() over a two-arm
+    # fixture shaped exactly like the 2026-08-19 day cell — one arm short by one load — and
+    # reads the rendered row, so a tool that computes the intersection and then prints
+    # something else still goes red.
+    for arm, n in (("nl-direct", 3), ("ru-mobile", 2)):
+        with open(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"), "w") as fh:
+            for i in range(n):
+                fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
+                                     "hour_utc": 9, "url": f"https://d{i}.ru/",
+                                     "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                     "pair_id": f"testcell-s{i:03d}"}) + "\n")
+    b = block(False)
+    row = [x for x in b.splitlines() if "`nl-direct`" in x and "`testcell`" in x]
+    check("the rendered NL row exists", len(row), 1)
+    # 3 attempted by this arm, 2 present in both — the table must print both, and the pair
+    # count it emphasises must be the second.
+    check("the table prints this arm's attempts AND the cross-arm pair count",
+          row and row[0].split("|")[5].strip() == "3" and row[0].split("|")[6].strip() == "**2**",
+          True)
+    ru_row = [x for x in b.splitlines() if "`ru-mobile`" in x and "`testcell`" in x]
+    check("the short arm publishes the same pair count, not its own",
+          ru_row and ru_row[0].split("|")[6].strip() == "**2**", True)
+    for arm in ("nl-direct", "ru-mobile"):
+        os.remove(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"))
 
     # A verdict this tool has never heard of must still be COUNTED, not dropped: a table that
     # silently omits an unknown row understates the denominator and flatters the frame.
