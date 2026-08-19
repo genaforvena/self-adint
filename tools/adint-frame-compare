@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Compare two stage-B ledgers taken from different vantages, on the domains BOTH touched.
+
+The question this answers is not decorative. A frame is built by a probe, a probe is run
+from somewhere, and `blocked` is exactly the verdict most likely to differ between a Russian
+and a non-Russian exit address. If it does differ, then a frame built from one vantage
+carries that vantage's blindness into BOTH arms of a paired study — the arms would be
+comparing sites selected by one of them. So the disagreement rate is a property the study
+has to measure rather than assume, in either direction.
+
+It is computed on the INTERSECTION only. A domain one walk has reached and the other has not
+is not a disagreement, it is a difference in progress, and pooling those two would make a
+slow walk look like a censoring vantage.
+
+Verdicts are RE-DERIVED with the current classifier from the stored probe rows, not read from
+the `stageb_verdict` field, so two ledgers written under different schemas can still be
+compared — the comparison is between the pages, not between the days the tools were edited.
+"""
+
+import argparse
+import collections
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def read(path):
+    """First reading per domain wins — a ledger may carry duplicates from concurrent
+    writers, and taking the last would silently prefer whichever walker finished later."""
+    d = {}
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        r = json.loads(line)
+        d.setdefault(r.get("domain"), r)
+    return d
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("a", nargs="?")
+    ap.add_argument("b", nargs="?")
+    ap.add_argument("--quiet", action="store_true", help="only the summary")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not args.a or not args.b:
+        print("usage: adint-frame-compare <ledger-a.jsonl> <ledger-b.jsonl>", file=sys.stderr)
+        return 2
+
+    sb = _load("adint-frame-stageb")
+    A, B = read(args.a), read(args.b)
+    va = next((r.get("vantage") for r in A.values() if r.get("vantage")), "a")
+    vb = next((r.get("vantage") for r in B.values() if r.get("vantage")), "b")
+    both = sorted(set(A) & set(B), key=lambda d: A[d].get("rank") or 0)
+
+    pairs = collections.Counter()
+    diffs = []
+    for d in both:
+        x, y = sb.classify(A[d])[0], sb.classify(B[d])[0]
+        pairs[(x, y)] += 1
+        if x != y:
+            diffs.append((A[d].get("rank"), d, x, y))
+        if not args.quiet:
+            mark = "" if x == y else "   <-- DIFFERS"
+            print(f"{d:24s} {A[d].get('rank') or 0:6d}  {x:17s} {y:17s}{mark}")
+
+    agree = sum(n for (x, y), n in pairs.items() if x == y)
+    n = len(both)
+    print(f"\nvantages: {va} vs {vb}")
+    print(f"intersection: {n} domain(s)  ·  agree {agree}  ·  differ {n - agree}"
+          + (f"  ({100.0*(n-agree)/n:.1f} %)" if n else ""))
+    print(f"reached by {va} only: {len(set(A) - set(B))}  ·  by {vb} only: {len(set(B) - set(A))}"
+          "   (progress, NOT disagreement)")
+    if diffs:
+        print("\ndisagreements:")
+        for rank, d, x, y in diffs:
+            print(f"  #{rank:<6} {d:24s} {va}={x}  {vb}={y}")
+    # The verdict most likely to be geo-shaped gets its own line: a null result here is worth
+    # as much as a positive one and must not be left implicit in a total.
+    bl = [d for d in both
+          if "blocked" in (sb.classify(A[d])[0], sb.classify(B[d])[0])]
+    bl_diff = [d for d in bl if sb.classify(A[d])[0] != sb.classify(B[d])[0]]
+    if bl:
+        print(f"\n`blocked` on either side: {len(bl)} domain(s), of which {len(bl_diff)} "
+              f"differ between the vantages"
+              + ("  — these refusals are not geo-shaped at this depth" if not bl_diff else ""))
+    if n:
+        print("\nCOVERAGE: this is a statement about the intersection above and nothing else. "
+              f"Ranks {min(A[d].get('rank') or 0 for d in both)}–"
+              f"{max(A[d].get('rank') or 0 for d in both)}.")
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    import tempfile
+    d = tempfile.mkdtemp()
+    a, b = os.path.join(d, "a.jsonl"), os.path.join(d, "b.jsonl")
+    common = {"http_status": 200, "content_type": "text/html"}
+    with open(a, "w") as fh:
+        fh.write(json.dumps({"domain": "same.ru", "rank": 1, "vantage": "x", **common}) + "\n")
+        fh.write(json.dumps({"domain": "geo.ru", "rank": 2, "vantage": "x",
+                             "http_status": 403}) + "\n")
+        fh.write(json.dumps({"domain": "onlya.ru", "rank": 3, "vantage": "x", **common}) + "\n")
+        # a duplicate row, as a concurrent writer would leave
+        fh.write(json.dumps({"domain": "same.ru", "rank": 1, "vantage": "x",
+                             "http_status": 403}) + "\n")
+    with open(b, "w") as fh:
+        fh.write(json.dumps({"domain": "same.ru", "rank": 1, "vantage": "y", **common}) + "\n")
+        fh.write(json.dumps({"domain": "geo.ru", "rank": 2, "vantage": "y", **common}) + "\n")
+
+    check("a duplicate row does not change the reading",
+          read(a)["same.ru"]["http_status"], 200)
+    A, B = read(a), read(b)
+    check("the intersection excludes what only one walk reached",
+          sorted(set(A) & set(B)), ["geo.ru", "same.ru"])
+    check("a domain only one walk reached is not counted as a disagreement",
+          "onlya.ru" in (set(A) & set(B)), False)
+    sb = _load("adint-frame-stageb")
+    check("a 403 on one side and a page on the other IS a disagreement",
+          sb.classify(A["geo.ru"])[0] != sb.classify(B["geo.ru"])[0], True)
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
