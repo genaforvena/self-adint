@@ -313,6 +313,8 @@ def main():
                          "only the verdict is re-derived, so a vocabulary that gains a "
                          "distinction does not cost another hour of page loads — and the two "
                          "schemas stay in separate files rather than pooling in one")
+    ap.add_argument("--frame-from", default=None, metavar="LEDGER",
+                    help="write the frame TSV from an existing ledger without walking")
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
@@ -323,9 +325,19 @@ def main():
         return audit_no_wrapper(args)
     if args.reclassify:
         return reclassify(args)
+    if args.frame_from:
+        # Derive the frame TSV from a ledger without walking. The walk writes it at the end;
+        # a study that wants to run a cell against the frame SO FAR should not have to wait
+        # for the walk to finish, and should not hand-copy domains out of a log either.
+        out = args.frame_out or os.path.join(
+            REPO, "ref", f"ru-frame-stageB-{args.vantage or 'unnamed'}-"
+                         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.tsv")
+        write_frame(out, args.frame_from, args)
+        print(f"frame -> {out}")
+        return 0
 
     if not args.vantage:
-        print("adint-frame-stageb: --vantage is required (the label this walk is filed "
+        print("adint-frame-stageb: --vantage is required for a WALK (the label it is filed "
               "under). Refusing to write rows that cannot be attributed to a path.",
               file=sys.stderr)
         return 2
