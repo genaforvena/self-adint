@@ -1,7 +1,8 @@
 # step0d — the first frame built under step0c's rule, and the three places the rule did not survive contact
 
 date: 2026-08-19 · by: the `adint` window · status: **frame walk in progress; the rule was
-corrected twice while running it, and one paired cell was captured.** Every count below is
+corrected twice while running it, one paired cell was captured, and the walk's own first
+null result expired on schedule (§4).** Every count below is
 re-derivable — the commands are named beside each claim. Tallies are deliberately NOT typed
 in: run `python3 tools/adint-status` and `tools/adint-frame-compare`, which read the ledgers
 on disk. A number typed into prose is true on the day it is typed.
@@ -94,30 +95,53 @@ which is why every non-admitting verdict describing a page we actually saw is re
 the full 45 s window before being written down. Two attempts, not one — and they are not
 independent (same vantage, minutes apart), so the residual miss rate is real and unquantified.
 
-## 4. The frame is NOT vantage-dependent at this depth — a null result, stated as one
+## 4. The frame IS vantage-dependent, and the hole falls exactly on the publishers
 
 `blocked` is the verdict most likely to be geo-shaped, and a frame built from one vantage
 would carry that vantage's blindness into *both* arms of a paired study. So the walk is run
 from both.
 
-On the **43 domains both walks had reached** (ranks 13–865): **42 agree, 1 differs (2.3 %).**
-Every `blocked` verdict is identical from Amsterdam and from a Moscow MTS address —
-`okcdn.ru` 403, `vkuserphoto.ru` 418, `ozon.ru` 403, `wildberries.ru` 498 among them. At this
-depth those refusals are **bot detection, not geography**.
+**The first reading said no.** At 43 domains reached by both walks (ranks 13–865): 42 agreed,
+1 differed, and every `blocked` verdict was identical from Amsterdam and from Moscow. That
+was reported as a null result — with its coverage bound stated in the same breath: *"that
+rank band is infrastructure, telecoms and marketplaces; the cases most likely to be
+geo-shaped are news publishers above rank 1100, which the Moscow walk has not reached."*
 
-The single disagreement is `cdnvideo.ru` (#615), `no-wrapper` from Amsterdam against
-`ya-generic-only` from Moscow — a difference between two *rejection* reasons on a CDN, not a
-difference in access. Nothing in the intersection turns on which side of the border we stood.
+**Two hundred ranks later the caveat expired exactly as written.** At 63 domains (ranks
+13–1347): **59 agree, 4 differ (6.3 %)** — and the headline understates it.
 
-**Coverage binds the claim.** That rank band is infrastructure, telecoms and marketplaces.
-The cases most likely to be geo-shaped are news publishers above rank 1100, where the NL walk
-already records `rbc.ru` 401 and `gismeteo.ru` 403 — and the RU walk has not reached them.
-The comparison is computed on the intersection only: a domain one walk has reached and the
-other has not is a difference in *progress*, and pooling those would make a slow walk look
-like a censoring vantage.
+| rank | domain | `nl-direct` | `ru-mobile` |
+|---:|---|---|---|
+| #615 | `cdnvideo.ru` | `no-wrapper` | `ya-generic-only` |
+| **#1163** | **`rbc.ru`** | **`blocked` (401)** | **`admit` — 10 bidders** |
+| **#1169** | **`gismeteo.ru`** | **`blocked` (403)** | **`admit` — 2 bidders** |
+| #1315 | `russianpost.ru` | `unreachable` | `no-web-apex` |
 
-    tools/adint-frame-compare data/frame-stageb-nl-direct-<date>.jsonl \
-                              data/frame-stageb-ru-mobile-<date>.jsonl
+Two of the seven domains where either vantage said `blocked` **become admissions from the
+other side**. `rbc.ru` and `gismeteo.ru` are real publishers running real header-bidding
+auctions with readable bidder rosters, and from Amsterdam they do not appear to exist.
+
+**This is not a rounding error in a frame. It is a hole in it, and it falls precisely on the
+class of site the study is about.** The other two disagreements are between *rejection*
+reasons and change nothing; these two change the frame's membership.
+
+**Consequences, and they bind the design rather than decorating it:**
+
+1. **The frame must be built from the RU vantage**, or from the union of both with every
+   disagreement published. An `nl-direct` frame is a frame of *Russian sites Amsterdam is
+   allowed to load*, which is a different population and never says so.
+2. **A paired study on an NL-built frame compares the arms on sites selected by one of
+   them** — and the excluded ones are systematically the news publishers, i.e. exactly where
+   display demand concentrates.
+3. **`blocked` counts are not portable between vantages.** Any rejection-ledger statistic must
+   carry the vantage it was measured from, which it now does per row.
+
+Note what worked here: nothing was retracted, because the earlier claim was never made
+larger than its evidence. The coverage bound was doing real work, and it is the reason this
+reads as a claim expiring on schedule rather than as a result being reversed.
+
+    tools/adint-frame-compare data/frame-stageb-nl-direct-<date>-schema3.jsonl \
+                              data/frame-stageb-ru-mobile-<date>-schema3.jsonl
 
 ## 5. The paired cell: the channel confound is not a caveat, it is the whole signal
 
@@ -205,6 +229,9 @@ as evidence — never as admission criteria, since the study's object is Adfox a
 
 ## 7. What this changes in step0c
 
+0. **§2.5 gains a frame clause: the FRAME is a measurement from a vantage, not just the
+   capture.** It must be built from the RU vantage or from the published union of both, and
+   every rejection statistic carries the vantage it was taken from (see §4).
 1. **§1.4's condition (ii) is replaced.** Admission requires an auction configuration, not an
    advertising global. The intermediate population is preserved as `ad-serving-only`.
 2. **§1.6's category source is upgraded from "open" to load-bearing.** Unstratified, the walk

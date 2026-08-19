@@ -507,23 +507,69 @@ def build(d, generated):
     # ── vantage agreement
     if len(fr) > 1:
         a, b = fr[0], fr[1]
-        common = (set(r["domain"] for r in a["rows"]) & set(r["domain"] for r in b["rows"]))
         va = {r["domain"]: r.get("stageb_verdict") for r in a["rows"]}
         vb = {r["domain"]: r.get("stageb_verdict") for r in b["rows"]}
+        common = sorted(set(va) & set(vb))
         differ = [d for d in common if va[d] != vb[d]]
+        # The verdict that matters is `blocked`, and specifically a `blocked` that turns into
+        # an ADMISSION from the other side: that is a real site the first vantage cannot see
+        # at all, and it does not average out — it is missing from the frame.
+        flips = [d for d in differ
+                 if "blocked" in (va[d], vb[d]) and "admit" in (va[d], vb[d])]
+        blocked_diff = [d for d in differ if "blocked" in (va[d], vb[d])]
+        lo = min([r.get("rank") or 0 for r in a["rows"] if r["domain"] in common] or [0])
+        hi = max([r.get("rank") or 0 for r in a["rows"] if r["domain"] in common] or [0])
         A('<section>')
-        A('<span class="status">Measured · a null result</span>')
-        A('<h2>The frame is not an artefact of where we stand — so far</h2>')
-        A(f'<p>A frame built from one vantage would carry that vantage’s blindness into both '
-          f'arms of a paired study, and <code>blocked</code> is the verdict most likely to be '
-          f'geo-shaped. On the <strong>{len(common)}</strong> domains both walks reached, the '
-          f'Amsterdam and Moscow vantages returned <strong>{len(common)-len(differ)}</strong> '
-          f'identical verdicts and <strong>{len(differ)}</strong> different ones.</p>')
-        A('<p class="note">Coverage binds this. That rank band is infrastructure and '
-          'marketplaces; the cases most likely to be geo-shaped are news publishers further '
-          'down, which the Moscow walk has not reached. A domain one walk has reached and the '
-          'other has not is a difference in <em>progress</em>, and is excluded — pooling '
-          'those would make a slow walk look like a censoring vantage.</p>')
+        # THE CLAIM IS DERIVED, NOT TYPED. An earlier version of this page carried the
+        # sentence "not an artefact of where we stand — so far" as prose, written when the
+        # walk had reached rank 865 and the vantages agreed 25/25. Two hundred ranks later
+        # they did not, and the prose would have gone on asserting a tie. A page that
+        # regenerates its numbers and not its conclusions is worse than one that regenerates
+        # neither, because it looks current.
+        if flips:
+            A('<span class="status">Measured · the frame depends on where we stand</span>')
+            A('<h2>A frame built from one vantage silently omits real sites</h2>')
+            A(f'<p>Across the <strong>{len(common)}</strong> domains both walks reached '
+              f'(ranks {lo}–{hi}), the two vantages returned '
+              f'<strong>{len(common)-len(differ)}</strong> identical verdicts and '
+              f'<strong>{len(differ)}</strong> different ones. That headline understates it. '
+              f'<strong>{len(flips)}</strong> domain'
+              f'{"s were" if len(flips) != 1 else " was"} refused outright from one vantage '
+              f'and <em>admitted to the frame</em> from the other — real publishers running '
+              f'real auctions that one observer cannot see exist.</p>')
+            A('<div class="tablewrap"><table><thead><tr><th>rank</th><th>domain</th>'
+              f'<th>{html.escape(a["vantage"])}</th><th>{html.escape(b["vantage"])}</th>'
+              '</tr></thead><tbody>')
+            rank_of = {r["domain"]: r.get("rank") for r in a["rows"]}
+            for d in sorted(differ, key=lambda d: rank_of.get(d) or 0):
+                hot = ' style="font-weight:600"' if d in flips else ""
+                A(f'<tr{hot}><td class="n">#{rank_of.get(d)}</td>'
+                  f'<td><code>{html.escape(d)}</code></td>'
+                  f'<td><span class="dot sw-{VERDICT_CLASS.get(va[d], DOMAIN)}"></span>'
+                  f'<code>{html.escape(va[d] or "")}</code></td>'
+                  f'<td><span class="dot sw-{VERDICT_CLASS.get(vb[d], DOMAIN)}"></span>'
+                  f'<code>{html.escape(vb[d] or "")}</code></td></tr>')
+            A('</tbody></table></div>')
+            A(f'<p class="note">Of {len(blocked_diff)} domains where either vantage said '
+              f'<code>blocked</code> and they disagreed, {len(flips)} became admissions from '
+              f'the other side. This is not a rounding error in a frame — it is a hole in it, '
+              f'and it falls exactly on the class of site the study is about. An earlier pass '
+              f'of this walk found the vantages agreeing 25 out of 25 and reported no '
+              f'dependence, binding that claim to its rank band; the band was infrastructure '
+              f'and marketplaces. The disagreements begin where the publishers do.</p>')
+        else:
+            A('<span class="status">Measured · a null result</span>')
+            A('<h2>The frame does not depend on where we stand — within this band</h2>')
+            A(f'<p>Across the <strong>{len(common)}</strong> domains both walks reached '
+              f'(ranks {lo}–{hi}), the vantages returned '
+              f'<strong>{len(common)-len(differ)}</strong> identical verdicts and '
+              f'<strong>{len(differ)}</strong> different ones, with no refusal on one side '
+              f'becoming an admission on the other.</p>')
+            A('<p class="note">Coverage binds this, and the binding is not a formality: the '
+              'claim is about the ranks walked so far and nothing beyond them.</p>')
+        A('<p class="note">A domain one walk has reached and the other has not is a difference '
+          'in <em>progress</em>, and is excluded — pooling those would make a slow walk look '
+          'like a censoring vantage.</p>')
         A('</section>')
 
     # ── blindness
@@ -662,6 +708,34 @@ def selftest():
 
     page = build(gather(), "TEST")
     check("the page names itself", "<title>" in page, True)
+    # The vantage section's CONCLUSION must follow the data, not a sentence typed once. Drive
+    # both branches from synthetic ledgers: a tie must not claim dependence, and a
+    # blocked->admit flip must not go on claiming a null result.
+    def _vsec(pairs):
+        global gather
+        real = gather
+        rows_a = [{"domain": d, "rank": i * 10, "vantage": "va", "stageb_verdict": x}
+                  for i, (d, x, _y) in enumerate(pairs, 1)]
+        rows_b = [{"domain": d, "rank": i * 10, "vantage": "vb", "stageb_verdict": y}
+                  for i, (d, _x, y) in enumerate(pairs, 1)]
+        mk = lambda v, rows: {"file": v, "vantage": v, "public": True, "rows": rows,
+                              "tally": collections.Counter(r["stageb_verdict"] for r in rows),
+                              "admitted": [], "ranks": [r["rank"] for r in rows],
+                              "egress": []}
+        gather = lambda: {"frames": [mk("va", rows_a), mk("vb", rows_b)], "cells": [],
+                          "pairs": []}
+        out = build(gather(), "T")
+        gather = real
+        return out
+    tie = _vsec([("a.ru", "blocked", "blocked"), ("b.ru", "admit", "admit")])
+    check("agreeing vantages report a null result",
+          "does not depend on where we stand" in tie, True)
+    check("a null result does not claim a hole", "silently omits" in tie, False)
+    flip = _vsec([("a.ru", "blocked", "admit"), ("b.ru", "admit", "admit")])
+    check("a blocked-to-admit flip is reported as a hole in the frame",
+          "silently omits real sites" in flip, True)
+    check("a flip does not go on claiming a null result",
+          "does not depend on where we stand" in flip, False)
     check("identity is never colour alone — the legend is present",
           'class="legend"' in page, True)
     print("selftest: " + ("ok" if ok else "FAIL"))
