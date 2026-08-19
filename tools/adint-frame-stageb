@@ -260,21 +260,22 @@ def read_universe(path):
 
 def already_touched(ledger):
     """Resume without re-probing. The walk is long and a restart that re-pays for every
-    earlier domain is a walk that never finishes on a slow vantage."""
+    earlier domain is a walk that never finishes on a slow vantage.
+
+    THE VERDICTS ARE RE-DERIVED, because the caller counts `admit` here against
+    `--admit-max`: a walk resumed after its own classifier was fixed would otherwise stop on
+    a count of verdicts the current rule no longer gives. Measured on the 2026-08-19 nl
+    ledger — 20 stored admits, 13 under the current rule — so the documented
+    `--admit-max 20` would have halted the walk at once, and the frame would have read as
+    COMPLETE at 20 while holding 13. The producer reads its own ledger too; writing a file
+    does not exempt you from the rule about reading one.
+    """
     seen = {}
     if not os.path.exists(ledger):
         return seen
-    with open(ledger, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if r.get("domain"):
-                seen[r["domain"]] = r.get("stageb_verdict")
+    for r in load_rows(ledger)[0]:
+        if r.get("domain"):
+            seen[r["domain"]] = r.get("stageb_verdict")
     return seen
 
 
@@ -843,6 +844,17 @@ def selftest():
     check("an unstamped row is treated as stale, not as current",
           [l for l in open(os.path.join(_d, "f3.tsv")).read().splitlines()
            if not l.startswith("#")][1:], [])
+
+    # RESUME reads the ledger too, and its count of `admit` is what `--admit-max` stops on.
+    _led4 = os.path.join(_d, "resume.jsonl")
+    with open(_led4, "w") as fh:
+        fh.write(json.dumps(_stale) + "\n")
+        fh.write(json.dumps(_fresh) + "\n")
+    _seen = already_touched(_led4)
+    check("resume re-derives, so --admit-max cannot count a retired admission",
+          sorted(v for v in _seen.values() if v == "admit"), ["admit"])
+    check("and the stale row is still SEEN, so resume does not re-probe it",
+          sorted(_seen), ["adserving.ru", "hb.ru"])
 
     # The universe must parse, and it must be the file the document pins.
     u = read_universe(UNIVERSE)
