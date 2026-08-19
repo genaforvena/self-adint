@@ -4,7 +4,10 @@ date: 2026-08-19 · by: the `adint` window · status: **frame walk in progress; 
 corrected twice while running it, one paired cell was captured, and the walk's own first
 null result expired on schedule (§4). §9 adds the second cell — the first against the
 CANONICAL frame — and the three instrument defects it exposed, one of which silently cost
-that cell four of its fourteen RU loads.** Every count below is
+that cell four of its fourteen RU loads. §10 is the verdict the fixed instrument then
+delivered on the VANTAGE: the phone's RTT straddles the wrapper's own deadline, so the RU
+arm's dominant outcome column is unreadable and §2.3's schedule must not be run against
+it.** Every count below is
 re-derivable — the commands are named beside each claim. Tallies are deliberately NOT typed
 in: run `python3 tools/adint-status` and `tools/adint-frame-compare`, which read the ledgers
 on disk. A number typed into prose is true on the day it is typed.
@@ -454,3 +457,73 @@ than trust the id.
 Nothing here is a result about the Russian market. The frame holds fourteen sites, the study
 holds ten complete pairs from one zone, and §2.3's design asks for 4480 loads per arm. Every
 fix above makes the instrument's own failures countable; none of them makes the sample bigger.
+
+---
+
+## 10. The vantage cannot answer the question, and the auction data is how we know
+
+§9 fixed the instrument. This section is about what the fixed instrument then showed, which
+is a verdict on the **vantage** rather than on any tool: **a tethered HSDPA phone cannot
+observe an auction whose deadline is the same order as its own round-trip time.**
+
+### 10.1 The contrast that looks like a finding
+
+Evening cell, 14 sites × 4 replicates, both arms launched simultaneously per site, identical
+45 s window, read by `tools/adint-hb-report`:
+
+| arm | rendered | dominant outcome | ever returned a price |
+|---|---:|---|---:|
+| `nl-direct` | 44/56 | **`no-bid`** — MyTarget/VK 34 vs 2, adriver 24 vs 2, roxot 16 vs 0 | 4 |
+| `ru-mobile` | 30/56 | **`no-answer`** — adriver 3 vs 12, sape 0 vs 10, betweendigital 0 vs 9 | **0** |
+
+Read carelessly this says Russian SSPs answer a Dutch datacenter and ignore a Russian phone.
+It is one of the most publishable-looking things this study has produced and it is an
+artifact of our own channel.
+
+### 10.2 The latencies make the mechanism visible
+
+Among the bidders that **did** answer, median response time:
+
+```
+ru-mobile   614 – 944 ms        the wrapper's own deadline: 700 – 1000 ms
+nl-direct   346 – 524 ms
+```
+
+The RU responses sit **at the publisher's deadline**. The bidders recorded as answering are
+the ones that just made it; everything slower is recorded as silence. And note why
+`after-deadline` reads ≈0 on *both* arms — a late answer is not recorded as late, it is
+recorded as **absent**. The column that would have named this confound cannot see it.
+
+This confirms at n=56 per arm what `step0b` §"the confound this treatment carries" asserted
+from a single pair, and it upgrades the claim: it is not merely that the channel *could*
+explain the difference, it is that the RU arm's response times straddle the exact threshold
+the outcome column is computed against.
+
+### 10.3 What follows for §2.3's schedule
+
+**Running the 14-day, 8960-load schedule against this vantage would buy 4480 RU loads whose
+dominant outcome column is unreadable.** The fixes in §9 make the instrument honest; they do
+not make the phone fast. Nothing in more replicates addresses a confound that lives in the
+millisecond budget of every single load.
+
+What the phone is still the only source for: a genuinely Russian *mobile subscriber* identity
+— the SIM, the carrier resolver, the operator's address space. What it cannot do is meet a
+1 s auction deadline. Those are separable, and the study should stop asking one device for
+both:
+
+1. **A Russian vantage on a fast link** (VPS in RU, or a residential fixed line) becomes the
+   measurement arm. Its RTT must be small against the wrapper deadline, and that should be
+   *measured and published beside every cell*, not assumed.
+2. **The phone stays** for what genuinely needs a mobile subscriber, and for exactly the
+   comparisons where a slow link is not disqualifying.
+3. **Publish the RTT/deadline ratio as a coverage statistic.** A cell whose arm RTT is a
+   large fraction of the wrapper deadline cannot report `no-answer` as a fact about a bidder,
+   and the reader should be able to see that from the table rather than from this paragraph.
+
+### 10.4 A second limit, smaller but worth knowing now
+
+The NL arm returned **4 priced bids across ~280 candidate requests**. `adint-hb-report` says
+it plainly — "ONE curve, not a set of shapes" — so **price-distribution analysis is
+unsupported on either arm**, independently of the vantage problem. A study that promised
+price shape per DSP would have discovered this after fourteen days instead of after two
+cells.
