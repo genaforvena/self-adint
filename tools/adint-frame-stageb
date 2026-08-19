@@ -72,6 +72,7 @@ observability, not about the publisher.
 
 import argparse
 import collections
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -335,6 +336,26 @@ def main():
     frame_out = args.frame_out or os.path.join(
         REPO, "ref", f"ru-frame-stageB-{args.vantage}-{day}.tsv")
 
+    # SINGLE WRITER PER LEDGER. Learned the hard way 2026-08-19: three RU walks ran at once
+    # for several minutes, all appending to one file. The launcher shells had been killed and
+    # the message said "Session terminated, killing shell" — which is about the SHELL, not
+    # about the walk, and the walks outlived it. Nothing in the ledger said so; the only
+    # symptom was one domain appearing three times, and a longer overlap would have produced a
+    # ledger whose verdict counts were silently inflated by however many walkers there were.
+    # The lock is non-blocking and its failure is LOUD and non-zero — a lock bounce that exits
+    # 0 hides a total shutout, which is the same class of lie as a silent fallback.
+    lockp = ledger + ".lock"
+    lockf = open(lockp, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"adint-frame-stageb: another walk already holds {os.path.basename(lockp)} — "
+              f"refusing to be a second writer on one ledger. Stop it, or pass a different "
+              f"--ledger.", file=sys.stderr)
+        return 1
+    lockf.write(f"{os.getpid()}\n")
+    lockf.flush()
+
     probe_mod = _load("adint-pbjs-probe")
     cap_mod = _load("adint-hb-capture")
 
@@ -519,12 +540,23 @@ def reclassify(args):
     out = src.replace(".jsonl", "") + f"-schema{SCHEMA}.jsonl"
     n = 0
     changed = collections.Counter()
+    # DEDUPE HERE, not in the ledger. The ledger is append-only and is the record of what was
+    # actually done, duplicates included; the DATASET is one row per domain. Collapsing at
+    # derivation keeps both true, and the count of collapsed rows is printed rather than
+    # silently absorbed — a dedupe that says nothing looks exactly like a clean run.
+    seen_dom = set()
+    dupes = 0
     with open(src, encoding="utf-8") as fh, open(out, "w", encoding="utf-8") as w:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
             r = json.loads(line)
+            d = r.get("domain")
+            if d in seen_dom:
+                dupes += 1
+                continue
+            seen_dom.add(d)
             before = r.get("stageb_verdict")
             v, ev = classify(r)
             if v != before:
@@ -536,6 +568,9 @@ def reclassify(args):
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
             n += 1
     print(f"{n} row(s) reclassified at schema {SCHEMA} -> {out}")
+    if dupes:
+        print(f"  collapsed {dupes} duplicate row(s) — the same domain appeared more than "
+              f"once in the ledger (concurrent writers); the dataset keeps the FIRST reading")
     if changed:
         for k, v in changed.most_common():
             print(f"  {k}: {v}")
@@ -554,7 +589,12 @@ def write_frame(path, ledger, args):
                     rows.append(json.loads(line))
                 except Exception:
                     pass
-    adm = [r for r in rows if r.get("stageb_verdict") == "admit"]
+    adm, seen_dom = [], set()
+    for r in rows:
+        if r.get("stageb_verdict") != "admit" or r.get("domain") in seen_dom:
+            continue
+        seen_dom.add(r.get("domain"))
+        adm.append(r)
     adm.sort(key=lambda r: r.get("rank", 10**9))
     tally = {}
     for r in rows:
@@ -674,6 +714,26 @@ def selftest():
     check("an HB config with an empty roster still admits",
           classify({"http_status": 200, "content_type": "text/html",
                     "adfox_hb": {"present": True, "bidders": []}})[0], "admit")
+
+    # A ledger written by two walkers at once must derive to ONE row per domain — and the
+    # frame must not list a domain twice, which would double its weight in every later count.
+    import tempfile as _tf
+    _d = _tf.mkdtemp()
+    _led = os.path.join(_d, "l.jsonl")
+    with open(_led, "w") as fh:
+        for i in range(3):
+            fh.write(json.dumps({"domain": "dup.ru", "rank": 10, "stageb_verdict": "admit",
+                                 "wrapper_evidence": ["x"], "settle_used_s": 8,
+                                 "browser_egress_ip": "1.2.3.4"}) + "\n")
+        fh.write(json.dumps({"domain": "one.ru", "rank": 11, "stageb_verdict": "admit",
+                             "wrapper_evidence": ["x"], "settle_used_s": 8,
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+    class _A:
+        universe = UNIVERSE; vantage = "t"; settle = 8; recheck_settle = 45
+    write_frame(os.path.join(_d, "f.tsv"), _led, _A())
+    _lines = [l for l in open(os.path.join(_d, "f.tsv")) if not l.startswith("#")][1:]
+    check("a domain duplicated by concurrent writers is listed once in the frame",
+          len(_lines), 2)
 
     # The universe must parse, and it must be the file the document pins.
     u = read_universe(UNIVERSE)
