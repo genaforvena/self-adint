@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Run one CELL of the step0c schedule: the same sites, in the same randomised order, from
+both vantages, paired site by site.
+
+    tools/adint-paired-run --frame ref/ru-frame-stageB-nl-direct-<date>.tsv \
+        --replicates 1 --window 45 --seed 20260819
+
+WHY A RUNNER AND NOT TWO SHELLS
+§2.4 requires the pair to be SIMULTANEOUS — "the same site at the same minute" — because on
+a market where floors move, same-hour-but-not-same-minute is not a pair. Two independent
+walks cannot deliver that, and the reason is §3's own finding: the arms differ in CHANNEL.
+The RU arm rides HSDPA and takes two to three times as long per load as the datacenter arm,
+so two lists started together drift apart monotonically, and by the tail of a 20-site walk
+the "pair" is an hour apart. **The schedule's simultaneity requirement and its channel
+design are in tension, and nothing in the data would say so** — both rows would carry
+honest timestamps and a later reader would join them on a key that quietly means "the same
+position in two walks that diverged".
+
+So the pair is a BARRIER: both arms are launched on one site at once and the next site does
+not start until both have returned. The fast arm idles; that idle time is the price of the
+pair actually being one. The realised skew is measured and printed per pair — a pair is a
+claim about simultaneity, and a claim carries its number.
+
+ORDER
+Site order is randomised per run from a seed that is recorded in the run log (§2.4), and
+BOTH arms receive the identical order — the pair key is positional, so a differing order
+would not mismatch loudly, it would silently pair different sites. The order is written to
+the log before the run, so it is checkable afterwards rather than trusted.
+
+VANTAGES
+The RU arm runs inside the `ruvantage` netns (Note3 USB tether, MTS). A netns is used rather
+than a routing rule because Chromium cannot bind a socket to an interface, so an `oif` rule
+can never catch it; inside a namespace every process is on the tether by construction. The
+NL arm runs in the root namespace. Each arm's browser reads its own egress and hb-capture
+refuses a load it cannot verify — a label is not a route.
+"""
+
+import argparse
+import json
+import os
+import random
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PY = os.path.expanduser("~/.venv-browser/bin/python3")
+CAPTURE = os.path.join(REPO, "tools", "adint-hb-capture")
+
+# MSK zones of §2.2, stored in UTC. The market's clock is Moscow's; the label is derived
+# from the wall clock at the START of the cell and recorded, never inferred later.
+def zone_msk(dt):
+    h = (dt.hour + 3) % 24
+    if h < 6:
+        return "night"
+    if h < 12:
+        return "morning"
+    if h < 18:
+        return "day"
+    return "evening"
+
+
+def read_frame(path):
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            p = line.split("\t")
+            if len(p) < 2 or p[0] == "rank":
+                continue
+            out.append(p[1])
+    return out
+
+
+def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None):
+    inner = [PY, CAPTURE, url, "--settle", str(window), "--nav-timeout", str(nav_timeout),
+             "--arm", arm, "--via", "direct", "--pair-prefix", pair_prefix, "--out", out]
+    if netns:
+        # runuser drops back to the user INSIDE the namespace; HOME is passed explicitly
+        # because `sudo ip netns exec` does not carry it and playwright's browser path is
+        # under it — a missing HOME here fails as "browser not installed", which reads as a
+        # broken install rather than a lost variable.
+        return ["sudo", "ip", "netns", "exec", netns, "runuser", "-u", os.environ.get("USER", "mesh-home"),
+                "--", "env", f"HOME={os.path.expanduser('~')}",
+                f"PATH={os.environ.get('PATH','')}"] + inner
+    return inner
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    # NOT `required=True`: that makes --test unrunnable without naming a frame, and a self
+    # test that cannot be invoked on its own is a self test nobody runs. Enforced below,
+    # where the distinction between a real run and a test is actually known.
+    ap.add_argument("--frame", default=None)
+    ap.add_argument("--replicates", type=int, default=1)
+    ap.add_argument("--window", type=int, default=45,
+                    help="window_s, fixed at 45 for every arm of the study (§2.1)")
+    ap.add_argument("--nav-timeout", type=int, default=120)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--sites", type=int, default=0, help="cap the site count (0 = the frame)")
+    ap.add_argument("--ru-netns", default="ruvantage")
+    ap.add_argument("--ru-arm", default="ru-mobile")
+    ap.add_argument("--nl-arm", default="nl-direct")
+    ap.add_argument("--out-prefix", default=None)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if not args.frame:
+        print("adint-paired-run: --frame is required for a real run", file=sys.stderr)
+        return 2
+
+    t_start = datetime.now(timezone.utc)
+    day = t_start.strftime("%Y-%m-%d")
+    zone = zone_msk(t_start)
+    seed = args.seed if args.seed is not None else int(t_start.strftime("%Y%m%d%H"))
+    run_id = f"{day}-{zone}-{seed}"
+    prefix = args.out_prefix or os.path.join(REPO, "data", f"hb-paired-{run_id}")
+    out_ru, out_nl = f"{prefix}.ru.jsonl", f"{prefix}.nl.jsonl"
+    logp = f"{prefix}.run.log"
+
+    sites = read_frame(args.frame)
+    if args.sites:
+        sites = sites[:args.sites]
+    rng = random.Random(seed)
+    order = sites[:]
+    rng.shuffle(order)
+
+    log = open(logp, "a", encoding="utf-8")
+
+    def say(msg):
+        line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+        print(line, flush=True)
+        log.write(line + "\n")
+        log.flush()
+
+    say(f"run_id={run_id} zone_msk={zone} seed={seed} window_s={args.window} "
+        f"replicates={args.replicates} frame={os.path.basename(args.frame)} n_sites={len(order)}")
+    # The order is written BEFORE the run, so "both arms got the same list" is checkable
+    # from the artifact instead of being a property of this process's memory.
+    say("order=" + ",".join(order))
+
+    skews = []
+    for rep in range(1, args.replicates + 1):
+        for idx, domain in enumerate(order, 1):
+            url = f"https://{domain}/"
+            pp = f"{run_id}-r{rep}-s{idx:03d}"
+            t0 = time.time()
+            procs = {}
+            for arm, out, ns in ((args.nl_arm, out_nl, None),
+                                 (args.ru_arm, out_ru, args.ru_netns)):
+                cmd = arm_cmd(arm, url, out, args.window, args.nav_timeout, pp, ns)
+                procs[arm] = (subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.PIPE), time.time())
+            done = {}
+            for arm, (pr, tlaunch) in procs.items():
+                err = pr.communicate()[1]
+                done[arm] = (pr.returncode, round(time.time() - tlaunch, 1),
+                             (err or b"").decode("utf-8", "replace")[-200:])
+            skew = round(abs(done[args.nl_arm][1] - done[args.ru_arm][1]), 1)
+            skews.append(skew)
+            say(f"rep{rep} [{idx}/{len(order)}] {domain} pair={pp} "
+                + " ".join(f"{a}=rc{done[a][0]}/{done[a][1]}s" for a in done)
+                + f" barrier_wait={skew}s total={round(time.time()-t0,1)}s")
+            for a, (rc, _, err) in done.items():
+                if rc != 0 and err.strip():
+                    say(f"    {a} stderr: {err.strip()[:200]}")
+
+    say(f"done · pairs={len(skews)} · median arm-duration gap="
+        f"{sorted(skews)[len(skews)//2] if skews else 'na'}s")
+    say(f"out ru={out_ru} nl={out_nl}")
+    log.close()
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    from datetime import datetime as dt
+    # Zones are MSK, and the UTC boundaries are where a naive local-time reading goes wrong.
+    check("21:00 UTC is MSK night", zone_msk(dt(2026, 8, 19, 21, 0)), "night")
+    check("02:59 UTC is still night", zone_msk(dt(2026, 8, 19, 2, 59)), "night")
+    check("03:00 UTC is MSK morning", zone_msk(dt(2026, 8, 19, 3, 0)), "morning")
+    check("06:00 UTC is MSK morning", zone_msk(dt(2026, 8, 19, 6, 0)), "morning")
+    check("09:00 UTC is MSK day", zone_msk(dt(2026, 8, 19, 9, 0)), "day")
+    check("15:00 UTC is MSK evening", zone_msk(dt(2026, 8, 19, 15, 0)), "evening")
+
+    # The order must be a FUNCTION of the seed, or "recorded seed" records nothing.
+    a, b = list("abcdefgh"), list("abcdefgh")
+    random.Random(7).shuffle(a)
+    random.Random(7).shuffle(b)
+    check("the same seed gives both arms the same order", a, b)
+    c = list("abcdefgh")
+    random.Random(8).shuffle(c)
+    check("a different seed gives a different order", a != c, True)
+
+    # The RU arm must actually be namespaced. A command that merely CARRIES the label while
+    # running in the root namespace is the exact failure §2.5 records for the 418-load set.
+    ru = arm_cmd("ru-mobile", "https://x.ru/", "/tmp/o", 45, 120, "p", netns="ruvantage")
+    check("the RU arm is executed inside the netns",
+          ru[:5], ["sudo", "ip", "netns", "exec", "ruvantage"])
+    check("the RU arm carries HOME into the namespace",
+          any(x.startswith("HOME=") for x in ru), True)
+    nl = arm_cmd("nl-direct", "https://x.ru/", "/tmp/o", 45, 120, "p", netns=None)
+    check("the NL arm is NOT namespaced", "netns" in nl, False)
+    check("both arms are given the same pair prefix",
+          ru[ru.index("--pair-prefix") + 1] == nl[nl.index("--pair-prefix") + 1], True)
+    check("both arms are given the same window",
+          ru[ru.index("--settle") + 1] == nl[nl.index("--settle") + 1] == "45", True)
+    check("the arms are labelled apart",
+          (ru[ru.index("--arm") + 1], nl[nl.index("--arm") + 1]), ("ru-mobile", "nl-direct"))
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

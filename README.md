@@ -1,68 +1,120 @@
 # self-adint — reading your own advertising profile from the demand side
 
-An operator points the ad-tech machinery at himself: stand on the **buy** side of the real-time
-bidding market and read what an audience buyer is handed, for free, about **his own device**.
+**The question.** When an ad is auctioned for your phone, the bid request that goes out
+describes *you* — segments, identity graphs, consent state, location precision. Buyers see
+that description for free, before anyone pays for anything. So: **what does the demand side
+already know about one specific person's device, and can that person read it himself?**
 
-The thesis is not "how much will impressions cost me". It is: *the audience profile arrives inside
-the bid request itself.* You do not have to buy the impression to read what came with it —
-`user.data[]` segments, `user.ext.eids[]` identity graphs, the consent string, and the `geo.type`
-precision class per app bundle.
+The thesis is not "what would my impressions cost". It is that *the audience profile arrives
+inside the bid request*. You do not have to buy the impression to read what came with it.
 
-The full brief in the operator's own words is `docs/brief-2026-08-15-operator.md` — the fact base
-of this project, kept verbatim. `PLAN.md` is what actually gets executed: his order of work with
-one step inserted in front of it and four corrections folded in.
+One operator, one phone, his own data. Nobody else is observed — not incidentally, not as a
+"noise statistic". That constraint shapes the code, not just the intentions: see *The rules
+the code is built to*, below.
 
-## Where it stands
+---
 
-**Step 0 — which exchanges actually sell his phone's traffic?** Inserted before everything else
-because the one irreversible step in this project (onboarding a bidder seat: legal entity,
-agreement, whitelist, deposit) currently rests on a *guess* about which exchange carries his
-device — and that guess can be turned into a measurement, read from the device side, for zero
-cost. If his apps sell through exchange A and the seat is opened at exchange B, his device never
-appears in the sample, and the failure is discovered after the money.
+## Where it stands, with the numbers that qualify it
 
-The artifact is a `bundle → exchange` table with observation counts. Not "app X shows ads".
+Two threads run in parallel. **`docs/INDEX.md` is the map**; start there if you want to
+navigate rather than read.
 
-Method record and what was rejected, with reasons: `docs/step0-method-2026-08-15.md`.
+**Thread A — measurement.** Which exchanges actually sell this device's traffic, and what is
+observable from where. This is where the current work is.
 
-## Rules the code is built to, not merely to follow
+**Thread B — access.** What a person can legally demand from an exchange, and what it takes
+for a small buyer to get a seat.
 
-- **Only his device.** A record whose device id is not the target never reaches disk — dropped in
-  the parser before any buffer, counted as a bare integer, never as a row, an aggregate, or a
-  "noise statistic". Nobody else is in scope, ever, including incidentally: this is why
-  monitor-mode Wi-Fi capture is rejected outright rather than filtered afterwards.
-- **`UNKNOWN` is a first-class verdict.** A host the reference table cannot name is reported *with
-  its count*, and the coverage ratio is printed on every run. A negative result and an absent
-  result are different things — the entire three-valued oracle downstream (`IN` / `UNKNOWN` /
-  `NOT`) exists because `LOSS` is not `NOT IN`.
-- **A silent fallback is a fabricated success.** A missing reference table raises, rather than
-  rendering every host `UNKNOWN` and letting the run "succeed" — a table of nothing looks exactly
-  like a finished measurement.
-- **A gate you have not seen fail is not a gate.** Each property above was broken deliberately and
-  watched go red before it was accepted; the mutations are listed in the method record.
+### The current measurement, stated with its size before its content
+
+The live work is a study of **Russian header bidding**, chosen because the western literature
+on the subject covers US/EU inventory and does not contain the Russian SSPs at all — `Yandex`,
+`adriver`, `buzzoola`, `betweendigital`, `sape`, `smi2`, `MyTarget/VK`, `astralab`, `gnezdo`,
+`hybrid`, `bidvol`, `alfasense` are visible by name in our own capture and absent from the
+papers.
+
+<!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
+<!-- /NUMBERS -->
+
+**The word *market* is not available to us yet.** What we have is a design that says exactly
+what would earn it (`docs/step0c-…`), a frame built by a published rule, and the first cell of
+that design actually run (`docs/step0d-…`). Every figure below and in the documents carries
+its `n` and its coverage in the same line as the number, and no chart in this repository is
+captioned as though it covered more.
+
+---
+
+## What we can see, and what we are blind to
+
+This matters more than any result here, so it is on the front page rather than in a footnote.
+
+**Observable:** what an ad wrapper hands the browser — which bidders a publisher's own config
+asks, which of them answered, which stayed silent, what price came back when one did, and the
+currency and floor when the request carries them.
+
+**Not observable, at all, from this vantage:**
+
+- **The server-side auction.** Server-to-server bidding never touches the browser. A site we
+  record as carrying no wrapper may be selling its inventory perfectly well.
+- **Any page we did not see.** An HTTP 401/403/5xx is *our own access failing*, and it is
+  recorded as `blocked`, never as "this publisher runs no header bidding". Converting our
+  blindness into a market fact is the one mistake this project cannot afford.
+- **Anything about anyone else.** By construction.
+
+---
+
+## The rules the code is built to, not merely to follow
+
+- **Only his device.** A record whose device id is not the target never reaches disk — dropped
+  in the parser before any buffer, counted as a bare integer, never as a row or an aggregate.
+  This is why monitor-mode Wi-Fi capture is rejected outright rather than filtered afterwards.
+- **`UNKNOWN` is a first-class verdict.** A host the reference table cannot name is reported
+  *with its count*, and the coverage ratio is printed on every run. `LOSS` is not `NOT IN`.
+- **Absence is split by cause, always.** `no-bid` / `no-answer` / `blocked` / `unreachable` /
+  `no-web-apex` / `no-wrapper` are six different facts. Folding any two of them is how a
+  measurement of our own latency becomes a finding about bidder selectivity.
+- **A silent fallback is a fabricated success.** A missing reference table raises rather than
+  rendering every host `UNKNOWN` and letting the run "succeed" — a table of nothing looks
+  exactly like a finished measurement.
+- **A gate you have not seen fail is not a gate.** Every property above was broken
+  deliberately and watched go red before it was accepted. `docs/REPRODUCE.md` lists which
+  mistake each gate exists to catch.
+- **A vantage is part of every reading.** Each row records the exit address the **browser**
+  read, not the one the shell measured — on our node those differ, and a row that cannot prove
+  its own path is discarded rather than labelled.
 
 ## Layout
 
-    tools/                  the collectors and the reporters, one concern each, every one with
-                            a --test that runs offline against a local fixture. Load-bearing:
-                              adint-aggregate       observations -> bundle-exchange table
-                              adint-hb-capture      drives a browser, records the wrapper's
-                                                    auction; --via direct leaves by the node's
-                                                    own route and PROVES it from inside the
-                                                    browser (a launch flag does not)
-                              adint-hb-report       reads the log; refuses to read an arm whose
-                                                    vantage nobody measured as a condition
-                              adint-attribute-by-adapter
-                                                    names an unattributed host only when an
-                                                    adapter's own source contains it literally
-                            self-test any of them: python3 tools/<name> --test
-                            (adint-hb-capture needs ~/.venv-browser/bin/python3 — it drives a
-                            real browser, and its --test exits 2 when the arm cannot be verified)
-    ref/                    public knowledge: domain -> org -> does it run an OpenRTB exchange,
-                            can an outsider get a seat there
-    docs/                   the fact base, the method record, the research notes
-    data/                   his observations — GITIGNORED, and stays that way
+    tools/         collectors and reporters, one concern each, every one with a --test that
+                   runs offline against a local fixture:
+                     adint-frame-stageb    builds the sampling frame from the pinned universe
+                                           and PUBLISHES the rejections with their reasons
+                     adint-paired-run      runs one cell of the schedule from both vantages,
+                                           barriered site by site so a pair is really a pair
+                     adint-hb-capture      drives a browser, records the wrapper's auction,
+                                           and proves its exit from INSIDE the browser
+                     adint-hb-report       counts it; refuses to pool schemas or fold no-answer
+                     adint-publish         copies observations to public-data/ through an
+                                           explicit field ALLOWLIST
+                     adint-aggregate       observations -> bundle-exchange table
+                   self-test any of them:  python3 tools/<name> --test
+                   (browser-driving tools need ~/.venv-browser/bin/python3; run under the
+                   wrong interpreter they exit 2 = n/a, never a false FAIL)
 
-This repository is deliberately **not** part of the operator's mesh genome: nothing here is a mesh
-organ, no cron, no reflex. It consumes the mesh (the phone body, the board, the voice channel) and
-never vendors it.
+    ref/           the pinned inputs: the Tranco universe, domain -> org -> exchange tables,
+                   and each frame produced from them
+    public-data/   the observations, world-readable, CC0. Written only by adint-publish
+    data/          HIS capture. Gitignored, and stays that way — this is the privacy boundary
+    docs/          design, method, fact base. See docs/INDEX.md
+    tests/         fixtures
+
+This repository is deliberately **not** part of the operator's mesh: nothing here is a mesh
+organ, no cron, no reflex. It consumes the mesh (the phone body, the board, the voice channel)
+and never vendors it.
+
+## Licence
+
+**CC0 1.0** — public domain. Take it, fork it, use it to argue we are wrong. See `LICENSE`.
+
+A public-domain dedication is a statement about rights, not about truth: every number here is
+published with its `n` and its vantage so that you can judge it rather than inherit it.

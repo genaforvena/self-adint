@@ -11,8 +11,26 @@
 .env
 data/
 
+# …EXCEPT the published tree. `data/` holds observations of HIS DEVICE and never leaves;
+# `public-data/` holds observations of the PUBLIC WEB — which domain answered what, which ad
+# wrapper its page carries, from which of our own vantages — made by a throwaway browser
+# profile with no history. Nothing in it is about a person.
+#
+# The two are not separated by care at commit time. They are separated by `tools/adint-publish`,
+# which copies rows through an explicit field ALLOWLIST: anything a future schema adds is
+# dropped unless it is argued onto the list. A denylist would be a promise about columns that
+# do not exist yet, and those are precisely the ones that leak. Never hand-copy a file into
+# public-data/ — run the tool, so the boundary stays mechanical and auditable.
+!public-data/
+!public-data/**
+
 # Android build output — the APK is a build product, not a source artifact
 android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+
+# Byte-cache from importing a sibling tool as a module (tools/adint-frame-stageb does this
+# so the detector under test is the one that runs, rather than a copy that rots away from it).
+__pycache__/
+*.pyc

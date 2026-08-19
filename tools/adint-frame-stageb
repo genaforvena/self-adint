@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""Stage B of the step0c sampling frame: walk the RU universe in rank order and admit
+domains to the study's frame by a mechanical probe, publishing the REJECTIONS as data.
+
+The rule is fixed in docs/step0c-hb-ru-market-study-2026-08-18.md §1.4 and this tool is
+its executable form — a stranger runs it against the committed universe and gets our
+frame or a dated diff. Nothing here is hand-picked.
+
+    Stage A  universe   ref/ru-universe-tranco-V3JQN.tsv (n=1944, committed, pinned)
+    Stage B  inclusion  walk stage A in rank order; admit iff (i) HTTP 200 with an HTML
+                        document and (ii) an ad wrapper is present in the page. Stop at
+                        --admit-max admitted. Every domain TOUCHED is written to the
+                        ledger with its verdict, including the ones rejected and why.
+
+WHY THIS IS NOT `adint-pbjs-probe` WITH A LOOP AROUND IT
+The probe's in-page read is reused verbatim (imported, not copied — a copied detector
+rots away from the one under test). What is NOT reused is its VERDICT vocabulary, which
+is prebid-centric: its `none` means "no prebid global in any frame". On a market whose
+wrapper is mostly Adfox rather than prebid, admitting on `none`-vs-not would reject
+exactly the sites this study exists to measure. Condition (ii) is `Adfox OR prebid`.
+
+THE DETECTOR THE DOCUMENT NAMES IS TOO WIDE, AND THAT IS A FINDING, NOT A TYPO
+§1.4 names the wrapper signal as "`Ya` / `YaHeaderBiddingSettings` (Adfox) or a non-empty
+`pbjs`". But `window.Ya` is Yandex's GENERIC namespace: Yandex.Metrika sets it, and
+Metrika is on a large fraction of runet. A rule keyed on bare `Ya` would admit analytics
+as ad-tech and quietly fill the frame with sites that run no auction at all — the frame
+would then be a frame of "sites using a Yandex product", and every later number would be
+a statement about that population instead.
+
+So admission requires an AD-specific global — `Ya.adfoxCode`, `YaHeaderBiddingSettings`,
+or `yaContextCb` (the Yandex advertising context queue) — or a prebid global in any
+frame. Bare `Ya` with none of those is NOT admitted; it is recorded under its own verdict
+`ya-generic-only` so the size of the difference is a published number rather than a
+choice hidden in a boolean. If that count is large, the naive rule's damage is measured;
+if it is small, the correction cost nothing. Either way the reader can see it.
+
+REJECTION REASONS STAY DISTINCT — §1.4's table is a contract
+  admit             HTTP 200 + HTML + an ad wrapper
+  no-wrapper        the page LOADED and demonstrably carries no ad wrapper
+  ya-generic-only   a Yandex namespace but no advertising global (see above)
+  not-html          HTTP 200 whose document is not HTML (feeds, JSON, downloads)
+  blocked           4xx/5xx — WE NEVER SAW THE PAGE, so we know nothing about its wrapper
+  rate-limited      428/429 — caused by OUR OWN load, not by the site's nature
+  error             no usable response (timeout, DNS, TLS)
+`blocked`, `rate-limited` and `error` never count toward "no header bidding here".
+Collapsing them into `no-wrapper` converts our own access failure into a market fact, and
+that is the study's first available lie.
+
+THE FRAME PROBE'S WINDOW IS NOT THE CAPTURE'S `window_s`
+§2.1 fixes `window_s = 45` for every ARM of the study, because the window is what
+separates `no-answer` from a real no-bid. That is a question about an AUCTION. Stage B
+asks a different question — is a wrapper PRESENT — and pays 95 s a site to ask it if it
+borrows the capture's window. It runs at --settle (default 8) plus the scroll pass that
+surfaces lazily-mounted wrappers, and then RE-PROBES every `no-wrapper` verdict at
+--recheck-settle (default 45) before writing it down. A rejection is therefore never
+cheaper than the acceptance threshold of the study itself, while an admission stays
+cheap. The settle that produced each verdict is recorded in the row; the two numbers are
+never pooled.
+
+VANTAGE
+Every row carries the egress as the BROWSER read it, per §2.5 — on this node a browser
+can carry proxy environment its shell does not, so a shell-read address is not evidence
+about the browser's path. Reading the echo costs a page load, so --verify-every controls
+how often it is re-read; each row records the age of the read it rests on, and a row
+whose vantage was never verified says so rather than inheriting a neighbour's address.
+
+Blindness printed beside the result: this admits on what the wrapper hands the browser.
+A server-side auction is invisible from here, so a `no-wrapper` domain may still be
+selling its inventory — it is out of THIS study's frame, which is a claim about our
+observability, not about the publisher.
+"""
+
+import argparse
+import collections
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.join(REPO, "tools")
+UNIVERSE = os.path.join(REPO, "ref", "ru-universe-tranco-V3JQN.tsv")
+
+SCHEMA = 3
+
+
+def _load(name):
+    """Import a sibling tool as a module. The tools carry no .py suffix, and copying a
+    detector instead of importing it is how the copy stops matching the one under test."""
+    # SourceFileLoader is named EXPLICITLY: these files have no .py suffix, and
+    # spec_from_file_location infers its loader from the extension — with none to infer
+    # from it returns a spec whose loader is None, i.e. an import that fails at the point
+    # of use rather than at the point of error.
+    path = os.path.join(TOOLS, name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ── the admission rule, as a pure function of one probe row ───────────────────────────
+# Pure on purpose: it is the part of stage B that can be tested without a browser, and it
+# is the part where a mistake becomes a population rather than a bug.
+
+AD_GLOBALS = ("adfoxCode", "hb_settings", "ya_context")
+
+
+def hb_evidence(row):
+    """Evidence that this page runs a HEADER-BIDDING AUCTION — the study's actual object.
+
+    Distinct from `wrapper_evidence` below, and the distinction is the correction that schema
+    3 exists for. Measured on the first NL walk: all seven admitted domains carried
+    `Ya.adfoxCode` and `yaContextCb` and **not one** carried `YaHeaderBiddingSettings`, had a
+    prebid global, or named a single bidder. The frame contained zero instances of the
+    phenomenon the study measures.
+
+    Those two globals are AD SERVING. `Ya.adfoxCode` places an Adfox ad; `yaContextCb` is the
+    Yandex advertising context queue. A page can carry both and run no auction whatsoever —
+    the demand is resolved inside Yandex and nothing is asked of anyone else. Header bidding
+    is the publisher asking SEVERAL bidders in the page, and the observable that says so is
+    the wrapper's own config: `YaHeaderBiddingSettings` with a bidder roster, or a prebid
+    global.
+
+    The original rule named "`Ya` / `YaHeaderBiddingSettings` … or a non-empty `pbjs`", and
+    schema 1 narrowed the too-wide bare `Ya` to `Ya.adfoxCode`/`yaContextCb` — which is a
+    narrowing on the *Metrika* axis and no narrowing at all on the *serving-vs-bidding* axis.
+    Fixing one width while leaving the other is how the frame ended up 7-for-7 wrong while
+    looking corrected. Both are now closed, and the intermediate tier is kept as data rather
+    than discarded."""
+    ev = []
+    hb = row.get("adfox_hb") or {}
+    if isinstance(hb, dict) and hb.get("present"):
+        n = len(hb.get("bidders") or [])
+        ev.append(f"YaHeaderBiddingSettings(bidders={n})")
+    if row.get("globals"):
+        ev.append("pbjs:" + ",".join(str(g) for g in row["globals"][:4]))
+    for f in row.get("subframes") or []:
+        if f.get("globals") or f.get("asked"):
+            ev.append("pbjs-in-frame")
+            break
+    return ev
+
+
+def wrapper_evidence(row):
+    """What ad wrapper this page demonstrably carries. Names, not a boolean — the frame
+    file has to say WHY each domain was admitted or the admission is unauditable."""
+    ev = []
+    adfox = row.get("adfox") or {}
+    if isinstance(adfox, dict):
+        if adfox.get("adfoxCode"):
+            ev.append("Ya.adfoxCode")
+        if adfox.get("hb_settings"):
+            ev.append("YaHeaderBiddingSettings")
+        if adfox.get("ya_context"):
+            ev.append("yaContextCb")
+    if row.get("globals"):
+        ev.append("pbjs:" + ",".join(str(g) for g in row["globals"][:4]))
+    for f in row.get("subframes") or []:
+        if f.get("globals") or f.get("asked"):
+            ev.append("pbjs-in-frame")
+            break
+    return ev
+
+
+# A navigation failure is not one fact. Measured on the first NL walk: of 7 rows the first
+# schema called `error`, six were DNS, certificate or TLS failures on CDN and nameserver
+# apexes (`yccdn.ru`, `geobasket.ru`, `tld-servers.ru`, `edgecdn.ru`) — domains that simply do
+# not serve a web page at their apex — and exactly one was a timeout. Those point opposite
+# ways. "There is no site here" is a structural fact about the domain and belongs beside
+# `no-wrapper` as a reason the universe is full of infrastructure (§1.3 again, from the other
+# side). "We could not reach it" is OUR blindness and belongs beside `blocked`. Pooling them
+# was the same fold this document forbids everywhere else, committed in our own tool.
+NO_APEX_SIGNS = ("ERR_NAME_NOT_RESOLVED", "ERR_CERT_", "ERR_SSL_", "ERR_BAD_SSL",
+                 "ERR_EMPTY_RESPONSE", "ERR_INVALID_RESPONSE")
+UNREACHABLE_SIGNS = ("TimeoutError", "ERR_CONNECTION_", "ERR_TIMED_OUT", "ERR_ADDRESS_",
+                     "ERR_NETWORK_", "ERR_PROXY_")
+
+
+def classify_error(err):
+    """Split a navigation failure by what it says about the DOMAIN vs about US."""
+    e = err or ""
+    for sign in NO_APEX_SIGNS:
+        if sign in e:
+            return "no-web-apex"
+    for sign in UNREACHABLE_SIGNS:
+        if sign in e:
+            return "unreachable"
+    # Unrecognised: it must not silently join either side. `error` survives as the residue,
+    # and a growing residue is the signal that this table needs another line.
+    return "error"
+
+
+def classify(row):
+    """Map one probe row to a stage-B verdict. Returns (verdict, evidence list)."""
+    status = row.get("http_status")
+    if row.get("verdict") == "error" or (status is None and not row.get("final_url")):
+        return classify_error(row.get("error")), []
+    if status in (428, 429):
+        # OUR load caused this. It says nothing about the site and must never be pooled
+        # with a refusal that is the site's own posture.
+        return "rate-limited", []
+    if status is not None and status >= 400:
+        return "blocked", []
+    if status is not None and status != 200:
+        # 3xx that never resolved to a 200 document: the walk followed redirects, so a
+        # non-200 final status here means we did not land on a page.
+        return "blocked", []
+    ct = (row.get("content_type") or "").lower()
+    if ct and "html" not in ct:
+        return "not-html", []
+    # THREE TIERS, because "carries advertising" and "runs an auction we can observe" are
+    # different populations and the study is about the second one.
+    hb = hb_evidence(row)
+    if hb:
+        return "admit", hb
+    ev = wrapper_evidence(row)
+    if ev:
+        # Ad tech is present and no auction config is readable from the page. NOT admitted —
+        # and NOT `no-wrapper` either, which would erase the fact that this publisher sells
+        # ads. It is the population the frame rule accidentally selected.
+        return "ad-serving-only", ev
+    adfox = row.get("adfox") or {}
+    if isinstance(adfox, dict) and adfox.get("ya"):
+        return "ya-generic-only", ["Ya"]
+    return "no-wrapper", []
+
+
+def registrable(domain):
+    return domain.strip().lower().lstrip(".")
+
+
+def read_universe(path):
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[0] == "rank":
+                continue
+            try:
+                rank = int(parts[0])
+            except ValueError:
+                continue
+            out.append((rank, registrable(parts[1])))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def already_touched(ledger):
+    """Resume without re-probing. The walk is long and a restart that re-pays for every
+    earlier domain is a walk that never finishes on a slow vantage."""
+    seen = {}
+    if not os.path.exists(ledger):
+        return seen
+    with open(ledger, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("domain"):
+                seen[r["domain"]] = r.get("stageb_verdict")
+    return seen
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--universe", default=UNIVERSE)
+    ap.add_argument("--admit-max", type=int, default=20,
+                    help="stop after this many admitted domains (§1.4: 20 per category; "
+                         "unstratified until the category source of §1.6 is committed)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after touching this many domains regardless of admissions "
+                         "— a bounded walk, so a run that cannot reach --admit-max says "
+                         "how far it got instead of running forever")
+    ap.add_argument("--settle", type=int, default=8)
+    ap.add_argument("--recheck-settle", type=int, default=45,
+                    help="re-probe every no-wrapper verdict at this window before writing "
+                         "it down; 0 disables (and the ledger records that it was skipped)")
+    ap.add_argument("--nav-timeout", type=int, default=45)
+    ap.add_argument("--vantage", required=False, default=None,
+                    help="LABEL for this walk's vantage (e.g. nl-direct, ru-mobile). A "
+                         "label is not a route: it is recorded beside the browser-read "
+                         "egress so the two can be checked against each other")
+    ap.add_argument("--verify-every", type=int, default=10,
+                    help="re-read the browser's egress every N domains (1 = every domain)")
+    ap.add_argument("--ledger", default=None)
+    ap.add_argument("--frame-out", default=None)
+    ap.add_argument("--audit-no-wrapper", default=None, metavar="LEDGER",
+                    help="re-probe only the `no-wrapper` domains of an existing ledger with "
+                         "the CURRENT detector and write the result to its own file. A "
+                         "`no-wrapper` verdict is a claim about the page; it becomes a claim "
+                         "about the DETECTOR the moment the detector learns to see more, and "
+                         "the only honest way to tell those apart is to go back and look")
+    ap.add_argument("--reclassify", default=None, metavar="LEDGER",
+                    help="re-run the CURRENT classifier over an existing ledger and write a "
+                         "new one at the current schema. The probe rows are kept verbatim; "
+                         "only the verdict is re-derived, so a vocabulary that gains a "
+                         "distinction does not cost another hour of page loads — and the two "
+                         "schemas stay in separate files rather than pooling in one")
+    ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if args.audit_no_wrapper:
+        return audit_no_wrapper(args)
+    if args.reclassify:
+        return reclassify(args)
+
+    if not args.vantage:
+        print("adint-frame-stageb: --vantage is required (the label this walk is filed "
+              "under). Refusing to write rows that cannot be attributed to a path.",
+              file=sys.stderr)
+        return 2
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ledger = args.ledger or os.path.join(
+        REPO, "data", f"frame-stageb-{args.vantage}-{day}.jsonl")
+    frame_out = args.frame_out or os.path.join(
+        REPO, "ref", f"ru-frame-stageB-{args.vantage}-{day}.tsv")
+
+    probe_mod = _load("adint-pbjs-probe")
+    cap_mod = _load("adint-hb-capture")
+
+    universe = read_universe(args.universe)
+    seen = already_touched(ledger)
+    admitted = [d for d, v in seen.items() if v == "admit"]
+    print(f"universe n={len(universe)} · already touched {len(seen)} "
+          f"(admitted {len(admitted)}) · ledger {ledger}")
+
+    from playwright.sync_api import sync_playwright
+
+    shell_ip = None
+    try:
+        shell_ip = subprocess.run(
+            ["curl", "-s", "--max-time", "20", "https://api.ipify.org"],
+            capture_output=True, text=True).stdout.strip() or None
+    except Exception:
+        pass
+
+    counts = {}
+    touched = 0
+    vantage_ip = None
+    vantage_ts = None
+
+    with sync_playwright() as pw:
+        for rank, domain in universe:
+            if len(admitted) >= args.admit_max:
+                break
+            if args.limit and touched >= args.limit:
+                break
+            if domain in seen:
+                continue
+            touched += 1
+
+            # Re-read the browser's own exit on a cadence. Its own browser, its own page:
+            # the address that matters is the one the PROBE's requests leave from.
+            need_verify = (vantage_ip is None
+                           or (args.verify_every and touched % args.verify_every == 1))
+            if need_verify:
+                b = None
+                try:
+                    b = pw.chromium.launch(headless=not args.headed)
+                    c = b.new_context()
+                    ip = cap_mod.browser_egress(
+                        c, timeout_ms=max(12, args.nav_timeout) * 1000)
+                    if ip:
+                        vantage_ip, vantage_ts = ip, time.time()
+                    c.close()
+                except Exception:
+                    pass
+                finally:
+                    if b:
+                        try:
+                            b.close()
+                        except Exception:
+                            pass
+
+            url = f"https://{domain}/"
+            row = probe_mod.probe(pw, url, args.settle, args.nav_timeout,
+                                  shell_ip, 0, args.headed)
+            verdict, ev = classify(row)
+            settle_used = args.settle
+
+            # A rejection must not be cheaper than the study's own acceptance window. Both
+            # non-admitting verdicts that describe a page we SAW are re-probed: `no-wrapper`
+            # (nothing mounted) and `ad-serving-only` (ad tech mounted, no auction config
+            # readable). The second matters because a wrapper can mount late — admitting it
+            # on the short window would be luck, and rejecting it on the short window is the
+            # same error the recheck exists to prevent, one tier over.
+            if verdict in ("no-wrapper", "ad-serving-only") and args.recheck_settle:
+                row2 = probe_mod.probe(pw, url, args.recheck_settle, args.nav_timeout,
+                                       shell_ip, 1, args.headed)
+                v2, ev2 = classify(row2)
+                if v2 != "no-wrapper":
+                    row, verdict, ev, settle_used = row2, v2, ev2, args.recheck_settle
+                elif v2 == verdict:
+                    row["recheck_settle_s"] = args.recheck_settle
+                    row["recheck_verdict"] = v2
+                else:
+                    # Changed but still not an admission (no-wrapper -> ad-serving-only, say):
+                    # take the longer window's answer, which saw strictly more.
+                    row, verdict, ev, settle_used = row2, v2, ev2, args.recheck_settle
+
+            out = dict(row)
+            out.update({
+                "stageb_schema": SCHEMA,
+                "rank": rank,
+                "domain": domain,
+                "stageb_verdict": verdict,
+                "wrapper_evidence": ev,
+                "settle_used_s": settle_used,
+                "recheck_settle_s": (args.recheck_settle
+                                     if verdict in ("no-wrapper", "ad-serving-only")
+                                     else out.get("recheck_settle_s")),
+                "vantage": args.vantage,
+                "shell_egress_ip": shell_ip,
+                "browser_egress_ip": vantage_ip,
+                # Absence of evidence about the path, kept distinct from a verified one.
+                "vantage_verified": bool(vantage_ip),
+                "vantage_read_age_s": (round(time.time() - vantage_ts)
+                                       if vantage_ts else None),
+            })
+            with open(ledger, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(out, ensure_ascii=False) + "\n")
+            seen[domain] = verdict
+            counts[verdict] = counts.get(verdict, 0) + 1
+            if verdict == "admit":
+                admitted.append(domain)
+            print(f"[{touched}] #{rank:<6} {verdict:16s} {domain}"
+                  f"  {'+'.join(ev) if ev else ''}"
+                  f"  ({row.get('http_status')}, {row.get('load_s')}s)", flush=True)
+
+    write_frame(frame_out, ledger, args)
+    print("\nverdicts: " + " · ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    print(f"admitted {len(admitted)}/{args.admit_max} · touched {touched} this run")
+    print(f"frame  -> {frame_out}\nledger -> {ledger}")
+    return 0
+
+
+def audit_no_wrapper(args):
+    """Re-probe the rejections, because a rejection ages differently from an admission.
+
+    An `admit` stands: we saw the wrapper. A `no-wrapper` is only ever "we looked with THIS
+    detector and found nothing", and when the detector gains a signal every earlier
+    `no-wrapper` silently changes meaning without changing value. The counts here are the
+    size of that: how many rejected domains carry an ad stack the frame's rule does not name.
+    They do NOT become admissions — step0c's frame is Adfox and prebid, and widening the rule
+    is a decision for the document, not for this tool. What changes is that `no-wrapper` can
+    no longer be read as "no ad tech here"."""
+    probe_mod = _load("adint-pbjs-probe")
+    src = args.audit_no_wrapper
+    doms = []
+    with open(src, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if r.get("stageb_verdict") == "no-wrapper" and r.get("domain"):
+                doms.append((r.get("rank"), r["domain"]))
+    out_path = src.replace(".jsonl", "") + "-nowrapper-audit.jsonl"
+    print(f"auditing {len(doms)} no-wrapper domain(s) from {os.path.basename(src)}")
+    if not doms:
+        print("nothing to audit — the source ledger holds no no-wrapper rows")
+        return 0
+    from playwright.sync_api import sync_playwright
+    tally = {"other-stack": 0, "still-bare": 0, "unreadable": 0}
+    with sync_playwright() as pw:
+        for rank, domain in doms:
+            row = probe_mod.probe(pw, f"https://{domain}/", args.recheck_settle or 45,
+                                  args.nav_timeout, None, 0, args.headed)
+            ow = row.get("other_wrappers") or {}
+            found = sorted(k for k, v in ow.items()
+                           if k != "googletag_slots" and v is True)
+            if row.get("verdict") == "error" or (row.get("http_status") or 0) >= 400:
+                bucket = "unreadable"
+            elif found:
+                bucket = "other-stack"
+            else:
+                bucket = "still-bare"
+            tally[bucket] += 1
+            rec = dict(row)
+            rec.update({"rank": rank, "domain": domain, "audit_bucket": bucket,
+                        "other_stacks": found, "vantage": args.vantage,
+                        "source_ledger": os.path.basename(src)})
+            with open(out_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"#{rank:<6} {bucket:12s} {domain}  "
+                  f"{'+'.join(found) if found else ''}"
+                  f"{' slots=' + str(ow.get('googletag_slots')) if ow.get('googletag_slots') else ''}",
+                  flush=True)
+    print("\naudit: " + " · ".join(f"{k}={v}" for k, v in tally.items()))
+    print(f"-> {out_path}")
+    print("These do NOT become admissions: the frame's rule is Adfox and prebid, and widening "
+          "it is the document's decision. What they retire is reading `no-wrapper` as "
+          "'no ad tech'.")
+    return 0
+
+
+def reclassify(args):
+    src = args.reclassify
+    out = src.replace(".jsonl", "") + f"-schema{SCHEMA}.jsonl"
+    n = 0
+    changed = collections.Counter()
+    with open(src, encoding="utf-8") as fh, open(out, "w", encoding="utf-8") as w:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            before = r.get("stageb_verdict")
+            v, ev = classify(r)
+            if v != before:
+                changed[f"{before}->{v}"] += 1
+            r["stageb_verdict"] = v
+            r["wrapper_evidence"] = ev or r.get("wrapper_evidence") or []
+            r["stageb_schema"] = SCHEMA
+            r["reclassified_from"] = before
+            w.write(json.dumps(r, ensure_ascii=False) + "\n")
+            n += 1
+    print(f"{n} row(s) reclassified at schema {SCHEMA} -> {out}")
+    if changed:
+        for k, v in changed.most_common():
+            print(f"  {k}: {v}")
+    else:
+        print("  no verdict changed — the older ledger already agrees with this classifier")
+    return 0
+
+
+def write_frame(path, ledger, args):
+    rows = []
+    with open(ledger, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    adm = [r for r in rows if r.get("stageb_verdict") == "admit"]
+    adm.sort(key=lambda r: r.get("rank", 10**9))
+    tally = {}
+    for r in rows:
+        tally[r.get("stageb_verdict")] = tally.get(r.get("stageb_verdict"), 0) + 1
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"# stage B frame — produced by tools/adint-frame-stageb, schema {SCHEMA}\n")
+        fh.write(f"# universe: {os.path.basename(args.universe)} (stage A, committed)\n")
+        fh.write(f"# vantage: {args.vantage} · settle {args.settle}s · "
+                 f"no-wrapper re-probed at {args.recheck_settle}s\n")
+        fh.write(f"# generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+        fh.write("# The REJECTIONS are the other half of this artifact and live in the "
+                 "ledger beside it: " + os.path.basename(ledger) + "\n")
+        fh.write("# ledger tally: " + " ".join(f"{k}={v}" for k, v in sorted(
+            tally.items(), key=lambda kv: str(kv[0]))) + "\n")
+        fh.write("# `blocked` / `rate-limited` / `error` are NOT evidence of absent header "
+                 "bidding — they are our own blindness, named.\n")
+        fh.write("rank\tdomain\twrapper_evidence\tsettle_used_s\tbrowser_egress_ip\n")
+        for r in adm:
+            fh.write("\t".join([
+                str(r.get("rank")), r.get("domain", ""),
+                "+".join(r.get("wrapper_evidence") or []),
+                str(r.get("settle_used_s")),
+                str(r.get("browser_egress_ip")),
+            ]) + "\n")
+
+
+# ── self test ─────────────────────────────────────────────────────────────────────────
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    # The whole point of the rule is that these five stay APART. A test that only asserts
+    # "admit works" would pass on the version that folds every failure into no-wrapper.
+    check("429 is rate-limited, not blocked",
+          classify({"http_status": 429, "verdict": "blocked"})[0], "rate-limited")
+    check("428 is rate-limited, not blocked",
+          classify({"http_status": 428, "verdict": "blocked"})[0], "rate-limited")
+    check("403 is blocked",
+          classify({"http_status": 403, "verdict": "blocked"})[0], "blocked")
+    check("401 is blocked, never no-wrapper",
+          classify({"http_status": 401, "verdict": "blocked"})[0], "blocked")
+    check("521 is blocked",
+          classify({"http_status": 521, "verdict": "blocked"})[0], "blocked")
+    # A navigation failure splits by WHOSE fact it is.
+    check("a timeout is unreachable — our blindness",
+          classify({"verdict": "error", "http_status": None,
+                    "error": "TimeoutError: Page.goto: Timeout 45000ms exceeded."})[0],
+          "unreachable")
+    check("NXDOMAIN is no-web-apex — a fact about the domain",
+          classify({"verdict": "error", "http_status": None,
+                    "error": "Error: Page.goto: net::ERR_NAME_NOT_RESOLVED at https://yccdn.ru/"})[0],
+          "no-web-apex")
+    check("a bad certificate is no-web-apex, not a timeout",
+          classify_error("net::ERR_CERT_COMMON_NAME_INVALID"), "no-web-apex")
+    check("a TLS protocol error is no-web-apex",
+          classify_error("net::ERR_SSL_PROTOCOL_ERROR"), "no-web-apex")
+    check("a refused connection is unreachable",
+          classify_error("net::ERR_CONNECTION_REFUSED"), "unreachable")
+    # The residue must NOT be silently absorbed by either side.
+    check("an unrecognised failure stays `error` rather than joining a side",
+          classify_error("net::ERR_SOMETHING_WE_HAVE_NEVER_SEEN"), "error")
+    check("no error string at all stays `error`", classify_error(None), "error")
+
+    # An Adfox HEADER-BIDDING config must ADMIT. This is the leg that fails if the prebid
+    # vocabulary is reused: pbjs-probe calls this row `none`.
+    v, ev = classify({"http_status": 200, "content_type": "text/html", "verdict": "none",
+                      "adfox": {"ya": True, "hb_settings": True}, "globals": [],
+                      "adfox_hb": {"present": True, "bidders": ["adriver", "buzzoola"]}})
+    check("an Adfox HB config admits", v, "admit")
+    check("admission names the roster size", ev, ["YaHeaderBiddingSettings(bidders=2)"])
+
+    # …and AD SERVING must NOT. This is the 7-for-7 failure of schema 1: every admitted
+    # domain looked exactly like this row.
+    v, ev = classify({"http_status": 200, "content_type": "text/html", "verdict": "none",
+                      "adfox": {"ya": True, "adfoxCode": True, "ya_context": True},
+                      "globals": [], "adfox_hb": {"present": False}})
+    check("Adfox ad SERVING does not admit", v, "ad-serving-only")
+    check("ad serving is not called no-wrapper either", v != "no-wrapper", True)
+    check("ad serving still names what it saw", ev, ["Ya.adfoxCode", "yaContextCb"])
+
+    # …and bare `Ya` must NOT, or the frame fills with Yandex.Metrika.
+    check("bare Ya does not admit",
+          classify({"http_status": 200, "content_type": "text/html", "verdict": "none",
+                    "adfox": {"ya": True}, "globals": []})[0], "ya-generic-only")
+    check("yaContextCb alone is ad serving, not an auction",
+          classify({"http_status": 200, "content_type": "text/html",
+                    "adfox": {"ya": True, "ya_context": True}})[0], "ad-serving-only")
+    check("prebid global admits",
+          classify({"http_status": 200, "content_type": "text/html",
+                    "adfox": {}, "globals": ["pbjs"]})[0], "admit")
+    check("prebid in a SUBFRAME admits",
+          classify({"http_status": 200, "content_type": "text/html", "adfox": {},
+                    "globals": [], "subframes": [{"asked": 3}]})[0], "admit")
+    check("clean 200 with nothing is no-wrapper",
+          classify({"http_status": 200, "content_type": "text/html",
+                    "adfox": {}, "globals": []})[0], "no-wrapper")
+    check("200 that is not HTML is not-html",
+          classify({"http_status": 200, "content_type": "application/rss+xml",
+                    "adfox": {"ya": True, "hb_settings": True}})[0], "not-html")
+
+    # A 4xx carrying an ad wrapper in its ERROR page must still be blocked: we did not see
+    # the site. This is the direction the first version of the sibling tool got wrong.
+    check("wrapper on a 403 error page is still blocked",
+          classify({"http_status": 403, "adfox": {"ya": True, "hb_settings": True},
+                    "adfox_hb": {"present": True, "bidders": ["x"]},
+                    "content_type": "text/html"})[0], "blocked")
+    # An HB config with an EMPTY roster still admits: the publisher runs the wrapper, and a
+    # roster that reads empty is a fact about our read, not proof they ask nobody.
+    check("an HB config with an empty roster still admits",
+          classify({"http_status": 200, "content_type": "text/html",
+                    "adfox_hb": {"present": True, "bidders": []}})[0], "admit")
+
+    # The universe must parse, and it must be the file the document pins.
+    u = read_universe(UNIVERSE)
+    check("universe parses to §1.2's n", len(u), 1944)
+    check("universe is rank-ordered", u[0][0] <= u[-1][0], True)
+    bad = [d for _, d in u if not re.search(r"\.(ru|su|xn--p1ai)$", d)]
+    check("universe holds only the declared TLDs", bad[:3], [])
+
+    # The imports are the point of the design; a broken one must be loud here, not at hour
+    # two of a walk.
+    try:
+        p = _load("adint-pbjs-probe")
+        check("pbjs-probe imports and exposes probe()", callable(getattr(p, "probe", None)), True)
+        c = _load("adint-hb-capture")
+        check("hb-capture imports and exposes browser_egress()",
+              callable(getattr(c, "browser_egress", None)), True)
+    except Exception as e:
+        ok = False
+        print(f"FAIL import: {type(e).__name__}: {e}")
+
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

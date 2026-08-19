@@ -1,0 +1,32 @@
+CC0 1.0 Universal — Public Domain Dedication
+============================================
+
+To the extent possible under law, the authors of this repository have waived all
+copyright and related or neighbouring rights to **self-adint**, including the code
+under `tools/`, `receiver/` and `android/`, the reference tables under `ref/`, the
+published observations under `public-data/`, and the documents under `docs/`.
+
+The work is dedicated to the public domain worldwide.
+
+    Full legal text: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+    Summary:         https://creativecommons.org/publicdomain/zero/1.0/
+
+This file carries the dedication and a link to the canonical legal text rather than a
+transcription of it, because a mistyped licence is worse than a referenced one.
+
+What this means in practice
+---------------------------
+Take it. Fork it, quote it, build on it, sell it, or use it to argue that we are wrong —
+no attribution is required and no permission needs to be asked. If the data here is
+useful to you, it is yours.
+
+What it does NOT mean
+---------------------
+A public-domain dedication is a statement about RIGHTS, not about TRUTH. Every number in
+this repository is published with its `n`, its coverage, and the vantage it was measured
+from, precisely so that a reader can judge it rather than inherit it. A CC0 dataset that
+is quoted without its blindness is still being quoted wrongly.
+
+And it is not a claim about anyone else's rights. The observations describe our own
+requests to publicly reachable web servers; they are not a licence to the content of the
+sites observed, and nothing here waives any third party's rights in their own material.

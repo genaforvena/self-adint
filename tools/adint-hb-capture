@@ -440,9 +440,24 @@ def browser_egress(ctx, timeout_ms=None, echo=None):
             pass
 
 
+def pair_key(prefix, index):
+    """step0c §2.4's pair key: positional, so both arms derive it from the shared ordered
+    URL list without communicating. None when no pairing was asked for — an unpaired run
+    must not carry a key that would let a later join mint pairs that were never run."""
+    return f"{prefix}-{index:03d}" if prefix else None
+
+
 def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None,
-            use_proxy=True, vantage_probe=True):
-    """One page load. Returns (load_row, request_rows)."""
+            use_proxy=True, vantage_probe=True, pair_id=None):
+    """One page load. Returns (load_row, request_rows).
+
+    `pair_id` is step0c §2.4's requirement that pairing be recoverable FROM THE DATA and not
+    reconstructed later by timestamp arithmetic. `load_id` cannot carry it: it is a fresh
+    uuid per load, so two arms loading the same site in the same minute share nothing, and
+    the only way back to the pair is to sort by clock and hope — on a market where floors
+    move, "same hour" is not a pair, and a reconstruction cannot tell a pair from a
+    coincidence. The two arms are launched with the same --pair-id; a run with no pairing
+    leaves it null rather than inventing a key that would make unpaired rows look paired."""
     load_id = uuid.uuid4().hex[:12]
     t_wall = datetime.now(timezone.utc)
     load = {
@@ -458,7 +473,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # override the inherited proxy env, so BOTH arms left through privoxy. Their
         # `egress_ip: 77.246.104.228` is what the parent's curl measured, not where that
         # browser went — schema-4 arms are an A/A null wearing a treatment's name.
-        "schema": 5, "kind": "load", "load_id": load_id,
+        "schema": 5, "kind": "load", "load_id": load_id, "pair_id": pair_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note,
         # `egress_ip` is the address the BROWSER left from, never whichever one was easiest to
@@ -741,6 +756,10 @@ def main():
     ap.add_argument("--arm-offset", type=int, default=0,
                     help="shift the alternation; use 1 on the next pass so a site does not "
                          "always land in the same arm (see arm_plan)")
+    ap.add_argument("--pair-prefix", default=None,
+                    help="stamp every load with `<prefix>-<index>` so the two arms' rows "
+                         "join on the pair, per step0c §2.4. Both arms must be given the "
+                         "SAME prefix and the SAME ordered URL list — the key is positional")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test", action="store_true")
@@ -858,8 +877,16 @@ def main():
             arm = plan[i - 1]
             use_proxy = ((arm == "proxy") if args.treatment == "proxy"
                          else args.via != "direct")
+            # The pair key is the INDEX in the shared, identically-ordered URL list — not a
+            # random id and not the clock. Both arms are handed the same list, so the same
+            # site lands on the same key in both without the arms having to talk to each
+            # other; and because it is positional, a run whose list differs cannot silently
+            # produce fake pairs — the sites under a key would simply not match, which is
+            # checkable after the fact. Absent --pair-prefix the field stays null.
+            pair_id = pair_key(args.pair_prefix, i)
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
-                                 arm, arm_note=args.arm_note, use_proxy=use_proxy)
+                                 arm, arm_note=args.arm_note, use_proxy=use_proxy,
+                                 pair_id=pair_id)
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
@@ -1057,14 +1084,15 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
                                  {"egress_ip_proxied": "proxy-ip",
                                   "egress_ip_direct": "direct-ip",
                                   "proxy_env": "http://127.0.0.1:8118"}, 7, "B",
-                                 vantage_probe=False)
+                                 vantage_probe=False, pair_id=pair_key("t", 4))
             # The same fixture on the node's own route: the browser must be launched with the
             # inherited proxy disabled, and the row must say which exit it used.
             load_d, rows_d = capture(pw, f"{base}/page", 2, 20,
                                      {"egress_ip_proxied": "proxy-ip",
                                       "egress_ip_direct": "direct-ip",
                                       "proxy_env": "http://127.0.0.1:8118"}, 7, "direct",
-                                     use_proxy=False, vantage_probe=False)
+                                     use_proxy=False, vantage_probe=False,
+                                     pair_id=pair_key("t", 4))
             # THE LIVE LEG. Everything above runs against 127.0.0.1, which Chromium exempts
             # from any proxy — so a localhost fixture cannot tell a bypassed proxy from an
             # obeyed one, and the two legs above would pass unchanged with the browser going
@@ -1105,6 +1133,17 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
     priced = by.get("betweendigital", {})
     prices = (priced.get("detail") or {}).get("prices") or []
     checks = [
+        # ── the pair key (step0c §2.4) ──
+        # Reconstructing pairs by timestamp is what this replaces, so the assertion is that
+        # two SEPARATE capture() calls — different load_ids, different arms — carry the same
+        # key, and that an unpaired run carries none. A test that only checked "the field
+        # exists" would pass on a per-load uuid, which is exactly the thing that does not work.
+        ("both arms of a pair share one key",
+         load.get("pair_id") == load_d.get("pair_id") == "t-004"),
+        ("the pair key is not the load id",
+         load.get("load_id") != load_d.get("load_id")),
+        ("no --pair-prefix means no key, never a minted one", pair_key(None, 4) is None),
+        ("the key is positional, so the index moves it", pair_key("t", 5) == "t-005"),
         ("wrapper deadline read", load.get("wrapper_timeout_ms") == 1200),
         ("roster read from the page", "buzzoola" in (load.get("roster") or [])),
         ("every asked bidder produced a row", len(by) == 16),

@@ -127,6 +127,29 @@ PROBE_JS = r"""
     }
   } catch (e) { out.adfox_hb = {err: String(e)}; }
 
+  // The OTHER wrappers. Not admission criteria for the RU study — step0c's frame is Adfox
+  // and prebid — but a `no-wrapper` verdict that cannot see them is not a claim about the
+  // site, it is a claim about this detector. drom.ru (Tranco #324, a large ad-supported
+  // classifieds site) came back `no-wrapper` at a 45 s window; without these fields there is
+  // no way to tell "runs no header bidding" from "runs a stack we never looked for".
+  try {
+    out.other_wrappers = {
+      googletag: typeof window.googletag !== 'undefined',
+      // Slots actually defined, not merely the library present: a GPT stub ships on pages
+      // that never call it.
+      googletag_slots: (function () {
+        try {
+          return (window.googletag && window.googletag.pubads
+                  && typeof window.googletag.pubads === 'function')
+            ? (window.googletag.pubads().getSlots() || []).length : null;
+        } catch (e) { return null; }
+      })(),
+      apstag: typeof window.apstag !== 'undefined',        // Amazon TAM
+      criteo: typeof window.Criteo !== 'undefined',
+      admixer: typeof window.admixer !== 'undefined',
+    };
+  } catch (e) { out.other_wrappers = {err: String(e)}; }
+
   try {
     out.cmp = {
       tcf: typeof window.__tcfapi === 'function',
@@ -315,7 +338,13 @@ def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
         # evidence of absence. Rows of an older schema must not be pooled with these.
         # schema 4 adds the Adfox HB roster (`adfox_hb`); verdicts mean the same as in 3,
         # but a schema-3 row is silent about the wrapper — absent field, not empty roster.
-        "schema": 4,
+        # schema 5 adds `content_type`; a schema-4 row is silent about it, so "no HTML
+        # content type recorded" and "the document was not HTML" are different facts and a
+        # consumer must not read the older rows' absence as the latter.
+        # schema 6 adds `other_wrappers` (googletag/apstag/criteo/admixer). Rows below it
+        # cannot distinguish "carries no ad stack" from "carries one this tool never looked
+        # for", so their absences bound our detector, not the market.
+        "schema": 6,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "url": url,
         "run_idx": run_idx,
@@ -338,6 +367,14 @@ def probe(pw, url, settle, nav_timeout, ip, run_idx, headed=False):
         status = resp.status if resp else None
         row["http_status"] = status
         row["final_url"] = page.url
+        # The document's own content type. Without it a consumer cannot separate a page
+        # from a feed or a JSON endpoint that answers 200 — a distinction the stage-B
+        # frame rule (§1.4 condition (i): "HTTP 200 with an HTML document") depends on,
+        # and one that no amount of reading the DOM recovers.
+        try:
+            row["content_type"] = (resp.headers.get("content-type") if resp else None)
+        except Exception:
+            row["content_type"] = None
         if status is not None and status >= 400:
             # The server refused us. Reading "no prebid" off a 403 body is reading an error
             # page, so the row stops here and is never counted as an absence.

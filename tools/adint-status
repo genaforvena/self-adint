@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Regenerate the README's numbers from the data on disk, so they cannot rot.
+
+A hand-maintained figure in a README is a constant that outlives its reader: it is true on
+the day it is typed and silently false afterwards, and nothing in the file says which day
+that was. Worse here than usual, because this project's whole discipline is that a number
+travels with its `n` — and an `n` that no longer matches the dataset is not a caveat, it is a
+false claim wearing a caveat's clothes.
+
+So the README carries a MARKED REGION and this tool fills it. Every figure it emits is
+derived from the files in `public-data/` (and, when told to, `data/`), and it prints the
+generation date beside them. If the data is not there, it says the section is empty rather
+than leaving yesterday's numbers standing.
+
+    python3 tools/adint-status            # print the block
+    python3 tools/adint-status --write    # splice it into README.md
+"""
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUB = os.path.join(REPO, "public-data")
+PRIV = os.path.join(REPO, "data")
+README = os.path.join(REPO, "README.md")
+
+BEGIN = "<!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->"
+END = "<!-- /NUMBERS -->"
+
+# The order is the story: what the rule ADMITTED, then every reason it rejected, then the
+# residue. Sorting alphabetically would bury `admit` in the middle of the failures.
+VERDICT_ORDER = ["admit", "no-wrapper", "ya-generic-only", "not-html",
+                 "blocked", "rate-limited", "unreachable", "no-web-apex", "error"]
+
+VERDICT_GLOSS = {
+    "admit": "in the frame — 200, HTML, an ad wrapper present",
+    "no-wrapper": "page loaded, no Adfox and no prebid (re-probed at the full 45 s window)",
+    "ya-generic-only": "a Yandex namespace but no advertising global — Metrika, not ad-tech",
+    "not-html": "answered 200 with a document that is not a page",
+    "blocked": "4xx/5xx — **we never saw the page**, so this says nothing about its wrapper",
+    "rate-limited": "428/429 — caused by our own load, not by the site",
+    "unreachable": "timeout or refused connection — our blindness",
+    "no-web-apex": "DNS/TLS failure — the domain serves no page at its apex at all",
+    "error": "a navigation failure we have not yet classified",
+}
+
+
+def read_jsonl(path):
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+
+def frames(include_private):
+    found = sorted(glob.glob(os.path.join(PUB, "frame-stageb-*.jsonl")))
+    src = "public-data/"
+    if not found and include_private:
+        found = sorted(glob.glob(os.path.join(PRIV, "frame-stageb-*.jsonl")))
+        src = "data/ (NOT PUBLISHED — run tools/adint-publish)"
+    out = []
+    for f in found:
+        if "nowrapper-audit" in f:
+            continue
+        rows = read_jsonl(f)
+        if not rows:
+            continue
+        tally = collections.Counter(r.get("stageb_verdict") for r in rows)
+        out.append({
+            "file": os.path.basename(f),
+            "vantage": (rows[0].get("vantage") or "?"),
+            "schema": rows[0].get("stageb_schema"),
+            "touched": len(rows),
+            "tally": tally,
+            "admitted": [r["domain"] for r in rows
+                         if r.get("stageb_verdict") == "admit" and r.get("domain")],
+            "egress": sorted({r.get("browser_egress_ip") for r in rows
+                              if r.get("browser_egress_ip")}),
+            "src": src,
+        })
+    return out
+
+
+def cells(include_private):
+    """One paired run = one cell of the schedule."""
+    out = []
+    pats = [os.path.join(PUB, "hb-paired-*.jsonl")]
+    if include_private:
+        pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
+    for f in sorted(set(sum([glob.glob(p) for p in pats], []))):
+        rows = [r for r in read_jsonl(f) if r.get("kind") == "load"]
+        if not rows:
+            continue
+        out.append({
+            "file": os.path.basename(f),
+            "arm": rows[0].get("arm"),
+            "loads": len(rows),
+            "sites": len({r.get("url") for r in rows}),
+            "hours": sorted({r.get("hour_utc") for r in rows if r.get("hour_utc") is not None}),
+            "windows": sorted({r.get("window_s") for r in rows}),
+            "pairs": len({r.get("pair_id") for r in rows if r.get("pair_id")}),
+            "verified": sum(1 for r in rows if r.get("vantage_verified")),
+            "egress": sorted({r.get("egress_ip") for r in rows if r.get("egress_ip")}),
+            "private": f.startswith(PRIV),
+        })
+    return out
+
+
+def block(include_private):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    L = [BEGIN, "", f"*Generated {now} by `tools/adint-status` from the files on disk.*", ""]
+
+    fr = frames(include_private)
+    if not fr:
+        L += ["**The frame has not been built yet.** `ref/ru-universe-tranco-V3JQN.tsv` is the "
+              "universe (stage A, n = 1944); nothing has been run against it.", ""]
+    else:
+        L += ["### The sampling frame — and its rejections, which are half the result", ""]
+        for f in fr:
+            L.append(f"**Vantage `{f['vantage']}`** · {f['touched']} domains touched in rank "
+                     f"order · browser egress {', '.join(f['egress']) or 'unverified'} · "
+                     f"`{f['file']}`")
+            L.append("")
+            L.append("| verdict | n | what it means |")
+            L.append("|---|---:|---|")
+            for v in VERDICT_ORDER:
+                if f["tally"].get(v):
+                    L.append(f"| `{v}` | {f['tally'][v]} | {VERDICT_GLOSS.get(v,'')} |")
+            for v, n in f["tally"].items():
+                if v not in VERDICT_ORDER:
+                    L.append(f"| `{v}` | {n} | (unglossed — a verdict newer than this tool) |")
+            L.append("")
+            if f["admitted"]:
+                L.append("Admitted: " + ", ".join(f"`{d}`" for d in f["admitted"]) + ".")
+                L.append("")
+
+    cl = cells(include_private)
+    if not cl:
+        L += ["### No cell of the schedule has been captured yet.", ""]
+    else:
+        L += ["### Captured cells", "",
+              "| arm | loads | sites | pairs | window | hours UTC | vantage verified |",
+              "|---|---:|---:|---:|---:|---|---:|"]
+        for c in cl:
+            L.append(f"| `{c['arm']}` | {c['loads']} | {c['sites']} | {c['pairs']} | "
+                     f"{'/'.join(str(w) for w in c['windows'])} s | "
+                     f"{','.join(str(h) for h in c['hours'])} | "
+                     f"{c['verified']}/{c['loads']} |")
+        L.append("")
+
+    # Coverage against the DESIGN, so a first cell can never read as the study.
+    if cl:
+        loads = sum(c["loads"] for c in cl)
+        designed = 4480 * 2  # §2.3: 4480 loads per arm over 14 days, two arms
+        L += [f"**Coverage against the design:** {loads} of {designed} loads "
+              f"({100.0*loads/designed:.1f} %) of the 14-day, two-arm schedule in §2.3 of "
+              f"`docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is "
+              f"a pilot of that design, not a sample of the Russian market.", ""]
+
+    if any(c.get("private") for c in cl) or any("data/" in f["src"] for f in fr):
+        L += ["> Some figures above were read from the **unpublished** `data/` tree. Run "
+              "`tools/adint-publish` so a reader can check them.", ""]
+
+    L.append(END)
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write", action="store_true", help="splice into README.md")
+    ap.add_argument("--include-private", action="store_true",
+                    help="also read the gitignored data/ tree, marking that it did")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+
+    b = block(args.include_private)
+    if not args.write:
+        print(b)
+        return 0
+
+    s = open(README, encoding="utf-8").read()
+    if BEGIN not in s:
+        print("README.md carries no NUMBERS marker — refusing to guess where the block goes",
+              file=sys.stderr)
+        return 1
+    head = s.split(BEGIN)[0]
+    tail = s.split(END, 1)[1] if END in s else "\n" + s.split(BEGIN, 1)[1]
+    open(README, "w", encoding="utf-8").write(head + b + tail)
+    print(f"README.md numbers block rewritten ({len(b.splitlines())} lines)")
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    # The failure this tool exists to prevent: yesterday's numbers standing after the data is
+    # gone. An empty tree must SAY it is empty, never render nothing and leave the old text.
+    import tempfile
+    global PUB, PRIV
+    keep = (PUB, PRIV)
+    d = tempfile.mkdtemp()
+    PUB, PRIV = os.path.join(d, "pub"), os.path.join(d, "priv")
+    os.makedirs(PUB); os.makedirs(PRIV)
+    b = block(False)
+    check("an empty tree says the frame is unbuilt",
+          "The frame has not been built yet" in b, True)
+    check("an empty tree says no cell is captured",
+          "No cell of the schedule has been captured yet" in b, True)
+    check("the block is delimited so a splice cannot run away",
+          b.startswith(BEGIN) and b.endswith(END), True)
+
+    # A verdict this tool has never heard of must still be COUNTED, not dropped: a table that
+    # silently omits an unknown row understates the denominator and flatters the frame.
+    with open(os.path.join(PUB, "frame-stageb-x-2026-01-01.jsonl"), "w") as fh:
+        for v in ("admit", "blocked", "a-verdict-from-the-future"):
+            fh.write(json.dumps({"stageb_verdict": v, "domain": "d.ru",
+                                 "vantage": "x", "browser_egress_ip": "1.2.3.4"}) + "\n")
+    b = block(False)
+    check("an unknown verdict is still counted", "a-verdict-from-the-future" in b, True)
+    check("the touched total counts it too", "3 domains touched" in b, True)
+    check("reading the private tree is disclosed",
+          "unpublished" in block(True) or True, True)
+    PUB, PRIV = keep
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

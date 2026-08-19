@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Copy an observation ledger out of the private `data/` tree into the world-readable
+`public-data/` tree, through an explicit field ALLOWLIST.
+
+WHY THIS TOOL EXISTS AT ALL
+`data/` is gitignored and must stay so: it is where the operator's own device capture lives,
+and the whole project is built on nobody but him being observed. But step0c's frame rule
+requires the REJECTION LEDGER to be published — "the sites without header bidding are named
+separately, their absence is a result too" — and a dataset nobody can fetch cannot be cited,
+audited, or diffed. Those two requirements are not in conflict; they are about two different
+kinds of row:
+
+  data/         OBSERVATIONS OF HIS DEVICE. Advertising ids, bid requests carrying his
+                profile, anything read off the phone. Never published, no exceptions.
+  public-data/  OBSERVATIONS OF THE PUBLIC WEB, made by a throwaway browser profile with no
+                history: which domain answered what, which ad wrapper its page carries, from
+                which of our own vantages. Nothing here is about a person.
+
+ALLOWLIST, NOT DENYLIST
+A denylist is a promise about fields that do not exist yet. Every schema bump adds columns,
+and the ones that leak are exactly the ones nobody thought to exclude. So the copy names what
+it KEEPS; anything a future schema adds is dropped by default and has to be argued into the
+list. The dropped field names are counted and printed, so a schema that grows is visible here
+rather than silent.
+
+The published copy also carries a header naming its source, its rule, and its licence, so it
+travels as a dataset rather than as a file.
+"""
+
+import argparse
+import collections
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUB = os.path.join(REPO, "public-data")
+
+# ── the allowlists, per ledger kind ───────────────────────────────────────────────────
+# Read these as the dataset's schema: what is published IS this list.
+
+FRAME_FIELDS = [
+    # what was asked
+    "stageb_schema", "schema", "ts", "rank", "domain", "url", "final_url",
+    # what came back
+    "http_status", "content_type", "load_s", "settle_used_s", "recheck_settle_s",
+    "recheck_verdict",
+    # the verdict and the evidence for it
+    "stageb_verdict", "verdict", "wrapper_evidence", "globals", "adfox", "other_wrappers",
+    "audit_bucket", "other_stacks", "source_ledger",
+    # where WE stood — a verdict is a claim from a vantage, never from nowhere
+    "vantage", "browser_egress_ip", "shell_egress_ip", "vantage_verified",
+    "vantage_read_age_s",
+    # our own failures, kept as data
+    "error", "scroll_err", "frames_err",
+]
+
+# `adfox_hb` is NOT in the list. It is the publisher's own bidder roster and would be a fine
+# thing to publish, but it is a nested blob whose shape we do not control, and this tool's
+# whole point is that unreviewed structure does not cross the boundary. Publishing it is a
+# deliberate later step with its own read-through, not a default.
+
+PAIRED_FIELDS = [
+    "schema", "kind", "load_id", "pair_id", "ts", "hour_utc", "url", "arm", "arm_note",
+    "run_idx", "window_s", "profile_age_s", "wrapper_timeout_ms", "roster",
+    "egress_ip", "browser_used_proxy", "vantage_verified", "browser_egress_ip",
+    "outcome", "outcomes", "is_bid_candidate", "evidence_strength",
+    "window_shorter_than_wrapper", "n_candidates", "error",
+]
+
+KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS}
+
+HEADER = """# {name}
+#
+# SOURCE     {src} (produced by {tool})
+# RULE       {rule}
+# LICENCE    CC0 1.0 — public domain dedication. Cite it, fork it, contradict it.
+# PUBLISHED  by tools/adint-publish through an explicit field allowlist ({nkept} fields).
+#            Fields not on that list are dropped, including ones added by later schemas.
+# NOT HERE   anything observed from the operator's own device. That tree is `data/` and it
+#            is gitignored; this file is observations of the PUBLIC WEB made by a throwaway
+#            browser profile with no history.
+# BLINDNESS  a passive read of what a wrapper hands the browser. A server-side auction is not
+#            observable from here at all, so an absence in this file is an absence in OUR
+#            view, never a fact about the publisher's business.
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kind", choices=sorted(KINDS), required=False)
+    ap.add_argument("--rule", default="see docs/step0c-hb-ru-market-study-2026-08-18.md")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("source", nargs="?")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+    if not args.source or not args.kind:
+        print("usage: adint-publish --kind {frame,paired} <data/…jsonl>", file=sys.stderr)
+        return 2
+
+    keep = KINDS[args.kind]
+    os.makedirs(PUB, exist_ok=True)
+    out = args.out or os.path.join(PUB, os.path.basename(args.source))
+
+    dropped = collections.Counter()
+    n = 0
+    rows = []
+    with open(args.source, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            for k in r:
+                if k not in keep:
+                    dropped[k] += 1
+            rows.append({k: r[k] for k in keep if k in r})
+            n += 1
+
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(HEADER.format(
+            name=os.path.basename(out), src=os.path.basename(args.source),
+            tool="tools/adint-frame-stageb" if args.kind == "frame" else "tools/adint-hb-capture",
+            rule=args.rule, nkept=len(keep)))
+        fh.write(f"# ROWS       {n}\n")
+        if dropped:
+            fh.write("# DROPPED    " + ", ".join(
+                f"{k}({v})" for k, v in sorted(dropped.items())) + "\n")
+        fh.write("#\n")
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"{n} row(s) -> {out}")
+    if dropped:
+        print("dropped (not on the allowlist): "
+              + ", ".join(f"{k}×{v}" for k, v in sorted(dropped.items())))
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    # The property that matters: a field NOBODY anticipated must not cross. This is the exact
+    # failure a denylist has — it passes on any column invented after it was written.
+    row = {"domain": "x.ru", "stageb_verdict": "admit",
+           "device_ifa": "SHOULD-NEVER-CROSS",
+           "a_column_invented_next_month": "also never"}
+    kept = {k: row[k] for k in FRAME_FIELDS if k in row}
+    check("an unanticipated field is dropped by default",
+          sorted(kept), ["domain", "stageb_verdict"])
+    check("an advertising id is not on the frame allowlist",
+          "device_ifa" in FRAME_FIELDS, False)
+    for f in ("ifa", "device_ifa", "gaid", "idfa", "imei", "msisdn", "user", "user_data",
+              "eids", "cookies", "post_data", "body", "request_body", "response_body"):
+        if f in FRAME_FIELDS or f in PAIRED_FIELDS:
+            ok = False
+            print(f"FAIL an identity/body field is on an allowlist: {f}")
+    print("ok   no identity or body field appears on either allowlist")
+    # The vantage must survive the copy: a verdict published without the standpoint it was
+    # taken from is exactly the row §2.5 says must be discarded.
+    for f in ("vantage", "browser_egress_ip", "vantage_verified"):
+        check(f"the vantage column `{f}` is published", f in FRAME_FIELDS, True)
+    check("the pair key is published", "pair_id" in PAIRED_FIELDS, True)
+    check("the window is published", "window_s" in PAIRED_FIELDS, True)
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
