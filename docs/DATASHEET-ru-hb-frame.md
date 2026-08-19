@@ -163,9 +163,11 @@ capture, and — unexpectedly — as evidence about the frame rule itself (see *
    all**. It answers 200 and serves a page carrying no auction config, while the same URL
    from Moscow carries `YaHeaderBiddingSettings`. So this is not only geo-blocking: a page
    you can load can still be the wrong page, and no HTTP status in the ledger reveals it.
-   The reverse hole does not exist — every domain Amsterdam admits and Moscow has reached,
-   Moscow admits too. Any user of this dataset must read the `vantage` column as part of the
-   verdict, never as metadata about it.
+   **The reverse hole exists too**, found once the RU walk went deeper: `lenta.ru` #3128 is
+   admitted from Amsterdam with two bidders and reads `ad-serving-only` from Moscow, on four
+   interleaved probes spanning 32 minutes at a common 45 s window. So *neither* single-vantage
+   frame is complete, and the union is strictly better than either. Any user of this dataset
+   must read the `vantage` column as part of the verdict, never as metadata about it.
 4. **Unstratified means rank-ordered, and rank correlates with everything.** Until categories
    are committed, the admitted set is biased toward whatever the top of the Russian resolver
    traffic distribution happens to be.

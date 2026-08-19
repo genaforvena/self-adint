@@ -324,6 +324,25 @@ a{color:var(--evidence)} a:focus-visible,.seg:focus-visible{outline:2px solid va
 """
 
 
+def hole_counts(d, vantage):
+    """(holes in the canonical frame, holes in the other) — a HOLE is a domain the other
+    vantage admits that this one REACHED and did not admit. A domain this vantage has not
+    reached yet is pending, not a hole, and conflating them is how a frame's completeness
+    gets overstated."""
+    fr = d["frames"]
+    if len(fr) < 2 or not vantage:
+        return 0, 0
+    me = next((f for f in fr if f["vantage"] == vantage), None)
+    other = next((f for f in fr if f["vantage"] != vantage), None)
+    if not me or not other:
+        return 0, 0
+    vm = {r["domain"]: r.get("stageb_verdict") for r in me["rows"]}
+    vo = {r["domain"]: r.get("stageb_verdict") for r in other["rows"]}
+    adm_m = {k for k, v in vm.items() if v == "admit"}
+    adm_o = {k for k, v in vo.items() if v == "admit"}
+    return (len((adm_o & set(vm)) - adm_m), len((adm_m & set(vo)) - adm_o))
+
+
 def canonical_vantage():
     """The vantage named in ref/CANONICAL-FRAME, or None if nothing is declared."""
     p = os.path.join(REPO, "ref", "CANONICAL-FRAME")
@@ -398,10 +417,29 @@ def build(d, generated):
     # grid, so a stray <p> takes a cell and shoves the last tile onto its own row. Nothing
     # in the generator complains; it only shows up in the rendered page.
     if not undeclared:
+        # DERIVED, not asserted. This sentence first read "a frame built from the other
+        # vantage is missing real publishers outright" — true when the canonical frame had no
+        # hole of its own, false fifteen minutes later when the walk found one. Twice now a
+        # hand-written conclusion has outlived its data on this page; the fix is the same
+        # both times, so it is applied here rather than re-typed.
+        hn, ho = hole_counts(d, main["vantage"] if main else None)
+        if ho and hn:
+            verdict = (f'Neither frame is complete: the other vantage is missing '
+                       f'<strong>{ho}</strong> domain{"s" if ho != 1 else ""} this one '
+                       f'admits, and this one is missing <strong>{hn}</strong> that it '
+                       f'admits. The union of both is strictly better than either — see '
+                       f'below.')
+        elif ho:
+            verdict = (f'That is not a formality: a frame built from the other vantage is '
+                       f'missing <strong>{ho}</strong> real publisher'
+                       f'{"s" if ho != 1 else ""} outright, and this one is missing none of '
+                       f'what the other admits — see below.')
+        else:
+            verdict = ('At the ranks walked so far the two vantages admit the same set, so '
+                       'this declaration costs nothing either way — see below.')
         A(f'<p>The study runs on the frame built from '
           f'<strong class="mono">{html.escape(main["vantage"])}</strong>, declared in '
-          f'<code>ref/CANONICAL-FRAME</code>. That is not a formality: a frame built from '
-          f'the other vantage is missing real publishers outright — see below.</p>')
+          f'<code>ref/CANONICAL-FRAME</code>. {verdict}</p>')
     A('</section>')
 
     # ── the ledger
@@ -744,6 +782,39 @@ def selftest():
 
     check("the canonical frame is read from the declaration",
           canonical_vantage(), "ru-mobile")
+    # A domain the other vantage admits and this one REACHED and refused is a hole; one this
+    # vantage has not reached is pending. The page's headline sentence turns on the
+    # difference, so it is asserted here rather than trusted.
+    CANON = canonical_vantage() or "me"
+
+    def _fake(pairs, reached_only_by_other=()):
+        rows_m, rows_o = [], []
+        for i, (dm, a, b) in enumerate(pairs, 1):
+            rows_m.append({"domain": dm, "rank": i, "stageb_verdict": a,
+                           "vantage": CANON})
+            rows_o.append({"domain": dm, "rank": i, "stageb_verdict": b, "vantage": "other"})
+        for j, dm in enumerate(reached_only_by_other, 100):
+            rows_o.append({"domain": dm, "rank": j, "stageb_verdict": "admit",
+                           "vantage": "other"})
+        mk = lambda v, rows: {"vantage": v, "rows": rows, "file": v, "public": True,
+                              "tally": collections.Counter(), "admitted": [], "ranks": [],
+                              "egress": []}
+        return {"frames": [mk(CANON, rows_m), mk("other", rows_o)], "cells": [],
+                "pairs": []}
+    check("a refusal where the other admits counts as a hole",
+          hole_counts(_fake([("a.ru", "blocked", "admit")]), CANON), (1, 0))
+    check("a domain not yet reached is NOT counted as a hole",
+          hole_counts(_fake([("a.ru", "admit", "admit")], ("deep.ru",)), CANON), (0, 0))
+    check("holes are counted in both directions",
+          hole_counts(_fake([("a.ru", "blocked", "admit"),
+                             ("b.ru", "admit", "ad-serving-only")]), CANON), (1, 1))
+    both = build(_fake([("a.ru", "blocked", "admit"),
+                        ("b.ru", "admit", "ad-serving-only")]), "T")
+    check("two-sided holes are reported as neither frame being complete",
+          "Neither frame is complete" in both, True)
+    one = build(_fake([("a.ru", "admit", "admit")], ("deep.ru",)), "T")
+    check("no hole does not claim the other frame is missing publishers",
+          "missing" in one.split("declared in")[1][:400], False)
     page = build(gather(), "TEST")
     check("the page says which vantage's frame the study runs on",
           "declared in" in page, True)

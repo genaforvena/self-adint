@@ -1,9 +1,9 @@
 # stage B frame — produced by tools/adint-frame-stageb, schema 3
 # universe: ru-universe-tranco-V3JQN.tsv (stage A, committed)
 # vantage: ru-mobile · settle 8s · no-wrapper re-probed at 45s
-# generated: 2026-08-19T07:26:09Z
+# generated: 2026-08-19T07:45:27Z
 # The REJECTIONS are the other half of this artifact and live in the ledger beside it: frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
-# ledger tally: ad-serving-only=13 admit=6 blocked=9 no-web-apex=28 no-wrapper=9 rate-limited=1 unreachable=6 ya-generic-only=30
+# ledger tally: ad-serving-only=14 admit=6 blocked=10 no-web-apex=35 no-wrapper=10 rate-limited=1 unreachable=10 ya-generic-only=38
 # `blocked` / `rate-limited` / `error` are NOT evidence of absent header bidding — they are our own blindness, named.
 rank	domain	wrapper_evidence	settle_used_s	browser_egress_ip
 721	magnit.ru	YaHeaderBiddingSettings(bidders=3)	8	91.79.81.62

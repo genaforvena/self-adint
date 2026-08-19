@@ -16,8 +16,28 @@ ledger:   public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
 #     #1163  rbc.ru        nl-direct says blocked (401)
 #     #1169  gismeteo.ru   nl-direct says blocked (403)
 #     #1754  hh.ru         nl-direct says ya-generic-only  <- NOT an access failure
-#   HOLE in a ru-mobile-built frame:
-#     none — every domain nl-direct admits and ru-mobile has reached, ru-mobile admits too.
+#   HOLE in a ru-mobile-built frame (found 07:44Z, ~15 min after this file was written):
+#     #3128  lenta.ru      ru-mobile says ad-serving-only
+#
+# THAT SECOND HOLE CORRECTS THIS FILE'S ORIGINAL ARGUMENT. When the declaration was made the
+# asymmetry was one-directional and the RU frame lost nothing; the RU walk then reached rank
+# 3128 and it no longer is. NEITHER single-vantage frame is complete: hh.ru is admitted only
+# from Moscow, lenta.ru only from Amsterdam, and both are CONTENT differences rather than
+# access. The union (11 domains at ranks 13-3128) is strictly better than either.
+#
+# The declaration is left at `ru-mobile` because that is the operator's instruction and it
+# is still the smaller hole — 1 against 3. Switching to a union frame is a decision for the
+# operator, not for whoever regenerates this file, and it carries a real cost: a union is no
+# longer a rank-ordered prefix of ONE walk, so its reproduction instructions change.
+#
+# lenta.ru is not a flake and not a config change, and the evidence is the INTERLEAVING:
+#   07:10:42Z  nl-direct  admit            hb_present=True   settle 8s
+#   07:36:23Z  ru-mobile  ad-serving-only  hb_present=False  settle 45s
+#   07:38:47Z  nl-direct  admit            hb_present=True   settle 45s   <- between the two
+#   07:42:45Z  ru-mobile  ad-serving-only  hb_present=False  settle 45s
+# An NL read sits BETWEEN two RU reads, and both re-probes used the same window. Time cannot
+# explain it and neither can the window; the vantage can. (Interleave the probes whenever a
+# per-vantage difference has to be told apart from a per-time one.)
 #
 # The asymmetry is the whole argument. A frame built from Amsterdam is a frame of "Russian
 # sites Amsterdam is allowed to load", and it never says so; two of its three holes are

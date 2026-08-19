@@ -133,11 +133,36 @@ reached by both walks (ranks 13–2463):
 
 | | admits | hole — the other vantage admits it, this one reached it and refused |
 |---|---:|---|
-| `nl-direct` | 5 | **3** — `rbc.ru` #1163, `gismeteo.ru` #1169, `hh.ru` #1754 |
-| `ru-mobile` | 6 | **none** |
+| `nl-direct` | 8 | **3** — `rbc.ru` #1163, `gismeteo.ru` #1169, `hh.ru` #1754 |
+| `ru-mobile` | 6 | **1** — `lenta.ru` #3128 |
 
-The asymmetry is the whole argument, and it is one-directional: every domain Amsterdam
-admits and Moscow has reached, Moscow admits too. A Moscow-built frame loses nothing.
+**The first version of this section said the asymmetry was one-directional and that a
+Moscow-built frame lost nothing. That was true of the data it was written on (ranks 13–2463)
+and stopped being true fifteen minutes later**, when the RU walk reached rank 3128 and read
+`lenta.ru` as `ad-serving-only` while Amsterdam admits it with two bidders.
+
+So: **neither single-vantage frame is complete.** `hh.ru` is admitted only from Moscow,
+`lenta.ru` only from Amsterdam, and *both are content differences rather than access* — each
+vantage is served a page the other is not. The union (11 domains at ranks 13–3128) is
+strictly better than either. The declaration stays at `ru-mobile` because that is the
+operator's instruction and it is still the smaller hole, 1 against 3; moving to a union frame
+is his call and carries a real cost, since a union is no longer a rank-ordered prefix of one
+walk and its reproduction instructions change.
+
+**`lenta.ru` is not a flake and not a config change, and the reason we can say so is the
+interleaving** — the cheap trick for separating a per-vantage difference from a per-time one:
+
+| time | vantage | verdict | `hb_settings` | window |
+|---|---|---|---|---|
+| 07:10:42Z | `nl-direct` | `admit` | true (2 bidders) | 8 s |
+| 07:36:23Z | `ru-mobile` | `ad-serving-only` | false | 45 s |
+| **07:38:47Z** | **`nl-direct`** | **`admit`** | **true (2 bidders)** | **45 s** |
+| 07:42:45Z | `ru-mobile` | `ad-serving-only` | false | 45 s |
+
+An NL read sits *between* two RU reads, and both re-probes ran at the same window. Time
+cannot explain the split and neither can the window. The vantage can. Given the measured
+per-probe miss rate of 15–25 % on known-HB sites (§3), a single disagreeing read would not
+have been enough; four interleaved reads are.
 
 **`hh.ru` is the one that widens the finding.** It is *not* blocked from Amsterdam — it
 answers 200 and renders. From there it carries only the generic Yandex namespace and no
@@ -154,9 +179,9 @@ two are indistinguishable in any disagreement total and only one of them is a de
 
 **Consequences, and they bind the design rather than decorating it:**
 
-1. **The frame is built from the RU vantage** — done, above. The alternative, a union of
-   both with every disagreement published, remains available and is what a third vantage
-   would require. An `nl-direct` frame is a frame of *Russian sites Amsterdam is allowed to
+1. **The frame is built from the RU vantage** — done, above, and it is the smaller hole
+   rather than no hole. The union of both with every disagreement published is now strictly
+   better than either single vantage, and is what a third vantage would require anyway. An `nl-direct` frame is a frame of *Russian sites Amsterdam is allowed to
    load*, which is a different population and never says so.
 2. **A paired study on an NL-built frame compares the arms on sites selected by one of
    them** — and the excluded ones are systematically the news publishers, i.e. exactly where
