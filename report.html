@@ -1,0 +1,200 @@
+<title>Where Russian Header Bidding Starts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;0,7..72,700;1,7..72,400&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --paper:#EFF2ED; --surface:#F7F9F5; --ink:#14201C; --muted:#5B6660; --rule:#D5DBD3;
+  --evidence:#1C7F5C; --blind:#B85218; --domain:#5A5CA8; --shade:#E4E9E1;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#101614; --surface:#141B18; --ink:#E3E9E2; --muted:#97A29B; --rule:#26302B;
+    --evidence:#34A67C; --blind:#D97534; --domain:#7B7FD6; --shade:#1B2320;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#101614; --surface:#141B18; --ink:#E3E9E2; --muted:#97A29B; --rule:#26302B;
+  --evidence:#34A67C; --blind:#D97534; --domain:#7B7FD6; --shade:#1B2320;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:Literata,Georgia,"Times New Roman",serif;
+  font-size:17px; line-height:1.62; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1000px;margin:0 auto;padding:0 24px 96px}
+header.masthead{padding:64px 0 28px;border-bottom:1px solid var(--rule)}
+.kicker{
+  font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;
+}
+h1{
+  font-size:clamp(30px,4.6vw,50px);line-height:1.08;margin:.36em 0 .18em;
+  font-weight:700;letter-spacing:-.018em;text-wrap:balance;
+}
+.standfirst{font-size:20px;line-height:1.5;color:var(--muted);max-width:62ch;margin:0}
+section{padding:44px 0;border-bottom:1px solid var(--rule);display:flex;
+  flex-direction:column;gap:20px}
+section:last-of-type{border-bottom:0}
+h2{font-size:26px;line-height:1.22;margin:0;font-weight:700;letter-spacing:-.012em;
+  text-wrap:balance;max-width:26ch}
+h3{font-size:18px;margin:0;font-weight:600}
+p{margin:0;max-width:66ch}
+.status{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--muted);display:inline-flex;align-items:center;gap:8px;
+}
+.status::before{content:"";width:22px;height:2px;background:currentColor;display:block}
+.tiles{display:grid;gap:2px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  background:var(--rule);border:1px solid var(--rule)}
+.tile{background:var(--surface);padding:20px 18px;display:flex;flex-direction:column;gap:5px}
+.tile .n{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:34px;line-height:1;
+  font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.tile .lab{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.tile .sub{font-size:14px;color:var(--muted);line-height:1.42}
+figure{margin:0;display:flex;flex-direction:column;gap:12px}
+figcaption{font-size:14px;color:var(--muted);max-width:70ch}
+.panel{background:var(--surface);border:1px solid var(--rule);padding:22px}
+.legend{display:flex;flex-wrap:wrap;gap:18px;font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:12px;letter-spacing:.04em}
+.legend span{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
+.swatch{width:12px;height:12px;border-radius:2px;display:block}
+.sw-evidence{background:var(--evidence)} .sw-blind{background:var(--blind)}
+.sw-domain{background:var(--domain)}
+.fill-evidence{fill:var(--evidence)} .fill-blind{fill:var(--blind)}
+.fill-domain{fill:var(--domain)}
+.seg{transition:opacity .12s} .seg:hover{opacity:.72;cursor:default}
+.grid{stroke:var(--rule);stroke-width:1} .axis-line{stroke:var(--rule);stroke-width:1}
+.axis{fill:var(--muted);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px}
+.val{fill:var(--ink);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;
+  font-variant-numeric:tabular-nums}
+.tick-walked{stroke:var(--domain);stroke-width:1.5;opacity:.4}
+.tick-admit{stroke:var(--evidence);stroke-width:2.5}
+.tablewrap{overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);font-weight:400}
+td.n{font-family:"IBM Plex Mono",ui-monospace,monospace;text-align:right;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.9em}
+code{background:var(--shade);padding:1px 5px;border-radius:3px}
+pre{background:var(--surface);border:1px solid var(--rule);padding:16px;overflow-x:auto;
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px;line-height:1.65;margin:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;
+  vertical-align:baseline}
+.note{border-left:2px solid var(--blind);padding:2px 0 2px 16px;color:var(--muted);
+  font-size:15.5px;max-width:64ch}
+.cols{display:grid;gap:26px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+footer{padding:40px 0 0;color:var(--muted);font-size:14px;display:flex;
+  flex-direction:column;gap:8px}
+a{color:var(--evidence)} a:focus-visible,.seg:focus-visible{outline:2px solid var(--evidence);
+  outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+<div class="wrap">
+<header class="masthead">
+<div class="kicker"><span>self-adint · step 0d</span><span>generated 2026-08-19 07:00 UTC</span><span>CC0 1.0</span></div>
+<h1>Where Russian header bidding starts</h1>
+<p class="standfirst">A frame built by a published rule, walked in rank order — and the rule inverted on contact. What follows is a report about an instrument, not about a market. Every figure carries its <span class="mono">n</span> and the vantage it was measured from.</p>
+</header>
+<section>
+<span class="status">Measured</span>
+<div class="tiles">
+<div class="tile"><span class="lab">domains walked</span><span class="n">69</span><span class="sub">in strict Tranco rank order from a universe of 1,944</span></div>
+<div class="tile"><span class="lab">in the frame</span><span class="n" style="color:var(--evidence)">2</span><span class="sub">carry an auction config we can read</span></div>
+<div class="tile"><span class="lab">admission density</span><span class="n">2.9%</span><span class="sub">the study's binding cost is the frame, not the capture</span></div>
+<div class="tile"><span class="lab">first admission at rank</span><span class="n">#721</span><span class="sub">nothing above it runs an observable auction</span></div>
+</div>
+</section>
+<section>
+<span class="status">Measured · rejections published</span>
+<h2>The rejections are half the dataset</h2>
+<p>A frame that publishes only what it admitted cannot be audited. Every domain the probe touched is here with its verdict, and the verdicts are kept apart by <em>whose fact</em> they are — because folding our own blindness into a finding about the market is the one mistake this study cannot afford.</p>
+<figure><div class="panel">
+<svg viewBox="0 0 880 54" width="100%" height="54" role="img" aria-label="verdict shares across 69 domains walked"><g class="seg"><title>admit: 2 of 69 domains — 200, HTML, and an auction config — a bidder roster or a prebid global</title><rect x="0.0" y="0" width="23.5" height="54" rx="3" class="fill-evidence"/></g><g class="seg"><title>ad-serving-only: 10 of 69 domains — Yandex ad code, no auction config: sells ads without asking several bidders</title><rect x="25.5" y="0" width="125.5" height="54" rx="3" class="fill-domain"/></g><g class="seg"><title>no-wrapper: 7 of 69 domains — the page loaded and carried nothing to bid with (re-probed at 45 s)</title><rect x="153.0" y="0" width="87.3" height="54" rx="3" class="fill-domain"/></g><g class="seg"><title>ya-generic-only: 17 of 69 domains — a Yandex namespace only — Metrika is not ad-tech</title><rect x="242.3" y="0" width="214.8" height="54" rx="3" class="fill-domain"/></g><g class="seg"><title>no-web-apex: 19 of 69 domains — DNS or TLS failure — no site at this domain&#x27;s apex at all</title><rect x="459.1" y="0" width="240.3" height="54" rx="3" class="fill-domain"/></g><g class="seg"><title>blocked: 9 of 69 domains — 4xx/5xx — we never saw the page, so this says nothing about it</title><rect x="701.4" y="0" width="112.8" height="54" rx="3" class="fill-blind"/></g><g class="seg"><title>rate-limited: 1 of 69 domains — 428/429 — caused by our own load</title><rect x="816.2" y="0" width="10.8" height="54" rx="3" class="fill-blind"/></g><g class="seg"><title>unreachable: 4 of 69 domains — timeout or refused connection</title><rect x="829.0" y="0" width="49.0" height="54" rx="3" class="fill-blind"/></g></svg>
+<div class="legend" style="margin-top:14px"><span><i class="swatch sw-evidence"></i>we saw an auction</span><span><i class="swatch sw-domain"></i>a fact about the domain</span><span><i class="swatch sw-blind"></i>our own blindness</span></div>
+</div>
+<figcaption>All 69 domains walked from vantage <span class="mono">nl-direct</span> · browser egress 77.246.104.228. Segment widths are shares of 69; hover any segment for its count.</figcaption>
+</figure>
+<div class="tablewrap"><table>
+<thead><tr><th>verdict</th><th>n</th><th>state of knowledge</th><th>what it means</th></tr></thead><tbody>
+<tr><td><span class="dot sw-evidence"></span><code>admit</code></td><td class="n">2</td><td>evidence</td><td>200, HTML, and an auction config — a bidder roster or a prebid global</td></tr>
+<tr><td><span class="dot sw-domain"></span><code>ad-serving-only</code></td><td class="n">10</td><td>about the domain</td><td>Yandex ad code, no auction config: sells ads without asking several bidders</td></tr>
+<tr><td><span class="dot sw-domain"></span><code>no-wrapper</code></td><td class="n">7</td><td>about the domain</td><td>the page loaded and carried nothing to bid with (re-probed at 45 s)</td></tr>
+<tr><td><span class="dot sw-domain"></span><code>ya-generic-only</code></td><td class="n">17</td><td>about the domain</td><td>a Yandex namespace only — Metrika is not ad-tech</td></tr>
+<tr><td><span class="dot sw-domain"></span><code>no-web-apex</code></td><td class="n">19</td><td>about the domain</td><td>DNS or TLS failure — no site at this domain&#x27;s apex at all</td></tr>
+<tr><td><span class="dot sw-blind"></span><code>blocked</code></td><td class="n">9</td><td>our blindness</td><td>4xx/5xx — we never saw the page, so this says nothing about it</td></tr>
+<tr><td><span class="dot sw-blind"></span><code>rate-limited</code></td><td class="n">1</td><td>our blindness</td><td>428/429 — caused by our own load</td></tr>
+<tr><td><span class="dot sw-blind"></span><code>unreachable</code></td><td class="n">4</td><td>our blindness</td><td>timeout or refused connection</td></tr>
+</tbody></table></div>
+</section>
+<section>
+<span class="status">Measured</span>
+<h2>Header bidding does not live at the top of the list</h2>
+<p>Tranco ranks by resolver traffic, so it answers <em>what is resolved</em>, not <em>what a person reads with ads on it</em>. The top of the Russian list is CDNs, registrars, telecoms, marketplaces and government. The first domain that runs an auction we can observe appears far down the walk.</p>
+<figure><div class="panel">
+<svg viewBox="0 0 880 76" width="100%" height="76" role="img" aria-label="rank positions of walked and admitted domains"><line x1="8" y1="34" x2="872" y2="34" class="axis-line"/><line x1="8.0" y1="27" x2="8.0" y2="41" class="tick-walked"/><line x1="10.7" y1="27" x2="10.7" y2="41" class="tick-walked"/><line x1="51.2" y1="27" x2="51.2" y2="41" class="tick-walked"/><line x1="53.9" y1="27" x2="53.9" y2="41" class="tick-walked"/><line x1="57.2" y1="27" x2="57.2" y2="41" class="tick-walked"/><line x1="73.4" y1="27" x2="73.4" y2="41" class="tick-walked"/><line x1="80.9" y1="27" x2="80.9" y2="41" class="tick-walked"/><line x1="87.4" y1="27" x2="87.4" y2="41" class="tick-walked"/><line x1="95.5" y1="27" x2="95.5" y2="41" class="tick-walked"/><line x1="110.7" y1="27" x2="110.7" y2="41" class="tick-walked"/><line x1="126.9" y1="27" x2="126.9" y2="41" class="tick-walked"/><line x1="130.1" y1="27" x2="130.1" y2="41" class="tick-walked"/><line x1="132.8" y1="27" x2="132.8" y2="41" class="tick-walked"/><line x1="158.2" y1="27" x2="158.2" y2="41" class="tick-walked"/><line x1="161.5" y1="27" x2="161.5" y2="41" class="tick-walked"/><line x1="168.5" y1="27" x2="168.5" y2="41" class="tick-walked"/><line x1="176.0" y1="27" x2="176.0" y2="41" class="tick-walked"/><line x1="195.5" y1="27" x2="195.5" y2="41" class="tick-walked"/><line x1="200.9" y1="27" x2="200.9" y2="41" class="tick-walked"/><line x1="204.7" y1="27" x2="204.7" y2="41" class="tick-walked"/><line x1="212.8" y1="27" x2="212.8" y2="41" class="tick-walked"/><line x1="220.4" y1="27" x2="220.4" y2="41" class="tick-walked"/><line x1="233.9" y1="27" x2="233.9" y2="41" class="tick-walked"/><line x1="240.3" y1="27" x2="240.3" y2="41" class="tick-walked"/><line x1="247.9" y1="27" x2="247.9" y2="41" class="tick-walked"/><line x1="248.5" y1="27" x2="248.5" y2="41" class="tick-walked"/><line x1="257.1" y1="27" x2="257.1" y2="41" class="tick-walked"/><line x1="295.5" y1="27" x2="295.5" y2="41" class="tick-walked"/><line x1="305.2" y1="27" x2="305.2" y2="41" class="tick-walked"/><line x1="311.1" y1="27" x2="311.1" y2="41" class="tick-walked"/><line x1="329.0" y1="27" x2="329.0" y2="41" class="tick-walked"/><line x1="333.3" y1="27" x2="333.3" y2="41" class="tick-walked"/><line x1="352.2" y1="27" x2="352.2" y2="41" class="tick-walked"/><line x1="365.2" y1="27" x2="365.2" y2="41" class="tick-walked"/><line x1="379.2" y1="27" x2="379.2" y2="41" class="tick-walked"/><line x1="380.8" y1="27" x2="380.8" y2="41" class="tick-walked"/><line x1="385.2" y1="27" x2="385.2" y2="41" class="tick-walked"/><line x1="390.6" y1="27" x2="390.6" y2="41" class="tick-walked"/><line x1="406.2" y1="27" x2="406.2" y2="41" class="tick-walked"/><line x1="424.1" y1="27" x2="424.1" y2="41" class="tick-walked"/><line x1="448.4" y1="27" x2="448.4" y2="41" class="tick-walked"/><line x1="451.1" y1="27" x2="451.1" y2="41" class="tick-walked"/><line x1="468.4" y1="27" x2="468.4" y2="41" class="tick-walked"/><line x1="492.1" y1="27" x2="492.1" y2="41" class="tick-walked"/><line x1="498.1" y1="27" x2="498.1" y2="41" class="tick-walked"/><line x1="513.2" y1="27" x2="513.2" y2="41" class="tick-walked"/><line x1="524.0" y1="27" x2="524.0" y2="41" class="tick-walked"/><line x1="549.4" y1="27" x2="549.4" y2="41" class="tick-walked"/><line x1="551.6" y1="27" x2="551.6" y2="41" class="tick-walked"/><line x1="564.0" y1="27" x2="564.0" y2="41" class="tick-walked"/><line x1="604.0" y1="27" x2="604.0" y2="41" class="tick-walked"/><line x1="614.3" y1="27" x2="614.3" y2="41" class="tick-walked"/><line x1="617.5" y1="27" x2="617.5" y2="41" class="tick-walked"/><line x1="620.2" y1="27" x2="620.2" y2="41" class="tick-walked"/><line x1="627.8" y1="27" x2="627.8" y2="41" class="tick-walked"/><line x1="629.4" y1="27" x2="629.4" y2="41" class="tick-walked"/><line x1="632.6" y1="27" x2="632.6" y2="41" class="tick-walked"/><line x1="652.6" y1="27" x2="652.6" y2="41" class="tick-walked"/><line x1="654.2" y1="27" x2="654.2" y2="41" class="tick-walked"/><line x1="673.2" y1="27" x2="673.2" y2="41" class="tick-walked"/><line x1="711.5" y1="27" x2="711.5" y2="41" class="tick-walked"/><line x1="717.5" y1="27" x2="717.5" y2="41" class="tick-walked"/><line x1="728.8" y1="27" x2="728.8" y2="41" class="tick-walked"/><line x1="752.6" y1="27" x2="752.6" y2="41" class="tick-walked"/><line x1="757.4" y1="27" x2="757.4" y2="41" class="tick-walked"/><line x1="827.7" y1="27" x2="827.7" y2="41" class="tick-walked"/><line x1="842.3" y1="27" x2="842.3" y2="41" class="tick-walked"/><line x1="863.4" y1="27" x2="863.4" y2="41" class="tick-walked"/><line x1="872.0" y1="27" x2="872.0" y2="41" class="tick-walked"/><line x1="390.6" y1="19" x2="390.6" y2="49" class="tick-admit"/><text x="396.6" y="64" class="val" text-anchor="start">magnit.ru #721</text><line x1="620.2" y1="19" x2="620.2" y2="49" class="tick-admit"/><text x="614.2" y="64" class="val" text-anchor="end">pikabu.ru #1146</text><text x="8" y="14" class="axis">rank 13</text><text x="872" y="14" class="axis" text-anchor="end">rank 1612</text></svg>
+</div><figcaption>Every domain walked (faint) and every domain admitted (solid), positioned by Tranco rank.</figcaption></figure>
+<div class="tablewrap"><table>
+<thead><tr><th>rank</th><th>domain</th><th>evidence for admission</th></tr></thead><tbody>
+<tr><td class="n">#721</td><td><code>magnit.ru</code></td><td class="mono">YaHeaderBiddingSettings(bidders=3)</td></tr>
+<tr><td class="n">#1146</td><td><code>pikabu.ru</code></td><td class="mono">YaHeaderBiddingSettings(bidders=19)</td></tr>
+</tbody></table></div>
+<p class="note">The rule first admitted seven domains near the top of the list — including two registrars and an image CDN. Not one of them carried a bidder roster: they had been admitted on Yandex’s ad-<em>serving</em> globals, which mean a page shows advertising, not that it asks several bidders. The frame contained zero instances of the phenomenon the study measures, and looked full.</p>
+</section>
+<section>
+<span class="status">Measured · confounded, and named</span>
+<h2>The slow arm turns answers into silence</h2>
+<p>Both arms load the same site in the same minute — a barrier, not two walks that drift apart — and read the same bidder roster off the page. They still disagree about the market, and the disagreement is the link, not the demand.</p>
+<figure><div class="panel">
+<svg viewBox="0 0 760 260" width="100%" height="260" role="img" aria-label="outcome counts by arm"><line x1="46" y1="226.0" x2="748" y2="226.0" class="grid"/><text x="38" y="230.0" class="axis" text-anchor="end">0</text><line x1="46" y1="172.5" x2="748" y2="172.5" class="grid"/><text x="38" y="176.5" class="axis" text-anchor="end">28</text><line x1="46" y1="119.0" x2="748" y2="119.0" class="grid"/><text x="38" y="123.0" class="axis" text-anchor="end">56</text><line x1="46" y1="65.5" x2="748" y2="65.5" class="grid"/><text x="38" y="69.5" class="axis" text-anchor="end">85</text><line x1="46" y1="12.0" x2="748" y2="12.0" class="grid"/><text x="38" y="16.0" class="axis" text-anchor="end">113</text><g class="seg"><title>nl-direct · priced: 1</title><rect x="65.5" y="224.1" width="37.0" height="2.0" rx="3" class="fill-evidence"/></g><text x="84.0" y="218.1" class="val" text-anchor="middle">1</text><g class="seg"><title>ru-mobile · priced: 0</title><rect x="104.5" y="226.0" width="37.0" height="2.0" rx="3" class="fill-blind"/></g><text x="123.0" y="220.0" class="val" text-anchor="middle">0</text><text x="104.5" y="250" class="axis" text-anchor="middle">priced</text><g class="seg"><title>nl-direct · no-bid: 75</title><rect x="182.5" y="84.0" width="37.0" height="142.0" rx="3" class="fill-evidence"/></g><text x="201.0" y="78.0" class="val" text-anchor="middle">75</text><g class="seg"><title>ru-mobile · no-bid: 49</title><rect x="221.5" y="133.2" width="37.0" height="92.8" rx="3" class="fill-blind"/></g><text x="240.0" y="127.2" class="val" text-anchor="middle">49</text><text x="221.5" y="250" class="axis" text-anchor="middle">no-bid</text><g class="seg"><title>nl-direct · no-answer: 7</title><rect x="299.5" y="212.7" width="37.0" height="13.3" rx="3" class="fill-evidence"/></g><text x="318.0" y="206.7" class="val" text-anchor="middle">7</text><g class="seg"><title>ru-mobile · no-answer: 34</title><rect x="338.5" y="161.6" width="37.0" height="64.4" rx="3" class="fill-blind"/></g><text x="357.0" y="155.6" class="val" text-anchor="middle">34</text><text x="338.5" y="250" class="axis" text-anchor="middle">no-answer</text><g class="seg"><title>nl-direct · unread: 71</title><rect x="416.5" y="91.5" width="37.0" height="134.5" rx="3" class="fill-evidence"/></g><text x="435.0" y="85.5" class="val" text-anchor="middle">71</text><g class="seg"><title>ru-mobile · unread: 45</title><rect x="455.5" y="140.8" width="37.0" height="85.2" rx="3" class="fill-blind"/></g><text x="474.0" y="134.8" class="val" text-anchor="middle">45</text><text x="455.5" y="250" class="axis" text-anchor="middle">unread</text><g class="seg"><title>nl-direct · binary: 113</title><rect x="533.5" y="12.0" width="37.0" height="214.0" rx="3" class="fill-evidence"/></g><text x="552.0" y="6.0" class="val" text-anchor="middle">113</text><g class="seg"><title>ru-mobile · binary: 87</title><rect x="572.5" y="61.2" width="37.0" height="164.8" rx="3" class="fill-blind"/></g><text x="591.0" y="55.2" class="val" text-anchor="middle">87</text><text x="572.5" y="250" class="axis" text-anchor="middle">binary</text><g class="seg"><title>nl-direct · redirect: 10</title><rect x="650.5" y="207.1" width="37.0" height="18.9" rx="3" class="fill-evidence"/></g><text x="669.0" y="201.1" class="val" text-anchor="middle">10</text><g class="seg"><title>ru-mobile · redirect: 13</title><rect x="689.5" y="201.4" width="37.0" height="24.6" rx="3" class="fill-blind"/></g><text x="708.0" y="195.4" class="val" text-anchor="middle">13</text><text x="689.5" y="250" class="axis" text-anchor="middle">redirect</text></svg>
+<div class="legend" style="margin-top:10px"><span><i class="swatch sw-evidence"></i>nl-direct</span><span><i class="swatch sw-blind"></i>ru-mobile</span></div>
+</div>
+<figcaption>Candidate bid requests across 6 simultaneous pair(s), window 45 s on both arms. <strong>no-bid</strong> is a bidder answering “no”; <strong>no-answer</strong> is a bidder asked and silent inside our window.</figcaption></figure>
+<div class="cols">
+<div class="panel"><h3 class="mono">nl-direct</h3><p style="font-size:15px;color:var(--muted);margin-top:8px">egress 77.246.104.228 · 6 load(s), 6/6 with the exit verified from inside the browser · 277 candidate requests · wrapper deadline 500, 1000 ms</p></div>
+<div class="panel"><h3 class="mono">ru-mobile</h3><p style="font-size:15px;color:var(--muted);margin-top:8px">egress 91.79.81.62 · 6 load(s), 6/6 with the exit verified from inside the browser · 228 candidate requests · wrapper deadline 500, 1000 ms</p></div>
+</div>
+<div class="tiles">
+<div class="tile"><span class="lab">nl-direct · silence rate</span><span class="n" style="color:var(--evidence)">8.5%</span><span class="sub">7 of 82 asked bidders said nothing rather than declining</span></div>
+<div class="tile"><span class="lab">ru-mobile · silence rate</span><span class="n" style="color:var(--blind)">41.0%</span><span class="sub">34 of 83 asked bidders said nothing rather than declining</span></div>
+</div>
+<p class="note">Measured round-trip time on the mobile arm is 400–1100 ms against a wrapper deadline of 1000 ms. A bidder that answers perfectly promptly still misses the publisher’s own deadline, and the page records silence. So “Russian bidders are less responsive” cannot be read off this arm at all — vantage and channel are perfectly confounded, and the difference is two main effects wearing the interaction’s name. A third arm, the datacentre link degraded to the mobile arm’s measured profile, is what would separate them.</p>
+</section>
+<section>
+<span class="status">Measured · a null result</span>
+<h2>The frame is not an artefact of where we stand — so far</h2>
+<p>A frame built from one vantage would carry that vantage’s blindness into both arms of a paired study, and <code>blocked</code> is the verdict most likely to be geo-shaped. On the <strong>43</strong> domains both walks reached, the Amsterdam and Moscow vantages returned <strong>42</strong> identical verdicts and <strong>1</strong> different ones.</p>
+<p class="note">Coverage binds this. That rank band is infrastructure and marketplaces; the cases most likely to be geo-shaped are news publishers further down, which the Moscow walk has not reached. A domain one walk has reached and the other has not is a difference in <em>progress</em>, and is excluded — pooling those would make a slow walk look like a censoring vantage.</p>
+</section>
+<section>
+<span class="status">Not observable</span>
+<h2>What this instrument cannot see</h2>
+<div class="cols">
+<div><h3>The server-side auction</h3><p style="margin-top:8px;color:var(--muted);font-size:15.5px">Everything here is a passive read of what a wrapper hands the browser. Server-to-server bidding never touches it. A domain recorded as carrying no wrapper may be selling its inventory perfectly well.</p></div>
+<div><h3>Any page we did not see</h3><p style="margin-top:8px;color:var(--muted);font-size:15.5px">A 401, 403 or 5xx is our own access failing. It is recorded as blindness and never as “this publisher runs no header bidding”.</p></div>
+<div><h3>Wrappers we did not look for</h3><p style="margin-top:8px;color:var(--muted);font-size:15.5px">The detector knows Adfox and Prebid, the two the study is about. Google’s and Amazon’s stacks are recorded as evidence but never admit — so a rejection bounds the detector, not the site.</p></div>
+<div><h3>A market</h3><p style="margin-top:8px;color:var(--muted);font-size:15.5px">The frame holds a handful of sites, from one or two vantages, on one date, in one six-hour zone of the Moscow clock. The word market is not available yet.</p></div>
+</div>
+</section>
+<section>
+<span class="status">Check us</span>
+<h2>Every number here is re-derivable</h2>
+<p>The universe is pinned and re-fetchable, the rule is a runnable tool, and the rejection ledger is published beside the frame. Disagreeing with this page should not require our cooperation.</p>
+<pre>git clone https://github.com/genaforvena/self-adint &amp;&amp; cd self-adint
+python3 tools/adint-frame-stageb  --test        # 25 gates, offline
+python3 tools/adint-status                      # the numbers above, from disk
+python3 tools/adint-frame-compare data/frame-stageb-nl-direct-*.jsonl \
+                                  data/frame-stageb-ru-mobile-*.jsonl
+
+# rebuild this page
+python3 tools/adint-report-page -o report.html</pre>
+<p>Method and design: <code>docs/step0c-hb-ru-market-study-2026-08-18.md</code>. What the walk did to it: <code>docs/step0d-hb-first-cell-2026-08-19.md</code>. The dataset’s passport: <code>docs/DATASHEET-ru-hb-frame.md</code>.</p>
+</section>
+<footer><div>self-adint — one operator reading his own advertising profile from the demand side. Nobody else is observed.</div><div>Public domain (CC0 1.0). A dedication is a statement about rights, not about truth: every number here is published with its n so you can judge it rather than inherit it.</div><div class="mono" style="font-size:12px">generated 2026-08-19 07:00 UTC</div></footer>
+</div>

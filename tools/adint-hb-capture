@@ -718,6 +718,29 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # a `no-answer` here cannot be distinguished from a bidder the wrapper itself dropped.
         row["window_shorter_than_wrapper"] = bool(
             wt is not None and (load.get("window_s") or 0) * 1000 < wt)
+        # …AND THE OTHER SIDE OF THE SAME CLOCK. Our window is longer than the wrapper's
+        # deadline on most pages, so we observe answers the AUCTION ITSELF threw away:
+        # measured 2026-08-19 on magnit.ru, `hybrid` returned 70.0 RUB CPM in 1747 ms of
+        # bidder latency against a 500 ms wrapper deadline. A real bid, and NOT a price the
+        # auction could have used — pooling it with in-time prices overstates both the depth
+        # of demand and the clearing level.
+        #
+        # THE QUANTITY IS THE BIDDER'S OWN LATENCY, `t_response_s - t_request_s`, NOT
+        # `t_response_s`. Both columns are measured from NAVIGATION START, while the wrapper's
+        # deadline runs from when the auction starts. The first version of this flag compared
+        # `t_response_s` against the deadline and reported 595/595 and 483/483 — **100 % of
+        # answers late on BOTH arms**, which is the tell: a flag that fires on everything has
+        # stopped being a measurement. The difference is the per-bidder latency the deadline
+        # is actually about, and it separates the arms cleanly (median 171 ms vs 659 ms).
+        #
+        # Per REQUEST, because the deadline is per page and the latency is per bidder: a
+        # consumer that wants "what the auction saw" filters on this, one that wants "what the
+        # bidder was willing to pay" does not.
+        _lat_ms = (None if (row.get("t_response_s") is None or row.get("t_request_s") is None)
+                   else (row["t_response_s"] - row["t_request_s"]) * 1000)
+        row["bidder_latency_ms"] = None if _lat_ms is None else round(_lat_ms, 1)
+        row["answered_after_wrapper_deadline"] = bool(
+            wt is not None and _lat_ms is not None and _lat_ms > wt)
         for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
                   "browser_egress_ip", "vantage_verified",
                   "hour_utc", "profile_age_s"):
@@ -1158,6 +1181,23 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
         ("floor read from the request",
          (priced.get("floor") or [{}])[0].get("bidfloor") == 0.5
          and (priced.get("floor") or [{}])[0].get("bidfloorcur") == "RUB"),
+        # The deadline flag must be a claim about THIS bidder's latency against THIS page's
+        # deadline, not a restatement of either. The fixture's wrapper deadline is 1200 ms and
+        # its bidders answer immediately, so a flag that were simply always-true or
+        # always-false would show up right here.
+        ("an in-time answer is not flagged as late",
+         priced.get("answered_after_wrapper_deadline") is False),
+        ("the late flag uses BIDDER LATENCY, not time since navigation",
+         all(r.get("answered_after_wrapper_deadline") is False
+             for r in rows if r.get("bidder_latency_ms") is not None
+             and r["bidder_latency_ms"] <= 1200)),
+        # The flag that fires on everything is the failure this leg exists for: the first
+        # version compared time-since-navigation and marked 100 % of answers late on both arms.
+        ("the late flag does not fire on every row",
+         not (rows and all(r.get("answered_after_wrapper_deadline")
+                           for r in rows if r.get("bidder_latency_ms") is not None))),
+        ("bidder latency is recorded beside the flag, so a reader can re-derive it",
+         priced.get("bidder_latency_ms") is not None),
         ("204 is a no-bid", by.get("mytarget", {}).get("outcome") == "no-bid"),
         # This fixture's 204 arrives and is THEN aborted — the shape a wrapper deadline
         # produces on a live page. The abort must be recorded without touching the verdict.

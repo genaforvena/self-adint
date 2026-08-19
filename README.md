@@ -35,7 +35,7 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-19 06:47 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-19 07:00 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
@@ -54,7 +54,29 @@ papers.
 
 Admitted: `magnit.ru`, `pikabu.ru`.
 
-### No cell of the schedule has been captured yet.
+**Vantage `ru-mobile`** · 43 domains touched in rank order · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
+
+| verdict | n | what it means |
+|---|---:|---|
+| `admit` | 1 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
+| `ad-serving-only` | 8 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
+| `no-wrapper` | 6 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
+| `ya-generic-only` | 9 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
+| `blocked` | 5 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
+| `rate-limited` | 1 | 428/429 — caused by our own load, not by the site |
+| `unreachable` | 1 | timeout or refused connection — our blindness |
+| `no-web-apex` | 12 | DNS/TLS failure — the domain serves no page at its apex at all |
+
+Admitted: `magnit.ru`.
+
+### Captured cells
+
+| arm | loads | sites | pairs | window | hours UTC | vantage verified |
+|---|---:|---:|---:|---:|---|---:|
+| `nl-direct` | 6 | 2 | 6 | 45 s | 6 | 6/6 |
+| `ru-mobile` | 6 | 2 | 6 | 45 s | 6 | 6/6 |
+
+**Coverage against the design:** 12 of 8960 loads (0.1 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is a pilot of that design, not a sample of the Russian market.
 
 <!-- /NUMBERS -->
 

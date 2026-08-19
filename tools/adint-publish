@@ -61,12 +61,36 @@ FRAME_FIELDS = [
 # deliberate later step with its own read-through, not a default.
 
 PAIRED_FIELDS = [
-    "schema", "kind", "load_id", "pair_id", "ts", "hour_utc", "url", "arm", "arm_note",
-    "run_idx", "window_s", "profile_age_s", "wrapper_timeout_ms", "roster",
-    "egress_ip", "browser_used_proxy", "vantage_verified", "browser_egress_ip",
+    # the load: what was asked, when, from where, under which window
+    "schema", "kind", "load_id", "pair_id", "ts", "hour_utc", "url", "final_url", "arm",
+    "arm_note", "run_idx", "window_s", "profile_age_s", "observed_s", "wrapper_timeout_ms",
+    "roster", "placements", "adfox", "pbjs", "http_status",
+    # the vantage, per §2.5 — a row that cannot prove its own path is not evidence
+    "egress_ip", "egress_ip_direct", "egress_ip_proxied", "proxy_env", "browser_used_proxy",
+    "vantage_verified", "browser_egress_ip",
+    # the request: who was asked and what came back. WITHOUT this the dataset is a row count
+    # and nothing else — the first cut of this list dropped `bidder`, `host`, `floor` and the
+    # price, i.e. published a file from which no finding could be checked. An allowlist that
+    # is too tight does not leak, it just makes the publication pointless; both failures are
+    # worth avoiding and only one of them is loud.
+    "bidder", "host", "match_by", "method", "resource_type", "status",
+    "t_request_s", "t_response_s", "req_openrtb", "req_adfox", "floor",
+    "post_response_abort", "abort_reason", "bid_evidence",
     "outcome", "outcomes", "is_bid_candidate", "evidence_strength",
-    "window_shorter_than_wrapper", "n_candidates", "error",
+    "window_shorter_than_wrapper", "answered_after_wrapper_deadline", "bidder_latency_ms",
+    "n_candidates", "error",
 ]
+
+# `detail` is the parsed answer, and it is the only NESTED thing that crosses. It is not
+# allowlisted whole: a nested blob whose shape we do not control is exactly what an allowlist
+# exists to stop. These sub-keys are named, and anything else inside `detail` is dropped the
+# same way a new top-level column would be.
+# `bids_raw` is deliberately NOT here: it is a fragment of the response body, and bodies do
+# not cross. Everything else is structure ABOUT the answer — did it carry a seatbid, how many
+# bytes, did the network fault — which is what makes an outcome checkable by someone else.
+NESTED = {"detail": ["prices", "currency", "at", "seatbids", "bids", "reason",
+                     "has_seatbid", "has_bids_key", "seatbid", "bytes", "net_fault",
+                     "location"]}
 
 KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS}
 
@@ -115,9 +139,21 @@ def main():
                 continue
             r = json.loads(line)
             for k in r:
-                if k not in keep:
+                if k not in keep and k not in NESTED:
                     dropped[k] += 1
-            rows.append({k: r[k] for k in keep if k in r})
+            row = {k: r[k] for k in keep if k in r}
+            for parent, subkeys in NESTED.items():
+                blob = r.get(parent)
+                if isinstance(blob, dict):
+                    kept = {k: blob[k] for k in subkeys if k in blob}
+                    for k in blob:
+                        if k not in subkeys:
+                            dropped[f"{parent}.{k}"] += 1
+                    if kept:
+                        row[parent] = kept
+                elif blob is not None:
+                    dropped[parent] += 1
+            rows.append(row)
             n += 1
 
     with open(out, "w", encoding="utf-8") as fh:
@@ -161,6 +197,18 @@ def selftest():
           sorted(kept), ["domain", "stageb_verdict"])
     check("an advertising id is not on the frame allowlist",
           "device_ifa" in FRAME_FIELDS, False)
+    # The nested projection must behave like the top-level allowlist: named keys cross, and a
+    # sub-key nobody anticipated does not.
+    blob = {"prices": [{"value": 1.23}], "currency": "RUB", "raw_body": "NEVER"}
+    kept = {k: blob[k] for k in NESTED["detail"] if k in blob}
+    check("a named sub-key of `detail` crosses", sorted(kept), ["currency", "prices"])
+    check("an unanticipated sub-key of `detail` does not", "raw_body" in kept, False)
+    check("a RAW BODY fragment is never allowlisted, even a named one",
+          "bids_raw" in NESTED["detail"], False)
+    # …and the other failure mode: an allowlist so tight the publication cannot be checked.
+    for f in ("bidder", "host", "outcome", "floor", "t_response_s"):
+        check(f"the paired dataset keeps `{f}`, or no finding in it can be re-checked",
+              f in PAIRED_FIELDS, True)
     for f in ("ifa", "device_ifa", "gaid", "idfa", "imei", "msisdn", "user", "user_data",
               "eids", "cookies", "post_data", "body", "request_body", "response_body"):
         if f in FRAME_FIELDS or f in PAIRED_FIELDS:

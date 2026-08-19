@@ -100,10 +100,14 @@ independent (same vantage, minutes apart), so the residual miss rate is real and
 would carry that vantage's blindness into *both* arms of a paired study. So the walk is run
 from both.
 
-On the **25 domains both walks had reached** (ranks 13–457): **25 agree, 0 differ.** All four
-`blocked` verdicts — `okcdn.ru` 403, `vkuserphoto.ru` 418, `ozon.ru` 403, `wildberries.ru`
-498 — are identical from Amsterdam and from a Moscow MTS address. At this depth those
-refusals are **bot detection, not geography**.
+On the **43 domains both walks had reached** (ranks 13–865): **42 agree, 1 differs (2.3 %).**
+Every `blocked` verdict is identical from Amsterdam and from a Moscow MTS address —
+`okcdn.ru` 403, `vkuserphoto.ru` 418, `ozon.ru` 403, `wildberries.ru` 498 among them. At this
+depth those refusals are **bot detection, not geography**.
+
+The single disagreement is `cdnvideo.ru` (#615), `no-wrapper` from Amsterdam against
+`ya-generic-only` from Moscow — a difference between two *rejection* reasons on a CDN, not a
+difference in access. Nothing in the intersection turns on which side of the border we stood.
 
 **Coverage binds the claim.** That rank band is infrastructure, telecoms and marketplaces.
 The cases most likely to be geo-shaped are news publishers above rank 1100, where the NL walk
@@ -117,32 +121,68 @@ like a censoring vantage.
 
 ## 5. The paired cell: the channel confound is not a caveat, it is the whole signal
 
-One simultaneous pair, `pikabu.ru`, both arms launched in the same minute by
-`tools/adint-paired-run` (**barrier wait 0.0 s**), same 19-bidder roster read off the page,
-same wrapper deadline `wrapper_timeout_ms = 1000`, `window_s = 45` on both:
+**Six simultaneous pairs**, two sites (`pikabu.ru`, `magnit.ru`), three replicates, MSK
+morning zone — a zone the RU arm had never observed. Both arms launched on one site at a
+time and the next site waits for both: **median arm-duration gap 8.8 s**, and the first pair
+0.0 s. `window_s = 45` on both. Every load carries its exit address as the *browser* read it,
+and 12 of 12 are verified.
 
-| arm | egress (read by the browser) | `no-bid` | `no-answer` | candidates |
-|---|---|---:|---:|---:|
-| `nl-direct` | 77.246.104.228 · Amsterdam, datacenter | **19** | 2 | 33 |
-| `ru-mobile` | 91.79.81.62 · MTS Moscow, HSDPA | 4 | **17** | 32 |
+| arm | egress (browser-read) | `no-bid` | `no-answer` | `priced` | `unread` | `binary` | `redirect` |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `nl-direct` | 77.246.104.228 · Amsterdam, datacentre | **75** | 7 | 1 | 71 | 113 | 10 |
+| `ru-mobile` | 91.79.81.62 · MTS Moscow, HSDPA | 49 | **34** | 0 | 45 | 87 | 13 |
 
-The arms invert. `no-bid` is a bidder answering *no*; `no-answer` is a bidder asked and
-silent inside our window. Measured RTT from inside the `ruvantage` namespace is **400–1100 ms**
-against a wrapper deadline of **1000 ms** — so on this link a bidder that answers perfectly
-promptly still misses the publisher's own deadline, and the page records silence.
+Note first what does *not* move: `unread` and `binary` — our own read failures — land at
+comparable rates on both arms. The difference is concentrated exactly where the design said
+it would be.
 
-**Any statement of the form "Russian bidders are less responsive", read off this arm, is an
-artifact of the phone's link.** This is §3's confound — vantage and channel perfectly
-confounded, a difference between them being *two main effects wearing the interaction's
-name* — no longer argued but measured, on one pair, in one minute.
+**Silence rate**, the fraction of bidders that were asked and said nothing rather than
+declining, over near-identical denominators:
 
-It also settles that §3's third arm is load-bearing rather than tidy. Without `nl-shaped`
-(the NL egress degraded with `tc netem` to the RU arm's measured profile) there is no way to
-attribute the gap, and the study cannot report a single number about Russian demand.
+> `nl-direct` **8.5 %** (7 of 82)  ·  `ru-mobile` **41.0 %** (34 of 83)
+
+### The same fact, measured a second way, independently
+
+`no-answer` is our window's verdict. The bidder's own clock says the same thing without
+reference to it. Per-bidder latency — `t_response_s − t_request_s` — against each page's own
+`wrapper_timeout_ms`:
+
+| arm | median bidder latency | answers arriving after the wrapper's deadline |
+|---|---:|---:|
+| `nl-direct` | **171 ms** | 81 of 595 — **14 %** |
+| `ru-mobile` | **659 ms** | 198 of 483 — **41 %** |
+
+The late-arrival fraction on the RU arm (41 %) and its silence rate (41.0 %) are two
+different measurements of one phenomenon and they agree. Wrapper deadlines observed on these
+pages are **500 and 1000 ms**; measured RTT from inside the `ruvantage` namespace is
+**400–1100 ms**. On that link a bidder that answers perfectly promptly still misses the
+publisher's own deadline, and the page records silence.
+
+**So "Russian bidders are less responsive" cannot be read off this arm at all.** That is §3's
+confound — vantage and channel perfectly confounded, a difference between them being *two
+main effects wearing the interaction's name* — no longer argued but measured. §3's third arm
+(`nl-shaped`: the datacentre link degraded with `tc netem` to the RU arm's measured profile)
+is what separates them, and it is now required rather than prudent.
 
 **A cheap tell for every future run:** compare `wrapper_timeout_ms` against the arm's RTT
 *before* reading its outcome mix at all. If the deadline sits inside the RTT distribution,
 that arm is not measuring bidding — it is measuring its own latency.
+
+### We see bids the auction threw away
+
+One price was observed: `hybrid` (`ssp.hybrid.ai`) returned **70.0 RUB CPM** on `magnit.ru`
+from the NL arm — with a bidder latency of **1747 ms against that page's 500 ms wrapper
+deadline**. It is a real bid and it is *not* a price the auction could have used. Our window
+is deliberately longer than the wrapper's, so this will be common; pooling late answers with
+in-time ones would overstate both the depth of demand and the clearing level. Every request
+row now carries `bidder_latency_ms` and `answered_after_wrapper_deadline`, so "what the
+auction saw" and "what the bidder was willing to pay" stay separable.
+
+**And that flag was wrong on its first attempt, which is why it is worth stating how.** It
+first compared `t_response_s` — measured from *navigation start* — against a deadline that
+runs from *auction start*, and reported **100 % of answers late on both arms**. A flag that
+fires on everything has stopped being a measurement, and that is the only thing that made it
+visible; nothing about the number itself looked wrong.
 
 ## 6. Two failures of ours, recorded because they were invisible
 

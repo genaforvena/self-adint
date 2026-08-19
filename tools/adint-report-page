@@ -108,8 +108,16 @@ def gather():
             best[fr["vantage"]] = fr
     d["frames"] = sorted(best.values(), key=lambda f: f["vantage"])
 
-    for f in sorted(glob.glob(os.path.join(PRIV, "hb-paired-*.jsonl"))
-                    + glob.glob(os.path.join(PUB, "hb-paired-*.jsonl"))):
+    # PUBLISHED copy wins, private is the fallback — the same capture exists in both trees
+    # once it has been published, and globbing both counted every arm twice. Nothing in the
+    # page looked wrong: the outcome mix is identical in both copies, so the doubling showed
+    # up only as an arm-file count, and the per-arm figures would have been right while the
+    # pair count silently doubled.
+    seen_base = {}
+    for f in (sorted(glob.glob(os.path.join(PRIV, "hb-paired-*.jsonl")))
+              + sorted(glob.glob(os.path.join(PUB, "hb-paired-*.jsonl")))):
+        seen_base[os.path.basename(f)] = f    # PUB globbed second, so it overwrites PRIV
+    for f in sorted(seen_base.values()):
         rows = read_jsonl(f)
         loads = [r for r in rows if r.get("kind") == "load"]
         if not loads:
@@ -434,8 +442,14 @@ def build(d, generated):
     if cells:
         by_arm = {c["arm"]: c for c in cells}
         arms = [a for a in ("nl-direct", "ru-mobile") if a in by_arm] or list(by_arm)
-        cats = ["no-bid", "no-answer", "priced", "error"]
-        cats = [c for c in cats if any(by_arm[a]["outcomes"].get(c) for a in arms)]
+        # EVERY outcome present, not the two that make the point. `binary` and `unread` are
+        # our own read failures and they land almost equally on both arms — which is exactly
+        # what makes the no-bid/no-answer split meaningful rather than cherry-picked. A chart
+        # that showed only the two moving columns would be arguing, not reporting.
+        cats = ["priced", "no-bid", "no-answer", "unread", "binary", "redirect", "error",
+                "bid-zero", "unparsed"]
+        present = sorted({c for a in arms for c in by_arm[a]["outcomes"] if c})
+        cats = [c for c in cats if c in present] + [c for c in present if c not in cats]
         series = []
         for a in arms:
             cls = EVIDENCE if a.startswith("nl") else BLIND
@@ -466,6 +480,20 @@ def build(d, generated):
               f'{c["verified"]}/{c["loads"]} with the exit verified from inside the browser · '
               f'{c["candidates"]} candidate requests · wrapper deadline '
               f'{", ".join(str(x) for x in c["deadline"]) or "?"} ms</p></div>')
+        A('</div>')
+        # The headline ratio, computed rather than asserted: of the bidders that were asked and
+        # either declined or stayed silent, what fraction stayed silent?
+        A('<div class="tiles">')
+        for a in arms:
+            o = by_arm[a]["outcomes"]
+            nb, na = o.get("no-bid", 0), o.get("no-answer", 0)
+            den = nb + na
+            pct = (100.0 * na / den) if den else 0.0
+            A(f'<div class="tile"><span class="lab">{html.escape(a)} · silence rate</span>'
+              f'<span class="n" style="color:var({"--evidence" if a.startswith("nl") else "--blind"})">'
+              f"{pct:.1f}%</span>"
+              f'<span class="sub">{na} of {den} asked bidders said nothing rather than '
+              f'declining</span></div>')
         A('</div>')
         A('<p class="note">Measured round-trip time on the mobile arm is 400–1100 ms against '
           'a wrapper deadline of 1000 ms. A bidder that answers perfectly promptly still misses '
@@ -610,6 +638,11 @@ def selftest():
     check("every verdict the classifier emits has a gloss", missing_gls, [])
 
     # A bar over zero rows must not divide by zero or render a stray mark.
+    # The same capture lives in data/ and public-data/ once published; counting both would
+    # double every arm.
+    _tmp = collections.Counter(c["arm"] for c in gather()["cells"])
+    check("a published capture is not counted twice",
+          [a for a, n in _tmp.items() if n > 1], [])
     check("an empty ledger renders no bar", seg_bar(collections.Counter(), 0), "")
     check("an empty rank list renders no strip", rank_strip([], []), "")
 

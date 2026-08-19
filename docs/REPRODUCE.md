@@ -128,7 +128,17 @@ You will reproduce the NL column and not the comparison. That is a smaller resul
 broken one — and it is worth knowing that some of what we record as `blocked` may be
 geo-blocking that a Russian vantage would not see at all.
 
-## 4. Read the capture
+## 4. Rebuild the report page
+
+```bash
+python3 tools/adint-report-page -o report.html
+```
+
+Every figure on it is read from `public-data/` and `data/` at build time. It is generated
+rather than written because a hand-written page is a snapshot that starts lying the moment
+the next walk appends a row.
+
+## 5. Read the capture
 
 ```bash
 python3 tools/adint-hb-report --log data/hb-paired-<run>.nl.jsonl
