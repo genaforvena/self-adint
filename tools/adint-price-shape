@@ -22,11 +22,44 @@ What it will not do:
 
 import argparse
 import collections
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# What the CAPTURE writes today. Read from the producer rather than copied here, because a
+# copied constant outlives its reader: the number would go on saying 5 after the capture moved
+# to 6, and the staleness warning below would then be permanently silent.
+CAPTURE_SCHEMA = _load("adint-hb-capture").SCHEMA
+
+def stale_schema_note(schema):
+    """A reader picks the newest schema PRESENT IN THE FILE. That is not the same as current,
+    and nothing in the file says so — a corpus captured before the last fix reports cleanly,
+    labelled only by a number the reader has no baseline for. So say it: the count is sound,
+    what it MEANS may not be."""
+    if schema >= CAPTURE_SCHEMA:
+        return None
+    return (f"!! this corpus is schema {schema}; the capture now writes {CAPTURE_SCHEMA}. The "
+            f"counts below are of schema-{schema} rows and are internally consistent, but the "
+            f"fields changed meaning between the two (see the schema history in "
+            f"tools/adint-hb-capture) — do NOT pool these figures with a current corpus, and "
+            f"do not read an arm comparison off a corpus captured before the arms were "
+            f"verified.")
+
+
 LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
 
 
@@ -72,6 +105,9 @@ def collect(rows, schema=None):
 def report(prices, zeros, schema, min_n=8, min_repeats=3, out=sys.stdout):
     p = lambda s="": print(s, file=out)
     p(f"== price shape — schema {schema} ==")
+    _stale = stale_schema_note(schema)
+    if _stale:
+        p(_stale)
     p(f"non-zero prices {len(prices)} · zero bids {zeros} (kept out of the distribution: a bid "
       f"of 0 is a refusal wearing a bid's clothes)")
     result = {"atoms": {}, "groups": {}}
@@ -166,7 +202,18 @@ def selftest():
     buf = io.StringIO()
     res = report(prices, zeros, schema, out=buf)
     text = buf.getvalue()
+    # The default fixture is schema 4 and the capture is at CAPTURE_SCHEMA — and schema 3 is
+    # exactly where the PRICE COLUMN changed meaning, so a price read-out that does not name
+    # its distance from current is the most dangerous quiet number in this repo.
+    _cur = io.StringIO()
+    _c = collect(rows_for([2.5, 2.5, 2.5, 0.1], schema=CAPTURE_SCHEMA))
+    report(_c[0], _c[1], _c[2], out=_cur)
+
     checks = [
+        ("a corpus behind the capture schema says so",
+         "the capture now writes" in text),
+        ("and a current corpus does not carry the warning",
+         "the capture now writes" not in _cur.getvalue()),
         ("zero bid kept out of the distribution", zeros == 1 and len(prices) == 9),
         ("the repeated round value is named an atom",
          [a["value"] for a in res["atoms"].get("sparrow/RUB", [])] == [2.5]

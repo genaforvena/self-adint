@@ -591,32 +591,69 @@ def reclassify(args):
     return 0
 
 
-def write_frame(path, ledger, args):
-    rows = []
-    with open(ledger, encoding="utf-8") as fh:
+def load_rows(path, dedupe=False):
+    """Read a stage-B ledger and return rows whose verdicts are CURRENT.
+
+    THE ONE PLACE THE STALE-VERDICT RULE LIVES. Every consumer of a stage-B ledger goes
+    through here, because the rule is not obvious enough to re-implement per reader and the
+    cost of getting it wrong is a frame that re-admits what a classifier fix retired
+    (`d28dbde`: 7 nl / 6 ru ad-serving domains, at the top of the rank order).
+
+    Returns (rows, redone, schemas, dupes):
+      rows     — rows in ledger order, verdicts re-derived where the stamp was not current
+      redone   — Counter of `before->after` for the rows that moved
+      schemas  — Counter of the stamps AS FOUND, so a caller can say what the file held
+                 rather than guessing from row 0. A mixed file is the normal case for any
+                 walk long enough to be interrupted by a fix.
+      dupes    — rows dropped by `dedupe` (a domain read twice by concurrent writers)
+    """
+    rows, seen, dupes = [], set(), 0
+    redone, schemas = collections.Counter(), collections.Counter()
+    with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
-    # A LEDGER OUTLIVES THE RULE THAT CLASSIFIED IT. `stageb_verdict` is the answer the
-    # classifier gave AT THE TIME OF THE READ; the raw fields beside it are vantage-and-time
-    # facts that do not age. So a row stamped with an older `stageb_schema` gets its verdict
-    # RE-DERIVED here rather than trusted — otherwise a fix to `classify` reaches only the
-    # rows walked after it, and the frame silently re-admits what the fix retired. An
-    # UNSTAMPED row is pre-schema by definition and is re-derived too.
-    redone = collections.Counter()
-    for r in rows:
-        if r.get("stageb_schema") == SCHEMA:
-            continue
-        before = r.get("stageb_verdict")
-        v, ev = classify(r)
-        r["stageb_verdict"] = v
-        r["wrapper_evidence"] = ev or r.get("wrapper_evidence") or []
-        r["stageb_schema"] = SCHEMA
-        redone[f"{before}->{v}"] += 1
+            if not line or line.startswith("#"):
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            schemas[r.get("stageb_schema")] += 1
+            if dedupe and r.get("domain"):
+                # Only a NAMED domain can be a duplicate. Collapsing on a missing key would
+                # fold every anonymous row into one and call the loss a dedupe.
+                if r["domain"] in seen:
+                    dupes += 1
+                    continue
+                seen.add(r["domain"])
+            if r.get("stageb_schema") != SCHEMA:
+                before = r.get("stageb_verdict")
+                v, ev = classify(r)
+                r["stageb_verdict"] = v
+                r["wrapper_evidence"] = ev or r.get("wrapper_evidence") or []
+                r["stageb_schema"] = SCHEMA
+                r["reclassified_from"] = before
+                redone[f"{before}->{v}"] += 1
+            rows.append(r)
+    return rows, redone, schemas, dupes
+
+
+def schema_note(redone, schemas):
+    """One line a reader can print beside any count derived from a ledger. Empty when the
+    file was single-schema and current — silence then means something."""
+    if not redone:
+        return ""
+    found = " ".join(f"schema{k}×{v}" for k, v in sorted(schemas.items(), key=lambda kv: str(kv[0])))
+    moves = " ".join(f"{k}={v}" for k, v in sorted(redone.items()))
+    return f"re-derived {sum(redone.values())} row(s) written under an older stageb_schema ({found}): {moves}"
+
+
+def write_frame(path, ledger, args):
+    # A LEDGER OUTLIVES THE RULE THAT CLASSIFIED IT: `stageb_verdict` is the answer the
+    # classifier gave at the time of the read, and it ages the moment the classifier is
+    # fixed. `load_rows` re-derives the stale ones; see its docstring for why this is not
+    # done inline here or in any other reader.
+    rows, redone, schemas, _ = load_rows(ledger)
     adm, seen_dom = [], set()
     for r in rows:
         if r.get("stageb_verdict") != "admit" or r.get("domain") in seen_dom:
@@ -635,14 +672,12 @@ def write_frame(path, ledger, args):
         fh.write(f"# generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
         fh.write("# The REJECTIONS are the other half of this artifact and live in the "
                  "ledger beside it: " + os.path.basename(ledger) + "\n")
-        fh.write("# ledger tally: " + " ".join(f"{k}={v}" for k, v in sorted(
+        fh.write("# ledger tally (ROWS, duplicates included; the frame below is one row per DOMAIN): " + " ".join(f"{k}={v}" for k, v in sorted(
             tally.items(), key=lambda kv: str(kv[0]))) + "\n")
         if redone:
             # Disclosed, never silent: a correction nobody can see reads exactly like a
             # ledger that never needed one. The counts name WHICH way rows moved.
-            fh.write(f"# re-derived {sum(redone.values())} row(s) written under an older "
-                     f"stageb_schema: " + " ".join(f"{k}={v}" for k, v in
-                                                   sorted(redone.items())) + "\n")
+            fh.write("# " + schema_note(redone, schemas) + "\n")
         fh.write("# `blocked` / `rate-limited` / `error` are NOT evidence of absent header "
                  "bidding — they are our own blindness, named.\n")
         fh.write("rank\tdomain\twrapper_evidence\tsettle_used_s\tbrowser_egress_ip\n")

@@ -93,8 +93,22 @@ def bidder_code(text):
 
 
 def unattributed_hosts(log_path):
-    """Candidate hosts the publisher's own config never names. From the log, not from a list."""
-    counts = collections.Counter()
+    """Candidate hosts the publisher's own config never names. From the log, not from a list.
+
+    ASKED IS NOT CONTACTED, and `is_bid_candidate` alone cannot tell them apart. A bidder's
+    cookie-sync pixel fires on pages where it is never asked to bid, so a host list built from
+    the flag pools two different facts; `evidence_strength` (capture schema >= 2) is the field
+    that splits them, and rows written before it exists cannot be split at all.
+
+    So: rows carrying `protocol` evidence are the list. Rows that predate the field are
+    returned SEPARATELY rather than folded in either direction — pooling them inflates the
+    sweep with hosts nobody asked to bid, and every one of those costs a code search and can
+    mint a "bidder" that never bid (the failure of 0d49033, from the other end).
+
+    Returns (counts, unstated, schemas).
+    """
+    counts, unstated = collections.Counter(), collections.Counter()
+    schemas = collections.Counter()
     for line in open(log_path, errors="replace"):
         line = line.strip()
         if not line:
@@ -105,11 +119,16 @@ def unattributed_hosts(log_path):
             continue
         if r.get("kind") != "request" or not r.get("is_bid_candidate"):
             continue
-        if r.get("bidder"):
+        if r.get("bidder") or not r.get("host"):
             continue
-        if r.get("host"):
+        schemas[r.get("schema", 1)] += 1
+        if r.get("evidence_strength") == "protocol":
             counts[r["host"]] += 1
-    return counts
+        elif r.get("evidence_strength"):
+            continue                      # attribution-only: contacted, never asked
+        else:
+            unstated[r["host"]] += 1      # predates the split — named, never counted
+    return counts, unstated, schemas
 
 
 class SearchUnavailable(Exception):
@@ -206,7 +225,29 @@ def selftest():
     KIMBER = ("const BIDDER_CODE = 'kimberlite';\n"
               "export const ENDPOINT_URL = 'https://kimberlite.io/rtb/bid/pbjs';\n")
 
+    # `is_bid_candidate` MEANT something different before capture schema 2 added
+    # `evidence_strength`, and this tool spends a code search per host it believes.
+    import tempfile as _tf, json as _json
+    _lg = os.path.join(_tf.mkdtemp(), "c.jsonl")
+    with open(_lg, "w") as _fh:
+        for _r in ({"kind": "request", "is_bid_candidate": True, "host": "asked.example",
+                    "schema": 5, "evidence_strength": "protocol"},
+                   {"kind": "request", "is_bid_candidate": True, "host": "synced.example",
+                    "schema": 5, "evidence_strength": "attribution-only"},
+                   {"kind": "request", "is_bid_candidate": True, "host": "old.example",
+                    "schema": 1}):
+            _fh.write(_json.dumps(_r) + "\n")
+    _c, _u, _s = unattributed_hosts(_lg)
+
     checks = [
+        ("only a host with PROTOCOL evidence is swept",
+         list(_c) == ["asked.example"]),
+        ("a cookie-sync contact is not a bid candidate to sweep",
+         "synced.example" not in _c and "synced.example" not in _u),
+        ("a row predating evidence_strength is named, not pooled",
+         list(_u) == ["old.example"]),
+        ("the schemas found are reported so the caller can say what it read",
+         sorted(_s) == [1, 5]),
         ("a host the adapter states literally is exact",
          grade("ad.vqserve.com", VIQEO) == "exact"),
         ("and the company comes from the same file",
@@ -324,8 +365,17 @@ def main():
         if not os.path.exists(args.log):
             print(f"n/a: no log at {args.log}", file=sys.stderr)
             return 2
-        counts = unattributed_hosts(args.log)
+        counts, unstated, schemas = unattributed_hosts(args.log)
         targets = [(h, n) for h, n in counts.most_common() if n >= args.min_requests]
+        if unstated:
+            # Said out loud, because the alternative is a sweep that looks complete. These
+            # hosts ARE in the log; what is missing is any evidence they were asked to bid.
+            print(f"note: {sum(unstated.values())} candidate row(s) across "
+                  f"{len(unstated)} host(s) predate `evidence_strength` (capture schema "
+                  f"{sorted(schemas)}) and are NOT swept — being contacted is not being "
+                  f"asked. Re-capture, or sweep them by hand with --hosts: "
+                  f"{', '.join(h for h, _ in unstated.most_common(5))}"
+                  f"{' …' if len(unstated) > 5 else ''}", file=sys.stderr)
         if not targets:
             print("n/a: no unattributed candidate hosts in the log", file=sys.stderr)
             return 2

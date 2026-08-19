@@ -23,6 +23,8 @@ import collections
 import datetime
 import glob
 import html
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -30,6 +32,21 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUB = os.path.join(REPO, "public-data")
 PRIV = os.path.join(REPO, "data")
+
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The stage-B ledger reader lives in ONE place and every consumer borrows it. A second
+# loader is a second place to forget that a stored verdict ages with its classifier.
+sb = _load("adint-frame-stageb")
 
 # Which state of knowledge each verdict belongs to. This mapping IS the page's thesis.
 EVIDENCE, BLIND, DOMAIN = "evidence", "blind", "domain"
@@ -75,16 +92,24 @@ def read_jsonl(p):
 
 def gather():
     d = {"frames": [], "cells": [], "pairs": []}
-    for f in sorted(glob.glob(os.path.join(PUB, "frame-stageb-*.jsonl"))
-                    + glob.glob(os.path.join(PRIV, "frame-stageb-*schema*.jsonl"))):
+    # The PUBLISHED copy of a walk wins over the private one — same rule as the cells loop
+    # below, and for the same reason: this page is the public artifact, so it must render
+    # what a stranger can fetch. The frames loop used to decide this by ROW COUNT with an
+    # alphabetical tie-break, which quietly preferred `data/` on every tie.
+    by_base = {}
+    for f in sorted(glob.glob(os.path.join(PRIV, "frame-stageb-*.jsonl"))):
+        by_base[os.path.basename(f)] = f
+    for f in sorted(glob.glob(os.path.join(PUB, "frame-stageb-*.jsonl"))):
+        by_base[os.path.basename(f)] = f
+    for f in sorted(by_base.values()):
         if "nowrapper-audit" in f:
             continue
-        rows, seen = [], set()
-        for r in read_jsonl(f):
-            if r.get("domain") in seen:
-                continue
-            seen.add(r.get("domain"))
-            rows.append(r)
+        # Verdicts RE-DERIVED at read time (see adint-frame-stageb.load_rows): a stored
+        # verdict is a claim about the page and about the code that read it, and this tool
+        # publishes the admission list to strangers. The private glob no longer filters on a
+        # `schema` in the FILENAME — that was a proxy for "somebody ran --reclassify", which
+        # is not a property of the data and hid any ledger whose name lacked the token.
+        rows, redone, schemas, dupes = sb.load_rows(f, dedupe=True)
         if not rows:
             continue
         d["frames"].append({
@@ -92,6 +117,8 @@ def gather():
             "vantage": rows[0].get("vantage") or "?",
             "public": f.startswith(PUB),
             "rows": rows,
+            "note": sb.schema_note(redone, schemas),
+            "dupes": dupes,
             "tally": collections.Counter(r.get("stageb_verdict") for r in rows),
             "admitted": [(r.get("rank"), r.get("domain"),
                           " + ".join(r.get("wrapper_evidence") or []))
@@ -100,11 +127,13 @@ def gather():
             "egress": sorted({r.get("browser_egress_ip") for r in rows
                               if r.get("browser_egress_ip")}),
         })
-    # keep only the newest per vantage, so a re-walk does not double the page
+    # One frame per vantage: published first, then the walk that got further. "Further" is
+    # rows, which is progress; it is NOT recency, and the two come apart whenever a repaired
+    # vantage is re-walked from the start.
     best = {}
     for fr in d["frames"]:
         cur = best.get(fr["vantage"])
-        if cur is None or len(fr["rows"]) > len(cur["rows"]):
+        if cur is None or (fr["public"], len(fr["rows"])) > (cur["public"], len(cur["rows"])):
             best[fr["vantage"]] = fr
     d["frames"] = sorted(best.values(), key=lambda f: f["vantage"])
 
@@ -463,6 +492,19 @@ def build(d, generated):
               '<code>ref/CANONICAL-FRAME</code>, so this section shows whichever walk sorted '
               'first. Which vantage a frame is built from changes its membership — see below '
               '— so an undeclared frame is a frame nobody has chosen.</p>')
+        # PROVENANCE, on the page rather than in the tool's stdout. A reader who cannot fetch
+        # the ledger this chart is drawn from cannot check it, and that is a property of the
+        # chart, not a footnote about our workflow.
+        if not main.get("public"):
+            A('<p class="note">This chart is drawn from a ledger that is '
+              '<strong>not published</strong> — it lives in the working tree only, so the '
+              'numbers here cannot yet be checked against a file you can fetch. Run '
+              '<code>tools/adint-publish</code> to close that gap.</p>')
+        if main.get("note"):
+            A(f'<p class="note">Verdicts are re-derived from the stored probe rows at read '
+              f'time, not taken from the ledger: {html.escape(main["note"])}. A stored '
+              f'verdict is a claim about the page <em>and</em> about the code that read it, '
+              f'and it ages the moment that code is fixed.</p>')
         A(f'<figcaption>All {total} domains walked from vantage '
           f'<span class="mono">{html.escape(main["vantage"])}</span>'
           f'{" · browser egress " + html.escape(", ".join(main["egress"])) if main["egress"] else ""}. '
@@ -730,13 +772,6 @@ def selftest():
     # Every verdict the classifier can emit must have a knowledge-class and a gloss, or the
     # page silently drops a column of the ledger — the exact failure the ledger exists to
     # prevent, reintroduced at the presentation layer.
-    import importlib.machinery, importlib.util
-    sp = importlib.util.spec_from_file_location(
-        "sb", os.path.join(REPO, "tools", "adint-frame-stageb"),
-        loader=importlib.machinery.SourceFileLoader(
-            "sb", os.path.join(REPO, "tools", "adint-frame-stageb")))
-    sb = importlib.util.module_from_spec(sp)
-    sp.loader.exec_module(sb)
     emitted = set()
     for row in ({"http_status": 200, "content_type": "text/html",
                  "adfox_hb": {"present": True, "bidders": ["x"]}},
@@ -815,6 +850,50 @@ def selftest():
     one = build(_fake([("a.ru", "admit", "admit")], ("deep.ru",)), "T")
     check("no hole does not claim the other frame is missing publishers",
           "missing" in one.split("declared in")[1][:400], False)
+    # gather() READS THE LEDGERS, and the three ways that read can lie are all file-level, so
+    # they need a real tree rather than a hand-made frames dict.
+    import tempfile as _tf
+    global PUB, PRIV
+    _keep = (PUB, PRIV)
+    _d = _tf.mkdtemp()
+    PUB, PRIV = os.path.join(_d, "pub"), os.path.join(_d, "priv")
+    os.makedirs(PUB); os.makedirs(PRIV)
+    # (1) The stale-verdict seam of d28dbde, at the presentation layer: this page PUBLISHES
+    #     the admission list, so a verdict left over from a retired classifier is read by
+    #     strangers as a finding about the market.
+    with open(os.path.join(PUB, "frame-stageb-v-2026-01-01.jsonl"), "w") as fh:
+        fh.write(json.dumps({"domain": "adserving.ru", "rank": 1, "vantage": "v",
+                             "stageb_verdict": "admit", "stageb_schema": sb.SCHEMA - 2,
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox": {"ya": True, "adfoxCode": True, "hb_settings": False,
+                                       "ya_context": True},
+                             "adfox_hb": {"present": False}, "prebid": [], "globals": [],
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+        fh.write(json.dumps({"domain": "real.ru", "rank": 2, "vantage": "v",
+                             "stageb_verdict": "admit", "stageb_schema": sb.SCHEMA,
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+    _g = gather()
+    check("a stale-schema admit is re-derived before it reaches the page",
+          [d for _r, d, _e in _g["frames"][0]["admitted"]], ["real.ru"])
+    # (2) The same walk exists in both trees once published. The page is the PUBLIC artifact,
+    #     so it must render the copy a stranger can fetch — the cells loop below already
+    #     decides it that way, and the frames loop decided it by row count with an
+    #     alphabetical tie-break, which silently preferred `data/`.
+    _row = {"domain": "real.ru", "rank": 2, "vantage": "v", "stageb_verdict": "admit",
+            "stageb_schema": sb.SCHEMA, "browser_egress_ip": "1.2.3.4"}
+    with open(os.path.join(PRIV, "frame-stageb-v-2026-01-01.jsonl"), "w") as fh:
+        fh.write(json.dumps(_row) + "\n")
+    check("the published copy of a walk wins over the private one",
+          gather()["frames"][0]["public"], True)
+    # (3) …and when only the private copy exists, the page must SAY so rather than present
+    #     an unpublished tree as the record.
+    os.remove(os.path.join(PUB, "frame-stageb-v-2026-01-01.jsonl"))
+    check("a frame read from the private tree is marked unpublished",
+          gather()["frames"][0]["public"], False)
+    check("and the page says it out loud",
+          "not published" in build(gather(), "T"), True)
+    PUB, PRIV = _keep
+
     page = build(gather(), "TEST")
     check("the page says which vantage's frame the study runs on",
           "declared in" in page, True)

@@ -21,11 +21,44 @@ config — so every count that could mislead is reported alongside its load coun
 
 import argparse
 import collections
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# What the CAPTURE writes today. Read from the producer rather than copied here, because a
+# copied constant outlives its reader: the number would go on saying 5 after the capture moved
+# to 6, and the staleness warning below would then be permanently silent.
+CAPTURE_SCHEMA = _load("adint-hb-capture").SCHEMA
+
+def stale_schema_note(schema):
+    """A reader picks the newest schema PRESENT IN THE FILE. That is not the same as current,
+    and nothing in the file says so — a corpus captured before the last fix reports cleanly,
+    labelled only by a number the reader has no baseline for. So say it: the count is sound,
+    what it MEANS may not be."""
+    if schema >= CAPTURE_SCHEMA:
+        return None
+    return (f"!! this corpus is schema {schema}; the capture now writes {CAPTURE_SCHEMA}. The "
+            f"counts below are of schema-{schema} rows and are internally consistent, but the "
+            f"fields changed meaning between the two (see the schema history in "
+            f"tools/adint-hb-capture) — do NOT pool these figures with a current corpus, and "
+            f"do not read an arm comparison off a corpus captured before the arms were "
+            f"verified.")
+
+
 LOG = os.path.join(REPO, "data", "hb-auction.jsonl")
 ALIASES = os.path.join(REPO, "ref", "org-aliases.tsv")
 
@@ -132,6 +165,9 @@ def report(kept, all_rows, schema, present, bad, out=sys.stdout):
             r["attribution"] = r.get("match_by")
 
     p(f"== hb capture read-out — schema {schema} ==")
+    _stale = stale_schema_note(schema)
+    if _stale:
+        p(_stale)
     p(f"rows {len(all_rows)} · counted {len(kept)} · set aside "
       f"{len(all_rows) - len(kept)} (other schemas {[s for s in present if s != schema]}) · "
       f"unparseable {bad}")
@@ -522,7 +558,25 @@ def selftest():
     text = buf.getvalue()
     os.unlink(path)
 
+    # A reader picks the newest schema PRESENT IN THE FILE, which is not the same as current
+    # and cannot be told apart from it by looking. This fixture is schema 1; the capture is at
+    # CAPTURE_SCHEMA, and the read-out has to say so or the number in its header is a label
+    # with no baseline.
+    _cur = [{"schema": CAPTURE_SCHEMA, "kind": "load", "load_id": "C1",
+             "url": "https://a.ru/", "arm": "A", "egress_ip": "1.2.3.4", "http_status": 200}]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        for r in _cur:
+            fh.write(json.dumps(r) + "\n")
+        _cp = fh.name
+    _cb = io.StringIO()
+    report(*load(_cp), out=_cb)
+    os.unlink(_cp)
+
     checks = [
+        ("a corpus behind the capture schema says so",
+         "the capture now writes" in text),
+        ("and a current corpus does not carry the warning",
+         "the capture now writes" not in _cb.getvalue()),
         ("older schema set aside", res["loads"] == 4 and "set aside 1" in text),
         # The fold the whole design turns on.
         ("no-answer counted apart from no-bid",

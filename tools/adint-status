@@ -20,6 +20,8 @@ import argparse
 import collections
 import datetime
 import glob
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -28,6 +30,22 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUB = os.path.join(REPO, "public-data")
 PRIV = os.path.join(REPO, "data")
 README = os.path.join(REPO, "README.md")
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The stage-B ledger reader lives in ONE place (`adint-frame-stageb.load_rows`) and this tool
+# borrows it rather than re-reading the file itself. A verdict stored in a ledger is a claim
+# about the page AND about the code that read it, and it ages the moment that code is fixed;
+# a second reader with its own loader is a second place for that to be forgotten.
+SB = _load("adint-frame-stageb")
 
 BEGIN = "<!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->"
 END = "<!-- /NUMBERS -->"
@@ -77,14 +95,19 @@ def frames(include_private):
     for f in found:
         if "nowrapper-audit" in f:
             continue
-        rows = read_jsonl(f)
+        rows, redone, schemas, dupes = SB.load_rows(f, dedupe=True)
         if not rows:
             continue
         tally = collections.Counter(r.get("stageb_verdict") for r in rows)
         out.append({
             "file": os.path.basename(f),
             "vantage": (rows[0].get("vantage") or "?"),
-            "schema": rows[0].get("stageb_schema"),
+            # The stamps AS FOUND, not row 0's. A walk long enough to be interrupted by a fix
+            # to the classifier produces a MIXED file, and naming one row's schema as the
+            # file's is how a mixed file passes for a clean one.
+            "schemas": dict(schemas),
+            "note": SB.schema_note(redone, schemas),
+            "dupes": dupes,
             "touched": len(rows),
             "tally": tally,
             "admitted": [r["domain"] for r in rows
@@ -150,10 +173,17 @@ def block(include_private):
         fr = sorted(fr, key=lambda f: (f["vantage"] != canon, f["vantage"]))
         for f in fr:
             mark = " — **canonical**" if canon and f["vantage"] == canon else ""
+            dup = f" · {f['dupes']} duplicate row(s) collapsed" if f.get("dupes") else ""
             L.append(f"**Vantage `{f['vantage']}`**{mark} · {f['touched']} domains touched in rank "
-                     f"order · browser egress {', '.join(f['egress']) or 'unverified'} · "
+                     f"order{dup} · browser egress {', '.join(f['egress']) or 'unverified'} · "
                      f"`{f['file']}`")
             L.append("")
+            if f.get("note"):
+                # Said out loud in the published README, not only in the tool's stdout: a
+                # correction a reader cannot see reads exactly like a ledger that never
+                # needed one.
+                L.append(f"> Verdicts re-derived at read time — {f['note']}.")
+                L.append("")
             L.append("| verdict | n | what it means |")
             L.append("|---|---:|---|")
             for v in VERDICT_ORDER:
@@ -257,12 +287,48 @@ def selftest():
     # A verdict this tool has never heard of must still be COUNTED, not dropped: a table that
     # silently omits an unknown row understates the denominator and flatters the frame.
     with open(os.path.join(PUB, "frame-stageb-x-2026-01-01.jsonl"), "w") as fh:
-        for v in ("admit", "blocked", "a-verdict-from-the-future"):
-            fh.write(json.dumps({"stageb_verdict": v, "domain": "d.ru",
+        for i, v in enumerate(("admit", "blocked", "a-verdict-from-the-future")):
+            fh.write(json.dumps({"stageb_verdict": v, "domain": f"d{i}.ru",
+                                 "stageb_schema": SB.SCHEMA,
                                  "vantage": "x", "browser_egress_ip": "1.2.3.4"}) + "\n")
     b = block(False)
     check("an unknown verdict is still counted", "a-verdict-from-the-future" in b, True)
     check("the touched total counts it too", "3 domains touched" in b, True)
+
+    # "N domains touched" must be DOMAINS. A ledger carries duplicates whenever two walkers
+    # ran at once, and counting rows under a domain label inflates the one number a reader
+    # uses to judge how far the walk got.
+    with open(os.path.join(PUB, "frame-stageb-dup-2026-01-01.jsonl"), "w") as fh:
+        for _ in range(3):
+            fh.write(json.dumps({"stageb_verdict": "admit", "domain": "same.ru",
+                                 "stageb_schema": SB.SCHEMA,
+                                 "vantage": "dup", "browser_egress_ip": "1.2.3.4"}) + "\n")
+    b = block(False)
+    check("a domain read three times is one domain touched",
+          "1 domains touched" in b, True)
+    os.remove(os.path.join(PUB, "frame-stageb-dup-2026-01-01.jsonl"))
+
+    # THE SAME STALE-VERDICT SEAM AS `write_frame` (d28dbde). This tool reads the frame
+    # ledgers and prints their admissions into README.md; a row stamped with an older
+    # classifier schema must be re-derived here too, and the schema line must describe the
+    # WHOLE file rather than whatever row 0 happens to carry.
+    with open(os.path.join(PUB, "frame-stageb-mixed-2026-01-01.jsonl"), "w") as fh:
+        fh.write(json.dumps({"stageb_verdict": "admit", "domain": "adserving.ru",
+                             "stageb_schema": SB.SCHEMA - 2, "vantage": "mixed",
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox": {"ya": True, "adfoxCode": True, "hb_settings": False,
+                                       "ya_context": True},
+                             "adfox_hb": {"present": False}, "prebid": [], "globals": [],
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+        fh.write(json.dumps({"stageb_verdict": "admit", "domain": "real.ru",
+                             "stageb_schema": SB.SCHEMA, "vantage": "mixed",
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+    b = block(False)
+    check("a stale-schema admit is not printed as an admission",
+          "`adserving.ru`" in b, False)
+    check("the re-derivation is disclosed rather than done quietly",
+          "re-derived 1 row" in b, True)
+    os.remove(os.path.join(PUB, "frame-stageb-mixed-2026-01-01.jsonl"))
     check("reading the private tree is disclosed",
           "unpublished" in block(True) or True, True)
     PUB, PRIV = keep

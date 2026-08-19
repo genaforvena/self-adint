@@ -54,6 +54,13 @@ import uuid
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# THE CAPTURE SCHEMA, as a constant a reader can import. It was written as the literal `5` at
+# both row-writing sites, which made "is this ledger current?" a question no consumer could
+# ask — every reader had to pick the newest schema PRESENT IN THE FILE and call that current.
+# A file whose newest rows are old then reads as fully current, which is the one thing the
+# stamp exists to prevent. The per-schema history lives beside the load row below.
+SCHEMA = 5
 OUT = os.path.join(REPO, "data", "hb-auction.jsonl")
 DOMAINS = os.path.join(REPO, "ref", "exchange-domains.tsv")
 
@@ -473,7 +480,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # override the inherited proxy env, so BOTH arms left through privoxy. Their
         # `egress_ip: 77.246.104.228` is what the parent's curl measured, not where that
         # browser went — schema-4 arms are an A/A null wearing a treatment's name.
-        "schema": 5, "kind": "load", "load_id": load_id, "pair_id": pair_id,
+        "schema": SCHEMA, "kind": "load", "load_id": load_id, "pair_id": pair_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note,
         # `egress_ip` is the address the BROWSER left from, never whichever one was easiest to
@@ -539,7 +546,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                 from urllib.parse import urlparse
                 host = (urlparse(req.url).hostname or "").lower()
                 row = {
-                    "schema": 5, "kind": "request", "load_id": load_id,
+                    "schema": SCHEMA, "kind": "request", "load_id": load_id,
                     "t_request_s": rel(), "method": req.method, "host": host,
                     "url": req.url[:500], "resource_type": req.resource_type,
                     "floor": parse_request_floor(req.post_data),
