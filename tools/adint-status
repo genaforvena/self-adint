@@ -126,15 +126,29 @@ def run_of(path):
     return b.split(".")[0]
 
 
-def rendered(load):
-    """Did this arm SEE the page? A 4xx/5xx load is our access failing, not a measurement.
+def unseen_cause(load):
+    """None if this arm saw the page; otherwise WHICH KIND of not-seeing it was.
 
-    The capture already says so honestly per load (`http_status` >= 400, and a note that
-    the rows say nothing about the auction). What was missing is that the pair counter
-    believed it anyway.
+    Two facts, and folding them is the mistake this project cannot afford:
+
+      `refused`    4xx/5xx — the publisher's server answered and declined us. A property
+                   of the site's relationship to THIS vantage.
+      `no-answer`  no `http_status` at all — the navigation never produced a response.
+                   Measured on the RU arm of the evening cell: 9 of its first 26 loads
+                   carry `TimeoutError: Page.goto: Timeout 120000ms exceeded`, i.e. the
+                   tether could not fetch the page inside the nav budget. That is OUR
+                   LINK, and filing it as `blocked` would record our own slowness as the
+                   publisher's refusal.
     """
     st = load.get("http_status")
-    return st is not None and st < 400
+    if st is None:
+        return "no-answer"
+    return "refused" if st >= 400 else None
+
+
+def rendered(load):
+    """Did this arm SEE the page? `unseen_cause` splits the reasons it did not."""
+    return unseen_cause(load) is None
 
 
 def complete_pairs(by_run_arm, rendered_only=False):
@@ -190,7 +204,8 @@ def cells(include_private):
             "run": run_of(f),
             "complete_pairs": done.get(run_of(f), 0),
             "readable_pairs": readable.get(run_of(f), 0),
-            "blocked": sum(1 for r in rows if not rendered(r)),
+            "refused": sum(1 for r in rows if unseen_cause(r) == "refused"),
+            "no_answer": sum(1 for r in rows if unseen_cause(r) == "no-answer"),
             "file": os.path.basename(f),
             "arm": rows[0].get("arm"),
             "loads": len(rows),
@@ -266,15 +281,18 @@ def block(include_private):
               "Three counts, because they are three different facts. `this arm` is what "
               "this arm attempted. `both arms` adds the other arm's load — they differ "
               "exactly when one arm refused a load the other recorded. **`readable`** "
-              "additionally requires that BOTH arms saw the page: a 4xx/5xx is our access "
-              "failing, and a pair with a blocked half carries no RU-versus-NL contrast at "
-              "all. Only the last number is a comparison.", "",
-              "| cell | arm | loads | blocked | sites | this arm | both arms | "
+              "additionally requires that BOTH arms saw the page, and a pair with an "
+              "unseen half carries no RU-versus-NL contrast at all. Only the last number "
+              "is a comparison. The two ways of not seeing are kept apart: `refused` is a "
+              "4xx/5xx — the publisher's server answered and declined THIS vantage — while "
+              "`no answer` is a navigation that never returned a response at all, which is "
+              "our own link and says nothing about the site.", "",
+              "| cell | arm | loads | refused | no answer | sites | this arm | both arms | "
               "**readable** | window | hours UTC | vantage verified |",
-              "|---|---|---:|---:|---:|---:|---:|---:|---|---|---:|"]
+              "|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|"]
         for c in cl:
-            L.append(f"| `{c['run']}` | `{c['arm']}` | {c['loads']} | {c['blocked']} | "
-                     f"{c['sites']} | "
+            L.append(f"| `{c['run']}` | `{c['arm']}` | {c['loads']} | {c['refused']} | "
+                     f"{c['no_answer']} | {c['sites']} | "
                      f"{c['pairs']} | {c['complete_pairs']} | **{c['readable_pairs']}** | "
                      f"{'/'.join(str(w) for w in c['windows'])} s | "
                      f"{','.join(str(h) for h in c['hours'])} | "
@@ -374,37 +392,48 @@ def selftest():
     # fixture shaped exactly like the 2026-08-19 day cell — one arm short by one load — and
     # reads the rendered row, so a tool that computes the intersection and then prints
     # something else still goes red.
-    # A pair whose halves BOTH wrote a load is still not a comparison if one of them was
-    # blocked. gismeteo.ru answers the NL vantage 403 in ~2s and the RU vantage 200.
-    check("a 4xx load did not see the page", rendered({"http_status": 403}), False)
-    check("a 200 load did", rendered({"http_status": 200}), True)
+    # A pair whose halves BOTH wrote a load is still not a comparison if one of them never
+    # saw the page — and the two ways of not seeing must not collapse into one column.
+    check("a 4xx load did not see the page", unseen_cause({"http_status": 403}), "refused")
+    check("a 200 load did", unseen_cause({"http_status": 200}), None)
+    check("no status at all is OUR link, not the publisher refusing",
+          unseen_cause({"http_status": None}), "no-answer")
     check("a missing status is not silently treated as rendered",
           rendered({"http_status": None}), False)
     check("a 3xx that landed is rendered", rendered({"http_status": 302}), True)
 
-    # NL attempts s000..s002, one of them (s001) blocked; RU attempts s000..s001, both 200.
-    # so: this-arm 3/2 · both-arms 2 · readable 1.
-    for arm, n, blocked in (("nl-direct", 3, {1}), ("ru-mobile", 2, set())):
+    # NL attempts s000/s001/s002 with s001 REFUSED (403); RU attempts s000/s001/s003 with
+    # s003 giving NO ANSWER (nav timeout, no status). So:
+    #   this arm  nl 3 · ru 3
+    #   both arms {s000,s001} = 2          (s002 and s003 have no partner)
+    #   readable  nl saw {s000,s002}, ru saw {s000,s001} -> {s000} = 1
+    fixture = {
+        "nl-direct": [("s000", 200), ("s001", 403), ("s002", 200)],
+        "ru-mobile": [("s000", 200), ("s001", 200), ("s003", None)],
+    }
+    for arm, loads in fixture.items():
         with open(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"), "w") as fh:
-            for i in range(n):
+            for sid, st in loads:
                 fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
-                                     "hour_utc": 9, "url": f"https://d{i}.ru/",
+                                     "hour_utc": 9, "url": f"https://{sid}.ru/",
                                      "egress_ip": "1.2.3.4", "vantage_verified": True,
-                                     "http_status": 403 if i in blocked else 200,
-                                     "pair_id": f"testcell-s{i:03d}"}) + "\n")
+                                     "http_status": st,
+                                     "pair_id": f"testcell-{sid}"}) + "\n")
     b = block(False)
     row = [x for x in b.splitlines() if "`nl-direct`" in x and "`testcell`" in x]
     check("the rendered NL row exists", len(row), 1)
     cols = [c.strip() for c in row[0].split("|")] if row else []
     check("the table prints attempts, both-arms and readable as three columns",
-          cols[6:9] if cols else None, ["3", "2", "**1**"])
-    check("the blocked half is counted and shown", cols[4] if cols else None, "1")
+          cols[7:10] if cols else None, ["3", "2", "**1**"])
+    check("the NL arm's refusal is a refusal and not a no-answer",
+          cols[4:6] if cols else None, ["1", "0"])
     ru_row = [x for x in b.splitlines() if "`ru-mobile`" in x and "`testcell`" in x]
     rcols = [c.strip() for c in ru_row[0].split("|")] if ru_row else []
-    check("the unblocked arm publishes the SAME readable count, not its own",
-          rcols[8] if rcols else None, "**1**")
-    check("the unblocked arm reports zero blocked", rcols[4] if rcols else None, "0")
-    for arm in ("nl-direct", "ru-mobile"):
+    check("the other arm publishes the SAME readable count, not its own",
+          rcols[9] if rcols else None, "**1**")
+    check("the RU arm's nav timeout is a no-answer and not a refusal",
+          rcols[4:6] if rcols else None, ["0", "1"])
+    for arm in fixture:
         os.remove(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"))
 
     # A verdict this tool has never heard of must still be COUNTED, not dropped: a table that
