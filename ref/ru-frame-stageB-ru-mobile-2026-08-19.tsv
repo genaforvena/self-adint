@@ -1,9 +1,10 @@
 # stage B frame — produced by tools/adint-frame-stageb, schema 3
 # universe: ru-universe-tranco-V3JQN.tsv (stage A, committed)
 # vantage: ru-mobile · settle 8s · no-wrapper re-probed at 45s
-# generated: 2026-08-19T07:45:27Z
-# The REJECTIONS are the other half of this artifact and live in the ledger beside it: frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
-# ledger tally: ad-serving-only=14 admit=6 blocked=10 no-web-apex=35 no-wrapper=10 rate-limited=1 unreachable=10 ya-generic-only=38
+# generated: 2026-08-19T13:17:43Z
+# The REJECTIONS are the other half of this artifact and live in the ledger beside it: frame-stageb-ru-mobile-2026-08-19.jsonl
+# ledger tally: ad-serving-only=18 admit=14 blocked=23 no-web-apex=45 no-wrapper=27 rate-limited=1 unreachable=20 ya-generic-only=63
+# re-derived 16 row(s) written under an older stageb_schema: admit->ad-serving-only=6 blocked->blocked=4 error->no-web-apex=3 error->unreachable=1 no-wrapper->no-wrapper=1 ya-generic-only->ya-generic-only=1
 # `blocked` / `rate-limited` / `error` are NOT evidence of absent header bidding — they are our own blindness, named.
 rank	domain	wrapper_evidence	settle_used_s	browser_egress_ip
 721	magnit.ru	YaHeaderBiddingSettings(bidders=3)	8	91.79.81.62
@@ -12,3 +13,11 @@ rank	domain	wrapper_evidence	settle_used_s	browser_egress_ip
 1169	gismeteo.ru	YaHeaderBiddingSettings(bidders=2)	8	91.79.81.62
 1754	hh.ru	YaHeaderBiddingSettings(bidders=1)	8	91.79.81.62
 2225	ria.ru	YaHeaderBiddingSettings(bidders=5)+pbjs:pbjs	8	91.79.81.62
+3322	iz.ru	YaHeaderBiddingSettings(bidders=8)	8	91.79.81.62
+3651	matchtv.ru	YaHeaderBiddingSettings(bidders=10)	45	91.79.81.62
+3950	kp.ru	YaHeaderBiddingSettings(bidders=16)	8	91.79.81.62
+3979	aif.ru	YaHeaderBiddingSettings(bidders=15)	8	91.79.81.62
+4249	mk.ru	YaHeaderBiddingSettings(bidders=11)	8	91.79.81.62
+4303	sports.ru	YaHeaderBiddingSettings(bidders=16)	8	91.79.81.62
+4583	aviasales.ru	YaHeaderBiddingSettings(bidders=6)	8	91.79.81.62
+5117	interfax.ru	YaHeaderBiddingSettings(bidders=1)	8	91.79.81.62

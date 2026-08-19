@@ -9,24 +9,38 @@ vantage:  ru-mobile
 frame:    ref/ru-frame-stageB-ru-mobile-2026-08-19.tsv
 ledger:   public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
 
-# WHY, measured rather than assumed (tools/adint-frame-compare, ranks 13–2463, 102 domains
-# reached by both walks):
+# WHY, measured rather than assumed (tools/adint-frame-compare, ranks 13–5117, on the
+# domains BOTH walks reached). Re-measured 2026-08-19T13:19Z after the frames were rebuilt
+# from the FULL ledgers; the earlier figures on this file (nl 8 admits / 3 holes, ru 6 / 1,
+# union 11) were computed over a truncated schema-3 snapshot and over a shallower walk, and
+# they are superseded — not contradicted. Direction held, every number moved:
+#
+#   nl-direct admits 13 · ru-mobile admits 14 · union 18
 #
 #   HOLE in an nl-direct-built frame — ru-mobile admits these, nl-direct does not:
-#     #1163  rbc.ru        nl-direct says blocked (401)
-#     #1169  gismeteo.ru   nl-direct says blocked (403)
-#     #1754  hh.ru         nl-direct says ya-generic-only  <- NOT an access failure
-#   HOLE in a ru-mobile-built frame (found 07:44Z, ~15 min after this file was written):
-#     #3128  lenta.ru      ru-mobile says ad-serving-only
+#     #1163  rbc.ru          nl-direct says blocked           <- our blindness
+#     #1169  gismeteo.ru     nl-direct says blocked           <- our blindness
+#     #5117  interfax.ru     nl-direct says unreachable       <- our blindness
+#     #1754  hh.ru           nl-direct says ya-generic-only   <- a DIFFERENT PAGE
+#     #4583  aviasales.ru    nl-direct says no-wrapper        <- a DIFFERENT PAGE
+#   HOLE in a ru-mobile-built frame — nl-direct admits these, ru-mobile does not:
+#     #3128  lenta.ru        ru-mobile says ad-serving-only   <- a DIFFERENT PAGE
+#     #4678  liveinternet.ru ru-mobile says unreachable       <- our blindness
 #
-# THAT SECOND HOLE CORRECTS THIS FILE'S ORIGINAL ARGUMENT. When the declaration was made the
-# asymmetry was one-directional and the RU frame lost nothing; the RU walk then reached rank
-# 3128 and it no longer is. NEITHER single-vantage frame is complete: hh.ru is admitted only
-# from Moscow, lenta.ru only from Amsterdam, and both are CONTENT differences rather than
-# access. The union (11 domains at ranks 13-3128) is strictly better than either.
+# READ THE TWO KINDS APART. A hole whose cause is `blocked`/`unreachable` is OUR blindness at
+# that moment and a later walk from the same vantage may close it; a hole whose cause is a
+# named-but-different verdict is the site serving that vantage another page, and no retry
+# closes it. 3 of nl-direct's 5 holes and 1 of ru-mobile's 2 are the recoverable kind, so a
+# bare hole count is an upper bound on how permanent either gap is — quoting 5 against 2
+# without the split overstates the difference between the vantages.
 #
-# The declaration is left at `ru-mobile` because that is the operator's instruction and it
-# is still the smaller hole — 1 against 3. Switching to a union frame is a decision for the
+# NEITHER single-vantage frame is complete, and that is the standing finding. hh.ru and
+# aviasales.ru are admitted only from Moscow, lenta.ru only from Amsterdam, and those three
+# are CONTENT differences rather than access. The union (18 domains) is strictly better than
+# either.
+#
+# The declaration is left at `ru-mobile` because that is the operator's instruction and it is
+# still the smaller hole — 2 against 5. Switching to a union frame is a decision for the
 # operator, not for whoever regenerates this file, and it carries a real cost: a union is no
 # longer a rank-ordered prefix of ONE walk, so its reproduction instructions change.
 #
@@ -40,14 +54,15 @@ ledger:   public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
 # per-vantage difference has to be told apart from a per-time one.)
 #
 # The asymmetry is the whole argument. A frame built from Amsterdam is a frame of "Russian
-# sites Amsterdam is allowed to load", and it never says so; two of its three holes are
-# outright refusals and the third is worse — hh.ru is not blocked from Amsterdam, it serves
-# a DIFFERENT PAGE there, one carrying only the generic Yandex namespace and no auction
-# config. So vantage-dependence is not only access. A page you can load can still be the
-# wrong page.
+# sites Amsterdam is allowed to load", and it never says so; three of its five holes are
+# outright refusals and two are worse — hh.ru and aviasales.ru are not blocked from
+# Amsterdam, they serve a DIFFERENT PAGE there, one carrying no auction config. So
+# vantage-dependence is not only access. A page you can load can still be the wrong page.
 #
-# PENDING, and it is progress rather than a defect: lenta.ru #3128 and iz.ru #3322 are
-# admitted by the deeper nl-direct walk and the ru-mobile walk has not reached them yet.
+# PENDING, and it is progress rather than a defect: sportbox.ru #5813 and playground.ru #6336
+# are admitted by the deeper nl-direct walk and the ru-mobile walk has not reached them yet.
 # They are NOT added by hand — the frame is a rank-ordered PREFIX of the universe, and
 # admitting a domain out of order would destroy the one property that makes the frame
-# reproducible by a stranger. They enter when the walk arrives.
+# reproducible by a stranger. They enter when the walk arrives. (iz.ru #3322 and lenta.ru
+# #3128 were on this list at 07:46Z; the RU walk has since reached both — iz.ru admitted,
+# lenta.ru read as ad-serving-only, which is how a pending line is supposed to end.)

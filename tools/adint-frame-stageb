@@ -601,6 +601,22 @@ def write_frame(path, ledger, args):
                     rows.append(json.loads(line))
                 except Exception:
                     pass
+    # A LEDGER OUTLIVES THE RULE THAT CLASSIFIED IT. `stageb_verdict` is the answer the
+    # classifier gave AT THE TIME OF THE READ; the raw fields beside it are vantage-and-time
+    # facts that do not age. So a row stamped with an older `stageb_schema` gets its verdict
+    # RE-DERIVED here rather than trusted — otherwise a fix to `classify` reaches only the
+    # rows walked after it, and the frame silently re-admits what the fix retired. An
+    # UNSTAMPED row is pre-schema by definition and is re-derived too.
+    redone = collections.Counter()
+    for r in rows:
+        if r.get("stageb_schema") == SCHEMA:
+            continue
+        before = r.get("stageb_verdict")
+        v, ev = classify(r)
+        r["stageb_verdict"] = v
+        r["wrapper_evidence"] = ev or r.get("wrapper_evidence") or []
+        r["stageb_schema"] = SCHEMA
+        redone[f"{before}->{v}"] += 1
     adm, seen_dom = [], set()
     for r in rows:
         if r.get("stageb_verdict") != "admit" or r.get("domain") in seen_dom:
@@ -621,6 +637,12 @@ def write_frame(path, ledger, args):
                  "ledger beside it: " + os.path.basename(ledger) + "\n")
         fh.write("# ledger tally: " + " ".join(f"{k}={v}" for k, v in sorted(
             tally.items(), key=lambda kv: str(kv[0]))) + "\n")
+        if redone:
+            # Disclosed, never silent: a correction nobody can see reads exactly like a
+            # ledger that never needed one. The counts name WHICH way rows moved.
+            fh.write(f"# re-derived {sum(redone.values())} row(s) written under an older "
+                     f"stageb_schema: " + " ".join(f"{k}={v}" for k, v in
+                                                   sorted(redone.items())) + "\n")
         fh.write("# `blocked` / `rate-limited` / `error` are NOT evidence of absent header "
                  "bidding — they are our own blindness, named.\n")
         fh.write("rank\tdomain\twrapper_evidence\tsettle_used_s\tbrowser_egress_ip\n")
@@ -735,9 +757,11 @@ def selftest():
     with open(_led, "w") as fh:
         for i in range(3):
             fh.write(json.dumps({"domain": "dup.ru", "rank": 10, "stageb_verdict": "admit",
+                                 "stageb_schema": SCHEMA,
                                  "wrapper_evidence": ["x"], "settle_used_s": 8,
                                  "browser_egress_ip": "1.2.3.4"}) + "\n")
         fh.write(json.dumps({"domain": "one.ru", "rank": 11, "stageb_verdict": "admit",
+                             "stageb_schema": SCHEMA,
                              "wrapper_evidence": ["x"], "settle_used_s": 8,
                              "browser_egress_ip": "1.2.3.4"}) + "\n")
     class _A:
@@ -746,6 +770,44 @@ def selftest():
     _lines = [l for l in open(os.path.join(_d, "f.tsv")) if not l.startswith("#")][1:]
     check("a domain duplicated by concurrent writers is listed once in the frame",
           len(_lines), 2)
+
+    # A LEDGER OUTLIVES THE RULE THAT CLASSIFIED IT. A walk interrupted by a fix to `classify`
+    # leaves rows carrying the OLD verdict under the OLD `stageb_schema`, and the frame is
+    # derived long after. Deriving on the stored verdict re-admits exactly what the fix
+    # retired — measured on the real 2026-08-19 walks: 7 nl / 6 ru ad-serving-only domains,
+    # ranks 13..563, i.e. the TOP of the frame. The stamp is on every row for this reason;
+    # reading it is what makes the header's `schema N` a claim the artifact ENFORCED.
+    _led2 = os.path.join(_d, "mixed.jsonl")
+    _stale = {"domain": "adserving.ru", "rank": 13, "stageb_verdict": "admit",
+              "stageb_schema": SCHEMA - 2, "wrapper_evidence": ["Ya.adfoxCode", "yaContextCb"],
+              "settle_used_s": 8, "browser_egress_ip": "1.2.3.4", "http_status": 200,
+              "content_type": "text/html", "adfox": {"ya": True, "adfoxCode": True,
+                                                     "hb_settings": False, "ya_context": True},
+              "adfox_hb": {"present": False}, "prebid": [], "globals": []}
+    _fresh = {"domain": "hb.ru", "rank": 14, "stageb_verdict": "admit",
+              "stageb_schema": SCHEMA, "wrapper_evidence": ["x"], "settle_used_s": 8,
+              "browser_egress_ip": "1.2.3.4"}
+    with open(_led2, "w") as fh:
+        fh.write(json.dumps(_stale) + "\n")
+        fh.write(json.dumps(_fresh) + "\n")
+    write_frame(os.path.join(_d, "f2.tsv"), _led2, _A())
+    _txt = open(os.path.join(_d, "f2.tsv")).read()
+    _rows = [l for l in _txt.splitlines() if not l.startswith("#")][1:]
+    check("a stale-schema admit is re-derived, not carried into the frame",
+          [l.split("\t")[1] for l in _rows], ["hb.ru"])
+    # and the re-derivation is DISCLOSED — a silent correction reads exactly like a ledger
+    # that never needed one.
+    check("the frame says how many rows it re-derived",
+          "re-derived 1 row" in _txt, True)
+    # An unstamped row is PRE-schema by definition; assuming it current is the assumption
+    # being removed.
+    _led3 = os.path.join(_d, "unstamped.jsonl")
+    with open(_led3, "w") as fh:
+        fh.write(json.dumps({k: v for k, v in _stale.items() if k != "stageb_schema"}) + "\n")
+    write_frame(os.path.join(_d, "f3.tsv"), _led3, _A())
+    check("an unstamped row is treated as stale, not as current",
+          [l for l in open(os.path.join(_d, "f3.tsv")).read().splitlines()
+           if not l.startswith("#")][1:], [])
 
     # The universe must parse, and it must be the file the document pins.
     u = read_universe(UNIVERSE)

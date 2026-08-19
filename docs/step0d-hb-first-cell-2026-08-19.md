@@ -177,6 +177,55 @@ destroy the one property that lets a stranger reproduce it. They enter when the 
 `tools/adint-frame-compare` now separates a HOLE from a PENDING by construction, because the
 two are indistinguishable in any disagreement total and only one of them is a defect.
 
+### Re-measured at 13:19Z, on the full ledgers — and the reason it had to be re-measured
+
+**The numbers in the table above were derived over a ledger that mixed two classifier
+schemas, and the derivation trusted the verdict stored in each row.** `tools/adint-frame-stageb`
+stamps `stageb_schema` on every row precisely because the rule can change under a running
+walk — and it did, at `495148a`, when the frame rule stopped admitting Adfox *ad serving* as
+header bidding. The 35 nl / 16 ru rows walked before that fix kept their old verdicts, and
+`write_frame` read the field instead of re-deriving it. The effect was not subtle and it was
+not at the margin: **7 domains re-entered the nl frame and 6 the ru frame as `admit` on
+`Ya.adfoxCode+yaContextCb` alone — `mail.ru` #13, `dzen.ru` #18, `nic.ru` #93, `yandex.ru`
+#98, `reg.ru` #148, `ok.ru` #310, `imgsmail.ru` #563 — the top of the rank order, ahead of
+every genuine admission.** The header said `schema 3` over a table that was partly schema 1.
+
+The sibling tool had it right the whole time: `adint-frame-compare` re-derives verdicts from
+the stored probe rows by design, and says so in its docstring — *"the comparison is between
+the pages, not between the days the tools were edited."* The discipline existed in the
+comparison path and was missing from the derivation path, which is why the disagreement
+tables were sound while the frames were not. `write_frame` now re-derives any row whose
+`stageb_schema` is not current (an *unstamped* row counts as stale — assuming it current is
+the assumption being removed) and prints how many it moved and in which direction, so a
+correction can never be silent:
+
+    # re-derived 35 row(s) written under an older stageb_schema: admit->ad-serving-only=7 …
+
+**A stored verdict is a claim about the page AND about the code that read it.** The raw
+fields beside it are facts that do not age; the verdict ages the moment the classifier is
+fixed. Re-derive on read, or the fix reaches only the rows walked after it.
+
+With that repaired and both walks carried to their current depth (ranks 13–5117 reached by
+both):
+
+| | admits | hole — the other vantage admits it, this one reached it and refused |
+|---|---:|---|
+| `nl-direct` | 13 | **5** — `rbc.ru` #1163, `gismeteo.ru` #1169, `hh.ru` #1754, `aviasales.ru` #4583, `interfax.ru` #5117 |
+| `ru-mobile` | 14 | **2** — `lenta.ru` #3128, `liveinternet.ru` #4678 |
+| union | **18** | |
+
+Direction held, every number moved — including which vantage admits more, which has
+reversed. **And the hole counts should be read split, not pooled:** 3 of `nl-direct`'s 5
+(`rbc.ru`, `gismeteo.ru` blocked; `interfax.ru` unreachable) and 1 of `ru-mobile`'s 2
+(`liveinternet.ru` unreachable) are *our own blindness at that moment*, which a later walk
+from the same vantage may close. The rest are the site serving that vantage a different
+page, and no retry closes those. Quoting **5 against 2** without the split overstates how
+permanent the gap is; the content-difference count is **2 against 1**.
+
+The pending line from 07:46Z closed exactly as a pending line should: the RU walk reached
+`iz.ru` #3322 (admitted) and `lenta.ru` #3128 (`ad-serving-only`, the hole above). Now
+pending for RU: `sportbox.ru` #5813 and `playground.ru` #6336.
+
 **Consequences, and they bind the design rather than decorating it:**
 
 1. **The frame is built from the RU vantage** — done, above, and it is the smaller hole
