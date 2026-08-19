@@ -35,39 +35,41 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-19 07:05 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-19 07:28 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
-**Vantage `nl-direct`** · 107 domains touched in rank order · browser egress 77.246.104.228 · `frame-stageb-nl-direct-2026-08-19-schema3.jsonl`
+The study runs on the **`ru-mobile`** frame, declared in `ref/CANONICAL-FRAME`. Which vantage a frame is built from changes its membership, so this is a choice with a reason, recorded in that file.
+
+**Vantage `ru-mobile`** — **canonical** · 102 domains touched in rank order · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
 
 | verdict | n | what it means |
 |---|---:|---|
-| `admit` | 3 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
-| `ad-serving-only` | 12 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
-| `no-wrapper` | 10 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
-| `ya-generic-only` | 34 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
-| `blocked` | 11 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
+| `admit` | 6 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
+| `ad-serving-only` | 13 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
+| `no-wrapper` | 9 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
+| `ya-generic-only` | 30 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
+| `blocked` | 9 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
 | `rate-limited` | 1 | 428/429 — caused by our own load, not by the site |
-| `unreachable` | 7 | timeout or refused connection — our blindness |
-| `no-web-apex` | 29 | DNS/TLS failure — the domain serves no page at its apex at all |
+| `unreachable` | 6 | timeout or refused connection — our blindness |
+| `no-web-apex` | 28 | DNS/TLS failure — the domain serves no page at its apex at all |
 
-Admitted: `magnit.ru`, `pikabu.ru`, `ria.ru`.
+Admitted: `magnit.ru`, `pikabu.ru`, `rbc.ru`, `gismeteo.ru`, `hh.ru`, `ria.ru`.
 
-**Vantage `ru-mobile`** · 63 domains touched in rank order · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
+**Vantage `nl-direct`** · 138 domains touched in rank order · browser egress 77.246.104.228 · `frame-stageb-nl-direct-2026-08-19-schema3.jsonl`
 
 | verdict | n | what it means |
 |---|---:|---|
-| `admit` | 4 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
-| `ad-serving-only` | 10 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
-| `no-wrapper` | 6 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
-| `ya-generic-only` | 15 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
-| `blocked` | 5 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
+| `admit` | 5 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
+| `ad-serving-only` | 14 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
+| `no-wrapper` | 14 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
+| `ya-generic-only` | 47 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
+| `blocked` | 12 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
 | `rate-limited` | 1 | 428/429 — caused by our own load, not by the site |
-| `unreachable` | 3 | timeout or refused connection — our blindness |
-| `no-web-apex` | 19 | DNS/TLS failure — the domain serves no page at its apex at all |
+| `unreachable` | 10 | timeout or refused connection — our blindness |
+| `no-web-apex` | 35 | DNS/TLS failure — the domain serves no page at its apex at all |
 
-Admitted: `magnit.ru`, `pikabu.ru`, `rbc.ru`, `gismeteo.ru`.
+Admitted: `magnit.ru`, `pikabu.ru`, `ria.ru`, `lenta.ru`, `iz.ru`.
 
 ### Captured cells
 

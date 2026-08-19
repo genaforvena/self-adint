@@ -125,11 +125,39 @@ auctions with readable bidder rosters, and from Amsterdam they do not appear to 
 class of site the study is about.** The other two disagreements are between *rejection*
 reasons and change nothing; these two change the frame's membership.
 
+### The frame was rebuilt from the RU vantage (operator, 2026-08-19)
+
+Done rather than recommended. `ref/CANONICAL-FRAME` now declares `ru-mobile` as the frame the
+study runs on, and the declaration carries the measurement that justifies it. At 102 domains
+reached by both walks (ranks 13–2463):
+
+| | admits | hole — the other vantage admits it, this one reached it and refused |
+|---|---:|---|
+| `nl-direct` | 5 | **3** — `rbc.ru` #1163, `gismeteo.ru` #1169, `hh.ru` #1754 |
+| `ru-mobile` | 6 | **none** |
+
+The asymmetry is the whole argument, and it is one-directional: every domain Amsterdam
+admits and Moscow has reached, Moscow admits too. A Moscow-built frame loses nothing.
+
+**`hh.ru` is the one that widens the finding.** It is *not* blocked from Amsterdam — it
+answers 200 and renders. From there it carries only the generic Yandex namespace and no
+auction config; from Moscow it carries `YaHeaderBiddingSettings`. **Vantage-dependence is
+therefore not only about access. A page you can load can still be the wrong page**, and no
+HTTP status anywhere in the ledger would tell you.
+
+`lenta.ru` #3128 and `iz.ru` #3322 are admitted by the deeper `nl-direct` walk and are
+**pending** for the RU walk, which has not reached them. They are not added by hand: the
+frame is a rank-ordered *prefix* of the universe, and admitting a domain out of order would
+destroy the one property that lets a stranger reproduce it. They enter when the walk arrives.
+`tools/adint-frame-compare` now separates a HOLE from a PENDING by construction, because the
+two are indistinguishable in any disagreement total and only one of them is a defect.
+
 **Consequences, and they bind the design rather than decorating it:**
 
-1. **The frame must be built from the RU vantage**, or from the union of both with every
-   disagreement published. An `nl-direct` frame is a frame of *Russian sites Amsterdam is
-   allowed to load*, which is a different population and never says so.
+1. **The frame is built from the RU vantage** — done, above. The alternative, a union of
+   both with every disagreement published, remains available and is what a third vantage
+   would require. An `nl-direct` frame is a frame of *Russian sites Amsterdam is allowed to
+   load*, which is a different population and never says so.
 2. **A paired study on an NL-built frame compares the arms on sites selected by one of
    them** — and the excluded ones are systematically the news publishers, i.e. exactly where
    display demand concentrates.
@@ -144,6 +172,11 @@ reads as a claim expiring on schedule rather than as a result being reversed.
                               data/frame-stageb-ru-mobile-<date>-schema3.jsonl
 
 ## 5. The paired cell: the channel confound is not a caveat, it is the whole signal
+
+> **This cell was captured on the `nl-direct` frame, which is now superseded.** It ran on
+> `pikabu.ru` and `magnit.ru` — both of which the canonical RU frame also admits, so nothing
+> here is invalidated. What it could not include is `rbc.ru`, `gismeteo.ru` and `hh.ru`,
+> which that frame did not contain. The next cell runs on the canonical frame.
 
 **Six simultaneous pairs**, two sites (`pikabu.ru`, `magnit.ru`), three replicates, MSK
 morning zone — a zone the RU arm had never observed. Both arms launched on one site at a
@@ -230,8 +263,10 @@ as evidence — never as admission criteria, since the study's object is Adfox a
 ## 7. What this changes in step0c
 
 0. **§2.5 gains a frame clause: the FRAME is a measurement from a vantage, not just the
-   capture.** It must be built from the RU vantage or from the published union of both, and
-   every rejection statistic carries the vantage it was taken from (see §4).
+   capture.** Built from the RU vantage as of 2026-08-19 (`ref/CANONICAL-FRAME`), and every
+   rejection statistic carries the vantage it was taken from (see §4). The clause is stronger
+   than "geo-blocking exists": `hh.ru` serves a *different page* to the two vantages without
+   refusing either.
 1. **§1.4's condition (ii) is replaced.** Admission requires an auction configuration, not an
    advertising global. The intermediate population is preserved as `ad-serving-only`.
 2. **§1.6's category source is upgraded from "open" to load-bearing.** Unstratified, the walk

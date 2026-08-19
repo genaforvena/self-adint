@@ -130,9 +130,27 @@ def block(include_private):
         L += ["**The frame has not been built yet.** `ref/ru-universe-tranco-V3JQN.tsv` is the "
               "universe (stage A, n = 1944); nothing has been run against it.", ""]
     else:
+        canon = None
+        cp = os.path.join(REPO, "ref", "CANONICAL-FRAME")
+        if os.path.exists(cp):
+            for line in open(cp, encoding="utf-8"):
+                if line.strip().startswith("vantage:"):
+                    canon = line.split(":", 1)[1].strip()
         L += ["### The sampling frame — and its rejections, which are half the result", ""]
+        if canon:
+            L += [f"The study runs on the **`{canon}`** frame, declared in "
+                  f"`ref/CANONICAL-FRAME`. Which vantage a frame is built from changes its "
+                  f"membership, so this is a choice with a reason, recorded in that file.", ""]
+        else:
+            L += ["> No canonical frame is declared in `ref/CANONICAL-FRAME`. Since the "
+                  "vantage a frame is built from changes its membership, an undeclared frame "
+                  "is a frame nobody has chosen.", ""]
+        # Canonical first: a reader who stops after the first block must have read the frame
+        # the study actually runs on, not whichever vantage sorts earlier in the alphabet.
+        fr = sorted(fr, key=lambda f: (f["vantage"] != canon, f["vantage"]))
         for f in fr:
-            L.append(f"**Vantage `{f['vantage']}`** · {f['touched']} domains touched in rank "
+            mark = " — **canonical**" if canon and f["vantage"] == canon else ""
+            L.append(f"**Vantage `{f['vantage']}`**{mark} · {f['touched']} domains touched in rank "
                      f"order · browser egress {', '.join(f['egress']) or 'unverified'} · "
                      f"`{f['file']}`")
             L.append("")

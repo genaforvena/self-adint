@@ -101,6 +101,34 @@ def main():
         print(f"\n`blocked` on either side: {len(bl)} domain(s), of which {len(bl_diff)} "
               f"differ between the vantages"
               + ("  — these refusals are not geo-shaped at this depth" if not bl_diff else ""))
+    # ── THE FRAME QUESTION, which is what this tool is actually for ──────────────────
+    # Disagreement counts do not answer it. What decides whether a frame built from ONE
+    # vantage is usable is asymmetric: a domain the OTHER vantage admits and this one does
+    # not is a HOLE — a real site missing from the frame — while a domain this vantage has
+    # simply not reached yet is PROGRESS. Those two look identical in any total.
+    adm_a = {d for d in A if sb.classify(A[d])[0] == "admit"}
+    adm_b = {d for d in B if sb.classify(B[d])[0] == "admit"}
+    hole_a = sorted((A[d].get("rank") or 0, d, sb.classify(A[d])[0])
+                    for d in (adm_b & set(A)) - adm_a)
+    hole_b = sorted((B[d].get("rank") or 0, d, sb.classify(B[d])[0])
+                    for d in (adm_a & set(B)) - adm_b)
+    pend_a = sorted((B[d].get("rank") or 0, d) for d in adm_b - set(A))
+    pend_b = sorted((A[d].get("rank") or 0, d) for d in adm_a - set(B))
+    print(f"\nFRAME: {va} admits {len(adm_a)} · {vb} admits {len(adm_b)} · "
+          f"union {len(adm_a | adm_b)}")
+    for who, other, holes in ((va, vb, hole_a), (vb, va, hole_b)):
+        if holes:
+            print(f"  HOLE in a {who}-built frame — {other} admits these and {who} does not:")
+            for rank, d, verdict in holes:
+                print(f"    #{rank:<6} {d:24s} {who} says {verdict}")
+        else:
+            print(f"  no hole in a {who}-built frame: every domain {other} admits and {who} "
+                  f"has reached, {who} admits too")
+    for who, other, pend in ((va, vb, pend_a), (vb, va, pend_b)):
+        if pend:
+            print(f"  PENDING for {who} (reached by {other} only — progress, NOT a hole): "
+                  + ", ".join(f"{d} #{r}" for r, d in pend))
+
     if n:
         print("\nCOVERAGE: this is a statement about the intersection above and nothing else. "
               f"Ranks {min(A[d].get('rank') or 0 for d in both)}–"
@@ -145,6 +173,39 @@ def selftest():
     sb = _load("adint-frame-stageb")
     check("a 403 on one side and a page on the other IS a disagreement",
           sb.classify(A["geo.ru"])[0] != sb.classify(B["geo.ru"])[0], True)
+
+    # The asymmetry that decides whether a one-vantage frame is usable. A HOLE (the other
+    # side admits it, this side reached it and did not) and PENDING (this side has not
+    # reached it at all) are indistinguishable in any disagreement total, and only one of
+    # them is a defect.
+    d2 = tempfile.mkdtemp()
+    x, y = os.path.join(d2, "x.jsonl"), os.path.join(d2, "y.jsonl")
+    hb = {"present": True, "bidders": ["b1"]}
+    with open(x, "w") as fh:
+        fh.write(json.dumps({"domain": "hole.ru", "rank": 1, "vantage": "x",
+                             "http_status": 403}) + "\n")
+        fh.write(json.dumps({"domain": "shared.ru", "rank": 2, "vantage": "x",
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox_hb": hb}) + "\n")
+    with open(y, "w") as fh:
+        fh.write(json.dumps({"domain": "hole.ru", "rank": 1, "vantage": "y",
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox_hb": hb}) + "\n")
+        fh.write(json.dumps({"domain": "shared.ru", "rank": 2, "vantage": "y",
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox_hb": hb}) + "\n")
+        fh.write(json.dumps({"domain": "deeper.ru", "rank": 9, "vantage": "y",
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox_hb": hb}) + "\n")
+    X, Y = read(x), read(y)
+    admX = {d for d in X if sb.classify(X[d])[0] == "admit"}
+    admY = {d for d in Y if sb.classify(Y[d])[0] == "admit"}
+    check("a domain the other vantage admits and this one refused is a HOLE",
+          sorted((admY & set(X)) - admX), ["hole.ru"])
+    check("a domain this vantage has not reached is PENDING, not a hole",
+          sorted(admY - set(X)), ["deeper.ru"])
+    check("the deeper walk has no hole of its own here",
+          sorted((admX & set(Y)) - admY), [])
     print("selftest: " + ("ok" if ok else "FAIL"))
     return 0 if ok else 1
 

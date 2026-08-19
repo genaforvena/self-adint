@@ -156,10 +156,16 @@ capture, and — unexpectedly — as evidence about the frame rule itself (see *
    later as *recorded evidence* (never as admission criteria), because a `no-wrapper` verdict
    that cannot see them is a claim about the detector wearing the clothes of a claim about the
    site. Rows written before that addition cannot make the distinction at all.
-3. **The frame is vantage-dependent, and a frame built from one vantage carries its blindness
-   into both arms of the study.** `blocked` is exactly the verdict most likely to differ
-   between a Russian and a non-Russian exit address. The walk is therefore run from both
-   vantages and the difference published; where a frame was built from one, that is stated.
+3. **The frame is vantage-dependent — measured, not feared, and the study now runs on the
+   RU-built frame** (`ref/CANONICAL-FRAME`). At 102 domains reached by both walks, an
+   Amsterdam-built frame is missing three domains a Moscow-built one admits: `rbc.ru` and
+   `gismeteo.ru` (refused 401/403) and `hh.ru` — which is **not refused from Amsterdam at
+   all**. It answers 200 and serves a page carrying no auction config, while the same URL
+   from Moscow carries `YaHeaderBiddingSettings`. So this is not only geo-blocking: a page
+   you can load can still be the wrong page, and no HTTP status in the ledger reveals it.
+   The reverse hole does not exist — every domain Amsterdam admits and Moscow has reached,
+   Moscow admits too. Any user of this dataset must read the `vantage` column as part of the
+   verdict, never as metadata about it.
 4. **Unstratified means rank-ordered, and rank correlates with everything.** Until categories
    are committed, the admitted set is biased toward whatever the top of the Russian resolver
    traffic distribution happens to be.

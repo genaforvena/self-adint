@@ -324,10 +324,32 @@ a{color:var(--evidence)} a:focus-visible,.seg:focus-visible{outline:2px solid va
 """
 
 
+def canonical_vantage():
+    """The vantage named in ref/CANONICAL-FRAME, or None if nothing is declared."""
+    p = os.path.join(REPO, "ref", "CANONICAL-FRAME")
+    if not os.path.exists(p):
+        return None
+    for line in open(p, encoding="utf-8"):
+        line = line.strip()
+        if line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        if k.strip() == "vantage":
+            return v.strip() or None
+    return None
+
+
 def build(d, generated):
     fr = d["frames"]
     cells = d["cells"]
-    main = fr[0] if fr else None
+    # The canonical frame is DECLARED in ref/CANONICAL-FRAME, not inferred. "The one with
+    # more admissions" would re-point the study every time a walk got further, and size is
+    # not why a frame is canonical — absence of a hole is (see that file).
+    canon = canonical_vantage()
+    main = next((f for f in fr if f["vantage"] == canon), None) if canon else None
+    undeclared = main is None
+    if main is None:
+        main = fr[0] if fr else None
     total = len(main["rows"]) if main else 0
     admits = main["admitted"] if main else []
     density = (100.0 * len(admits) / total) if total else 0.0
@@ -371,6 +393,15 @@ def build(d, generated):
       f'<span class="n">#{first}</span>'
       f'<span class="sub">nothing above it runs an observable auction</span></div>')
     A('</div>')
+    # AFTER the grid closes. Emitted inside it, this paragraph became a grid ITEM sitting
+    # between two tiles — the tiles container is a `repeat(auto-fit, minmax(190px,1fr))`
+    # grid, so a stray <p> takes a cell and shoves the last tile onto its own row. Nothing
+    # in the generator complains; it only shows up in the rendered page.
+    if not undeclared:
+        A(f'<p>The study runs on the frame built from '
+          f'<strong class="mono">{html.escape(main["vantage"])}</strong>, declared in '
+          f'<code>ref/CANONICAL-FRAME</code>. That is not a formality: a frame built from '
+          f'the other vantage is missing real publishers outright — see below.</p>')
     A('</section>')
 
     # ── the ledger
@@ -389,6 +420,11 @@ def build(d, generated):
           '<span><i class="swatch sw-domain"></i>a fact about the domain</span>'
           '<span><i class="swatch sw-blind"></i>our own blindness</span></div>')
         A('</div>')
+        if undeclared:
+            A('<p class="note">No canonical frame is declared in '
+              '<code>ref/CANONICAL-FRAME</code>, so this section shows whichever walk sorted '
+              'first. Which vantage a frame is built from changes its membership — see below '
+              '— so an undeclared frame is a frame nobody has chosen.</p>')
         A(f'<figcaption>All {total} domains walked from vantage '
           f'<span class="mono">{html.escape(main["vantage"])}</span>'
           f'{" · browser egress " + html.escape(", ".join(main["egress"])) if main["egress"] else ""}. '
@@ -706,7 +742,17 @@ def selftest():
     check("wide content scrolls in its own container", "overflow-x:auto" in CSS, True)
     check("reduced motion is respected", "prefers-reduced-motion" in CSS, True)
 
+    check("the canonical frame is read from the declaration",
+          canonical_vantage(), "ru-mobile")
     page = build(gather(), "TEST")
+    check("the page says which vantage's frame the study runs on",
+          "declared in" in page, True)
+    # …and says it OUTSIDE the tiles grid: a <p> between two tiles is a grid item, which
+    # takes a cell and reflows the row. The generator cannot see that; this can.
+    _tiles = page[page.index('<div class="tiles">'):]
+    _tiles = _tiles[:_tiles.index("</section>")]
+    check("no stray paragraph is nested inside the tiles grid",
+          "<p" in _tiles.rsplit("</div>", 1)[0], False)
     check("the page names itself", "<title>" in page, True)
     # The vantage section's CONCLUSION must follow the data, not a sentence typed once. Drive
     # both branches from synthetic ledgers: a tie must not claim dependence, and a

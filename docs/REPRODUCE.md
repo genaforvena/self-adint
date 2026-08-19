@@ -80,6 +80,18 @@ rejections and their reasons:
   it down, so a rejection is never cheaper than the acceptance threshold of the study itself.
 - The run is resumable: re-running skips domains already in the ledger.
 
+**Which vantage you walk from is not a detail.** `ref/CANONICAL-FRAME` declares the frame
+the study runs on and records the measurement behind the choice: an Amsterdam-built frame is
+missing `rbc.ru`, `gismeteo.ru` and `hh.ru`, while a Moscow-built one has no hole at all.
+Compare two walks yourself — the tool separates a HOLE (the other vantage admits it, this one
+reached it and refused) from a PENDING (this one has not reached it yet), which no
+disagreement total can do:
+
+```bash
+python3 tools/adint-frame-compare data/frame-stageb-nl-direct-<date>-schema3.jsonl \
+                                  data/frame-stageb-ru-mobile-<date>-schema3.jsonl --quiet
+```
+
 Then publish the ledger through the allowlist (never copy it by hand):
 
 ```bash
