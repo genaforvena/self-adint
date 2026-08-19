@@ -158,10 +158,16 @@ def main():
                          "--nav-timeout. Default: the same as both arms. Set it only from a "
                          "MEASUREMENT of the link, and read the asymmetry warning the run "
                          "prints — the arms then differ in something besides the treatment")
-    ap.add_argument("--nav-tries", type=int, default=2,
-                    help="attempts each arm gets at a navigation that never connected "
-                         "(default 2). Raising --nav-timeout instead is INERT above ~135 s, "
-                         "where Chromium's own connect timeout fires. Identical for both arms")
+    ap.add_argument("--nav-tries", type=int, default=1,
+                    help="attempts each arm gets at a navigation that never connected. "
+                         "DEFAULT 1, i.e. OFF, and the measurement is why: in the night cell "
+                         "the immediate retry recovered 0 of 8 loads. The connection failure "
+                         "has a correlation time of MINUTES, so a retry seconds later lands "
+                         "inside the same bad window — and it doubles the arm's traffic on "
+                         "exactly the loads where the link is already failing. THE RETRY THAT "
+                         "WORKS IS THE REPLICATE CYCLE: 14 sites revisited ~35 min apart, at "
+                         "no extra cost. Same cell, next replicate: aviasales/gismeteo/rbc/"
+                         "ria/sports each failed then succeeded. Identical for both arms")
     ap.add_argument("--ip-echo", default=None,
                     help="echo host for BOTH arms. Must be one the RU vantage's resolver "
                          "answers correctly: MTS returns api.ipify.org (the capture's "
