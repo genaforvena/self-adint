@@ -34,6 +34,28 @@ on the subject covers US/EU inventory and does not contain the Russian SSPs at a
 papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
+
+*Generated 2026-08-19 06:47 UTC by `tools/adint-status` from the files on disk.*
+
+### The sampling frame — and its rejections, which are half the result
+
+**Vantage `nl-direct`** · 69 domains touched in rank order · browser egress 77.246.104.228 · `frame-stageb-nl-direct-2026-08-19-schema3.jsonl`
+
+| verdict | n | what it means |
+|---|---:|---|
+| `admit` | 2 | **in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a prebid global |
+| `ad-serving-only` | 10 | Adfox/Yandex ad code present, no auction config readable — this publisher sells ads, but not by asking several bidders in the page |
+| `no-wrapper` | 7 | page loaded, no Adfox and no prebid (re-probed at the full 45 s window) |
+| `ya-generic-only` | 17 | a Yandex namespace but no advertising global — Metrika, not ad-tech |
+| `blocked` | 9 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
+| `rate-limited` | 1 | 428/429 — caused by our own load, not by the site |
+| `unreachable` | 4 | timeout or refused connection — our blindness |
+| `no-web-apex` | 19 | DNS/TLS failure — the domain serves no page at its apex at all |
+
+Admitted: `magnit.ru`, `pikabu.ru`.
+
+### No cell of the schedule has been captured yet.
+
 <!-- /NUMBERS -->
 
 **The word *market* is not available to us yet.** What we have is a design that says exactly

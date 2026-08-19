@@ -34,11 +34,14 @@ END = "<!-- /NUMBERS -->"
 
 # The order is the story: what the rule ADMITTED, then every reason it rejected, then the
 # residue. Sorting alphabetically would bury `admit` in the middle of the failures.
-VERDICT_ORDER = ["admit", "no-wrapper", "ya-generic-only", "not-html",
+VERDICT_ORDER = ["admit", "ad-serving-only", "no-wrapper", "ya-generic-only", "not-html",
                  "blocked", "rate-limited", "unreachable", "no-web-apex", "error"]
 
 VERDICT_GLOSS = {
-    "admit": "in the frame — 200, HTML, an ad wrapper present",
+    "admit": "**in the frame** — 200, HTML, and an AUCTION config: a bidder roster or a "
+             "prebid global",
+    "ad-serving-only": "Adfox/Yandex ad code present, no auction config readable — this "
+                       "publisher sells ads, but not by asking several bidders in the page",
     "no-wrapper": "page loaded, no Adfox and no prebid (re-probed at the full 45 s window)",
     "ya-generic-only": "a Yandex namespace but no advertising global — Metrika, not ad-tech",
     "not-html": "answered 200 with a document that is not a page",
@@ -169,7 +172,9 @@ def block(include_private):
               f"`docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is "
               f"a pilot of that design, not a sample of the Russian market.", ""]
 
-    if any(c.get("private") for c in cl) or any("data/" in f["src"] for f in fr):
+    # `"data/" in f["src"]` was TRUE for "public-data/" — the substring trap this project
+    # documents, committed in the tool that reports on it. Compare against the marker itself.
+    if any(c.get("private") for c in cl) or any(f["src"].startswith("data/") for f in fr):
         L += ["> Some figures above were read from the **unpublished** `data/` tree. Run "
               "`tools/adint-publish` so a reader can check them.", ""]
 

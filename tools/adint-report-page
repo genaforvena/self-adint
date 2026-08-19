@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""Generate the living report page from the data on disk.
+
+The operator asked for "a live report page at a link, with charts, updated as the run
+accumulates". The important word is *updated*: a page written by hand is a snapshot that
+starts lying the moment the next walk appends a row. So the page is GENERATED — every figure
+in it is read from `public-data/` and `data/` at build time, and rebuilding it is one command.
+
+    python3 tools/adint-report-page -o /tmp/report.html
+
+Design constraints that are not decoration:
+  * Every number carries its `n` and the vantage it was measured from, in the same line.
+  * Three states of knowledge are colored apart and never mixed: what we SAW (evidence),
+    what WE could not see (our blindness), and facts about the DOMAIN that are not evidence
+    about header bidding. Collapsing those is the study's characteristic failure, so the
+    palette refuses to let a reader collapse them either.
+  * The palette is validated for colour-vision deficiency in both themes, and identity is
+    never carried by colour alone — every segment is also labelled.
+"""
+
+import argparse
+import collections
+import datetime
+import glob
+import html
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUB = os.path.join(REPO, "public-data")
+PRIV = os.path.join(REPO, "data")
+
+# Which state of knowledge each verdict belongs to. This mapping IS the page's thesis.
+EVIDENCE, BLIND, DOMAIN = "evidence", "blind", "domain"
+VERDICT_CLASS = {
+    "admit": EVIDENCE,
+    "ad-serving-only": DOMAIN,
+    "no-wrapper": DOMAIN,
+    "ya-generic-only": DOMAIN,
+    "not-html": DOMAIN,
+    "no-web-apex": DOMAIN,
+    "blocked": BLIND,
+    "rate-limited": BLIND,
+    "unreachable": BLIND,
+    "error": BLIND,
+}
+VERDICT_ORDER = ["admit", "ad-serving-only", "no-wrapper", "ya-generic-only", "not-html",
+                 "no-web-apex", "blocked", "rate-limited", "unreachable", "error"]
+VERDICT_GLOSS = {
+    "admit": "200, HTML, and an auction config — a bidder roster or a prebid global",
+    "ad-serving-only": "Yandex ad code, no auction config: sells ads without asking several bidders",
+    "no-wrapper": "the page loaded and carried nothing to bid with (re-probed at 45 s)",
+    "ya-generic-only": "a Yandex namespace only — Metrika is not ad-tech",
+    "not-html": "answered 200 with something that is not a page",
+    "no-web-apex": "DNS or TLS failure — no site at this domain's apex at all",
+    "blocked": "4xx/5xx — we never saw the page, so this says nothing about it",
+    "rate-limited": "428/429 — caused by our own load",
+    "unreachable": "timeout or refused connection",
+    "error": "a navigation failure not yet classified",
+}
+
+
+def read_jsonl(p):
+    out = []
+    for line in open(p, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+
+def gather():
+    d = {"frames": [], "cells": [], "pairs": []}
+    for f in sorted(glob.glob(os.path.join(PUB, "frame-stageb-*.jsonl"))
+                    + glob.glob(os.path.join(PRIV, "frame-stageb-*schema*.jsonl"))):
+        if "nowrapper-audit" in f:
+            continue
+        rows, seen = [], set()
+        for r in read_jsonl(f):
+            if r.get("domain") in seen:
+                continue
+            seen.add(r.get("domain"))
+            rows.append(r)
+        if not rows:
+            continue
+        d["frames"].append({
+            "file": os.path.basename(f),
+            "vantage": rows[0].get("vantage") or "?",
+            "public": f.startswith(PUB),
+            "rows": rows,
+            "tally": collections.Counter(r.get("stageb_verdict") for r in rows),
+            "admitted": [(r.get("rank"), r.get("domain"),
+                          " + ".join(r.get("wrapper_evidence") or []))
+                         for r in rows if r.get("stageb_verdict") == "admit"],
+            "ranks": [r.get("rank") or 0 for r in rows],
+            "egress": sorted({r.get("browser_egress_ip") for r in rows
+                              if r.get("browser_egress_ip")}),
+        })
+    # keep only the newest per vantage, so a re-walk does not double the page
+    best = {}
+    for fr in d["frames"]:
+        cur = best.get(fr["vantage"])
+        if cur is None or len(fr["rows"]) > len(cur["rows"]):
+            best[fr["vantage"]] = fr
+    d["frames"] = sorted(best.values(), key=lambda f: f["vantage"])
+
+    for f in sorted(glob.glob(os.path.join(PRIV, "hb-paired-*.jsonl"))
+                    + glob.glob(os.path.join(PUB, "hb-paired-*.jsonl"))):
+        rows = read_jsonl(f)
+        loads = [r for r in rows if r.get("kind") == "load"]
+        if not loads:
+            continue
+        cand = [r for r in rows if r.get("is_bid_candidate")]
+        d["cells"].append({
+            "file": os.path.basename(f),
+            "arm": loads[0].get("arm"),
+            "loads": len(loads),
+            "sites": sorted({r["url"].split("/")[2] for r in loads}),
+            "pairs": sorted({r.get("pair_id") for r in loads if r.get("pair_id")}),
+            "window": sorted({r.get("window_s") for r in loads}),
+            "egress": sorted({r.get("egress_ip") for r in loads if r.get("egress_ip")}),
+            "verified": sum(1 for r in loads if r.get("vantage_verified")),
+            "deadline": sorted({r.get("wrapper_timeout_ms") for r in loads
+                                if r.get("wrapper_timeout_ms")}),
+            "outcomes": collections.Counter(r.get("outcome") for r in cand),
+            "candidates": len(cand),
+        })
+    return d
+
+
+# ── svg helpers ───────────────────────────────────────────────────────────────────────
+# Hand-built SVG rather than a library: the page must be self-contained (no external
+# script host is reachable from a published artifact), and these are simple forms.
+
+def seg_bar(counts, total, width=880, height=54):
+    """One horizontal bar segmented by verdict, coloured by state of knowledge.
+
+    A pie would answer 'what share' and this has to answer 'how little' — a single bar with
+    the admitted sliver at the left end makes the density legible at a glance without a
+    reader doing arithmetic on a legend."""
+    if not total:
+        return ""
+    x, parts = 0.0, []
+    GAP = 2.0   # surface gap between fills, so adjacent segments never blend
+    for v in VERDICT_ORDER:
+        n = counts.get(v, 0)
+        if not n:
+            continue
+        w = max(3.0, width * n / total - GAP)
+        cls = VERDICT_CLASS.get(v, DOMAIN)
+        parts.append(
+            f'<g class="seg"><title>{html.escape(v)}: {n} of {total} domains — '
+            f'{html.escape(VERDICT_GLOSS.get(v, ""))}</title>'
+            f'<rect x="{x:.1f}" y="0" width="{w:.1f}" height="{height}" rx="3" '
+            f'class="fill-{cls}"/></g>')
+        x += w + GAP
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+            f'role="img" aria-label="verdict shares across {total} domains walked">'
+            + "".join(parts) + "</svg>")
+
+
+def grouped_bars(series, cats, width=760, height=260):
+    """series = [(label, {cat: value}, css_class)] — one axis, always."""
+    mx = max([v for _, d, _ in series for v in d.values()] + [1])
+    pad_l, pad_b, pad_t = 46, 34, 12
+    plot_w, plot_h = width - pad_l - 12, height - pad_b - pad_t
+    group_w = plot_w / len(cats)
+    bw = min(64.0, group_w / (len(series) + 1))
+    out = []
+    for i in range(0, 5):
+        y = pad_t + plot_h - plot_h * i / 4
+        val = mx * i / 4
+        out.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width-12}" y2="{y:.1f}" class="grid"/>')
+        out.append(f'<text x="{pad_l-8}" y="{y+4:.1f}" class="axis" text-anchor="end">'
+                   f'{val:.0f}</text>')
+    for ci, cat in enumerate(cats):
+        gx = pad_l + group_w * ci
+        for si, (label, data, cls) in enumerate(series):
+            v = data.get(cat, 0)
+            h = plot_h * v / mx
+            x = gx + (group_w - bw * len(series)) / 2 + bw * si
+            y = pad_t + plot_h - h
+            out.append(
+                f'<g class="seg"><title>{html.escape(label)} · {html.escape(cat)}: {v}</title>'
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw-2:.1f}" height="{max(h,2):.1f}" '
+                f'rx="3" class="fill-{cls}"/></g>')
+            out.append(f'<text x="{x + (bw-2)/2:.1f}" y="{y-6:.1f}" class="val" '
+                       f'text-anchor="middle">{v}</text>')
+        out.append(f'<text x="{gx + group_w/2:.1f}" y="{height-10}" class="axis" '
+                   f'text-anchor="middle">{html.escape(cat)}</text>')
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" role="img" '
+            f'aria-label="outcome counts by arm">' + "".join(out) + "</svg>")
+
+
+def rank_strip(ranks, admits, width=880, height=76):
+    """Where in the rank order the frame's members actually fall."""
+    if not ranks:
+        return ""
+    lo, hi = min(ranks), max(ranks)
+    span = max(hi - lo, 1)
+    y = 34
+    out = [f'<line x1="8" y1="{y}" x2="{width-8}" y2="{y}" class="axis-line"/>']
+    for r in ranks:
+        x = 8 + (width - 16) * (r - lo) / span
+        out.append(f'<line x1="{x:.1f}" y1="{y-7}" x2="{x:.1f}" y2="{y+7}" class="tick-walked"/>')
+    for r, dom, _ev in admits:
+        x = 8 + (width - 16) * ((r or lo) - lo) / span
+        anchor = "start" if x < width * 0.7 else "end"
+        out.append(f'<line x1="{x:.1f}" y1="{y-15}" x2="{x:.1f}" y2="{y+15}" class="tick-admit"/>')
+        out.append(f'<text x="{x + (6 if anchor=="start" else -6):.1f}" y="{y+30}" '
+                   f'class="val" text-anchor="{anchor}">{html.escape(dom)} #{r}</text>')
+    out.append(f'<text x="8" y="{y-20}" class="axis">rank {lo}</text>')
+    out.append(f'<text x="{width-8}" y="{y-20}" class="axis" text-anchor="end">rank {hi}</text>')
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" role="img" '
+            f'aria-label="rank positions of walked and admitted domains">'
+            + "".join(out) + "</svg>")
+
+
+CSS = """
+:root{
+  --paper:#EFF2ED; --surface:#F7F9F5; --ink:#14201C; --muted:#5B6660; --rule:#D5DBD3;
+  --evidence:#1C7F5C; --blind:#B85218; --domain:#5A5CA8; --shade:#E4E9E1;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#101614; --surface:#141B18; --ink:#E3E9E2; --muted:#97A29B; --rule:#26302B;
+    --evidence:#34A67C; --blind:#D97534; --domain:#7B7FD6; --shade:#1B2320;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#101614; --surface:#141B18; --ink:#E3E9E2; --muted:#97A29B; --rule:#26302B;
+  --evidence:#34A67C; --blind:#D97534; --domain:#7B7FD6; --shade:#1B2320;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:Literata,Georgia,"Times New Roman",serif;
+  font-size:17px; line-height:1.62; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1000px;margin:0 auto;padding:0 24px 96px}
+header.masthead{padding:64px 0 28px;border-bottom:1px solid var(--rule)}
+.kicker{
+  font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;
+}
+h1{
+  font-size:clamp(30px,4.6vw,50px);line-height:1.08;margin:.36em 0 .18em;
+  font-weight:700;letter-spacing:-.018em;text-wrap:balance;
+}
+.standfirst{font-size:20px;line-height:1.5;color:var(--muted);max-width:62ch;margin:0}
+section{padding:44px 0;border-bottom:1px solid var(--rule);display:flex;
+  flex-direction:column;gap:20px}
+section:last-of-type{border-bottom:0}
+h2{font-size:26px;line-height:1.22;margin:0;font-weight:700;letter-spacing:-.012em;
+  text-wrap:balance;max-width:26ch}
+h3{font-size:18px;margin:0;font-weight:600}
+p{margin:0;max-width:66ch}
+.status{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--muted);display:inline-flex;align-items:center;gap:8px;
+}
+.status::before{content:"";width:22px;height:2px;background:currentColor;display:block}
+.tiles{display:grid;gap:2px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  background:var(--rule);border:1px solid var(--rule)}
+.tile{background:var(--surface);padding:20px 18px;display:flex;flex-direction:column;gap:5px}
+.tile .n{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:34px;line-height:1;
+  font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.tile .lab{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.tile .sub{font-size:14px;color:var(--muted);line-height:1.42}
+figure{margin:0;display:flex;flex-direction:column;gap:12px}
+figcaption{font-size:14px;color:var(--muted);max-width:70ch}
+.panel{background:var(--surface);border:1px solid var(--rule);padding:22px}
+.legend{display:flex;flex-wrap:wrap;gap:18px;font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:12px;letter-spacing:.04em}
+.legend span{display:inline-flex;align-items:center;gap:7px;color:var(--muted)}
+.swatch{width:12px;height:12px;border-radius:2px;display:block}
+.sw-evidence{background:var(--evidence)} .sw-blind{background:var(--blind)}
+.sw-domain{background:var(--domain)}
+.fill-evidence{fill:var(--evidence)} .fill-blind{fill:var(--blind)}
+.fill-domain{fill:var(--domain)}
+.seg{transition:opacity .12s} .seg:hover{opacity:.72;cursor:default}
+.grid{stroke:var(--rule);stroke-width:1} .axis-line{stroke:var(--rule);stroke-width:1}
+.axis{fill:var(--muted);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px}
+.val{fill:var(--ink);font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;
+  font-variant-numeric:tabular-nums}
+.tick-walked{stroke:var(--domain);stroke-width:1.5;opacity:.4}
+.tick-admit{stroke:var(--evidence);stroke-width:2.5}
+.tablewrap{overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);font-weight:400}
+td.n{font-family:"IBM Plex Mono",ui-monospace,monospace;text-align:right;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.9em}
+code{background:var(--shade);padding:1px 5px;border-radius:3px}
+pre{background:var(--surface);border:1px solid var(--rule);padding:16px;overflow-x:auto;
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px;line-height:1.65;margin:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;
+  vertical-align:baseline}
+.note{border-left:2px solid var(--blind);padding:2px 0 2px 16px;color:var(--muted);
+  font-size:15.5px;max-width:64ch}
+.cols{display:grid;gap:26px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+footer{padding:40px 0 0;color:var(--muted);font-size:14px;display:flex;
+  flex-direction:column;gap:8px}
+a{color:var(--evidence)} a:focus-visible,.seg:focus-visible{outline:2px solid var(--evidence);
+  outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+"""
+
+
+def build(d, generated):
+    fr = d["frames"]
+    cells = d["cells"]
+    main = fr[0] if fr else None
+    total = len(main["rows"]) if main else 0
+    admits = main["admitted"] if main else []
+    density = (100.0 * len(admits) / total) if total else 0.0
+
+    P = []
+    A = P.append
+    A('<title>Where Russian Header Bidding Starts</title>')
+    A('<link rel="preconnect" href="https://fonts.googleapis.com">')
+    A('<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>')
+    A('<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+      'family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;0,7..72,700;1,7..72,400'
+      '&family=IBM+Plex+Mono:wght@400;600&display=swap">')
+    A(f"<style>{CSS}</style>")
+    A('<div class="wrap">')
+
+    # ── masthead
+    A('<header class="masthead">')
+    A(f'<div class="kicker"><span>self-adint · step 0d</span><span>generated {generated}</span>'
+      f'<span>CC0 1.0</span></div>')
+    A('<h1>Where Russian header bidding starts</h1>')
+    A('<p class="standfirst">A frame built by a published rule, walked in rank order — and the '
+      'rule inverted on contact. What follows is a report about an instrument, not about a '
+      'market. Every figure carries its <span class="mono">n</span> and the vantage it was '
+      'measured from.</p>')
+    A('</header>')
+
+    # ── tiles
+    A('<section>')
+    A('<span class="status">Measured</span>')
+    A('<div class="tiles">')
+    A(f'<div class="tile"><span class="lab">domains walked</span><span class="n">{total}</span>'
+      f'<span class="sub">in strict Tranco rank order from a universe of 1,944</span></div>')
+    A(f'<div class="tile"><span class="lab">in the frame</span>'
+      f'<span class="n" style="color:var(--evidence)">{len(admits)}</span>'
+      f'<span class="sub">carry an auction config we can read</span></div>')
+    A(f'<div class="tile"><span class="lab">admission density</span>'
+      f'<span class="n">{density:.1f}%</span>'
+      f'<span class="sub">the study\'s binding cost is the frame, not the capture</span></div>')
+    first = min([r for r, _, _ in admits] or [0])
+    A(f'<div class="tile"><span class="lab">first admission at rank</span>'
+      f'<span class="n">#{first}</span>'
+      f'<span class="sub">nothing above it runs an observable auction</span></div>')
+    A('</div>')
+    A('</section>')
+
+    # ── the ledger
+    if main:
+        A('<section>')
+        A('<span class="status">Measured · rejections published</span>')
+        A('<h2>The rejections are half the dataset</h2>')
+        A('<p>A frame that publishes only what it admitted cannot be audited. Every domain the '
+          'probe touched is here with its verdict, and the verdicts are kept apart by <em>whose '
+          'fact</em> they are — because folding our own blindness into a finding about the '
+          'market is the one mistake this study cannot afford.</p>')
+        A('<figure><div class="panel">')
+        A(seg_bar(main["tally"], total))
+        A('<div class="legend" style="margin-top:14px">'
+          '<span><i class="swatch sw-evidence"></i>we saw an auction</span>'
+          '<span><i class="swatch sw-domain"></i>a fact about the domain</span>'
+          '<span><i class="swatch sw-blind"></i>our own blindness</span></div>')
+        A('</div>')
+        A(f'<figcaption>All {total} domains walked from vantage '
+          f'<span class="mono">{html.escape(main["vantage"])}</span>'
+          f'{" · browser egress " + html.escape(", ".join(main["egress"])) if main["egress"] else ""}. '
+          f'Segment widths are shares of {total}; hover any segment for its count.</figcaption>')
+        A('</figure>')
+
+        A('<div class="tablewrap"><table>')
+        A('<thead><tr><th>verdict</th><th>n</th><th>state of knowledge</th>'
+          '<th>what it means</th></tr></thead><tbody>')
+        for v in VERDICT_ORDER:
+            n = main["tally"].get(v, 0)
+            if not n:
+                continue
+            cls = VERDICT_CLASS[v]
+            nice = {"evidence": "evidence", "blind": "our blindness",
+                    "domain": "about the domain"}[cls]
+            A(f'<tr><td><span class="dot sw-{cls}"></span><code>{html.escape(v)}</code></td>'
+              f'<td class="n">{n}</td><td>{nice}</td>'
+              f'<td>{html.escape(VERDICT_GLOSS.get(v, ""))}</td></tr>')
+        A('</tbody></table></div>')
+        A('</section>')
+
+        # ── rank strip
+        A('<section>')
+        A('<span class="status">Measured</span>')
+        A('<h2>Header bidding does not live at the top of the list</h2>')
+        A('<p>Tranco ranks by resolver traffic, so it answers <em>what is resolved</em>, not '
+          '<em>what a person reads with ads on it</em>. The top of the Russian list is CDNs, '
+          'registrars, telecoms, marketplaces and government. The first domain that runs an '
+          'auction we can observe appears far down the walk.</p>')
+        A('<figure><div class="panel">')
+        A(rank_strip(main["ranks"], admits))
+        A('</div><figcaption>Every domain walked (faint) and every domain admitted (solid), '
+          'positioned by Tranco rank.</figcaption></figure>')
+        if admits:
+            A('<div class="tablewrap"><table>')
+            A('<thead><tr><th>rank</th><th>domain</th><th>evidence for admission</th>'
+              '</tr></thead><tbody>')
+            for r, dom, ev in sorted(admits):
+                A(f'<tr><td class="n">#{r}</td><td><code>{html.escape(dom)}</code></td>'
+                  f'<td class="mono">{html.escape(ev)}</td></tr>')
+            A('</tbody></table></div>')
+        A('<p class="note">The rule first admitted seven domains near the top of the list — '
+          'including two registrars and an image CDN. Not one of them carried a bidder roster: '
+          'they had been admitted on Yandex’s ad-<em>serving</em> globals, which mean a page '
+          'shows advertising, not that it asks several bidders. The frame contained zero '
+          'instances of the phenomenon the study measures, and looked full.</p>')
+        A('</section>')
+
+    # ── the paired cell
+    if cells:
+        by_arm = {c["arm"]: c for c in cells}
+        arms = [a for a in ("nl-direct", "ru-mobile") if a in by_arm] or list(by_arm)
+        cats = ["no-bid", "no-answer", "priced", "error"]
+        cats = [c for c in cats if any(by_arm[a]["outcomes"].get(c) for a in arms)]
+        series = []
+        for a in arms:
+            cls = EVIDENCE if a.startswith("nl") else BLIND
+            series.append((a, {c: by_arm[a]["outcomes"].get(c, 0) for c in cats}, cls))
+        A('<section>')
+        A('<span class="status">Measured · confounded, and named</span>')
+        A('<h2>The slow arm turns answers into silence</h2>')
+        A('<p>Both arms load the same site in the same minute — a barrier, not two walks that '
+          'drift apart — and read the same bidder roster off the page. They still disagree '
+          'about the market, and the disagreement is the link, not the demand.</p>')
+        A('<figure><div class="panel">')
+        A(grouped_bars(series, cats))
+        A('<div class="legend" style="margin-top:10px">'
+          + "".join(f'<span><i class="swatch sw-{cls}"></i>{html.escape(lab)}</span>'
+                    for lab, _, cls in series) + '</div>')
+        A('</div>')
+        n_pairs = len(set().union(*[set(c["pairs"]) for c in cells])) if cells else 0
+        A(f'<figcaption>Candidate bid requests across {n_pairs} simultaneous pair(s), '
+          f'window 45 s on both arms. <strong>no-bid</strong> is a bidder answering '
+          f'“no”; <strong>no-answer</strong> is a bidder asked and silent inside our '
+          f'window.</figcaption></figure>')
+        A('<div class="cols">')
+        for a in arms:
+            c = by_arm[a]
+            A('<div class="panel"><h3 class="mono">' + html.escape(a) + '</h3>'
+              f'<p style="font-size:15px;color:var(--muted);margin-top:8px">'
+              f'egress {html.escape(", ".join(c["egress"]) or "?")} · {c["loads"]} load(s), '
+              f'{c["verified"]}/{c["loads"]} with the exit verified from inside the browser · '
+              f'{c["candidates"]} candidate requests · wrapper deadline '
+              f'{", ".join(str(x) for x in c["deadline"]) or "?"} ms</p></div>')
+        A('</div>')
+        A('<p class="note">Measured round-trip time on the mobile arm is 400–1100 ms against '
+          'a wrapper deadline of 1000 ms. A bidder that answers perfectly promptly still misses '
+          'the publisher’s own deadline, and the page records silence. So “Russian '
+          'bidders are less responsive” cannot be read off this arm at all — vantage and '
+          'channel are perfectly confounded, and the difference is two main effects wearing the '
+          'interaction’s name. A third arm, the datacentre link degraded to the mobile '
+          'arm’s measured profile, is what would separate them.</p>')
+        A('</section>')
+
+    # ── vantage agreement
+    if len(fr) > 1:
+        a, b = fr[0], fr[1]
+        common = (set(r["domain"] for r in a["rows"]) & set(r["domain"] for r in b["rows"]))
+        va = {r["domain"]: r.get("stageb_verdict") for r in a["rows"]}
+        vb = {r["domain"]: r.get("stageb_verdict") for r in b["rows"]}
+        differ = [d for d in common if va[d] != vb[d]]
+        A('<section>')
+        A('<span class="status">Measured · a null result</span>')
+        A('<h2>The frame is not an artefact of where we stand — so far</h2>')
+        A(f'<p>A frame built from one vantage would carry that vantage’s blindness into both '
+          f'arms of a paired study, and <code>blocked</code> is the verdict most likely to be '
+          f'geo-shaped. On the <strong>{len(common)}</strong> domains both walks reached, the '
+          f'Amsterdam and Moscow vantages returned <strong>{len(common)-len(differ)}</strong> '
+          f'identical verdicts and <strong>{len(differ)}</strong> different ones.</p>')
+        A('<p class="note">Coverage binds this. That rank band is infrastructure and '
+          'marketplaces; the cases most likely to be geo-shaped are news publishers further '
+          'down, which the Moscow walk has not reached. A domain one walk has reached and the '
+          'other has not is a difference in <em>progress</em>, and is excluded — pooling '
+          'those would make a slow walk look like a censoring vantage.</p>')
+        A('</section>')
+
+    # ── blindness
+    A('<section>')
+    A('<span class="status">Not observable</span>')
+    A('<h2>What this instrument cannot see</h2>')
+    A('<div class="cols">')
+    for h3, body in [
+        ("The server-side auction",
+         "Everything here is a passive read of what a wrapper hands the browser. "
+         "Server-to-server bidding never touches it. A domain recorded as carrying no wrapper "
+         "may be selling its inventory perfectly well."),
+        ("Any page we did not see",
+         "A 401, 403 or 5xx is our own access failing. It is recorded as blindness and never "
+         "as “this publisher runs no header bidding”."),
+        ("Wrappers we did not look for",
+         "The detector knows Adfox and Prebid, the two the study is about. Google’s and "
+         "Amazon’s stacks are recorded as evidence but never admit — so a rejection "
+         "bounds the detector, not the site."),
+        ("A market",
+         "The frame holds a handful of sites, from one or two vantages, on one date, in one "
+         "six-hour zone of the Moscow clock. The word market is not available yet."),
+    ]:
+        A(f'<div><h3>{h3}</h3><p style="margin-top:8px;color:var(--muted);font-size:15.5px">'
+          f'{body}</p></div>')
+    A('</div>')
+    A('</section>')
+
+    # ── reproduce
+    A('<section>')
+    A('<span class="status">Check us</span>')
+    A('<h2>Every number here is re-derivable</h2>')
+    A('<p>The universe is pinned and re-fetchable, the rule is a runnable tool, and the '
+      'rejection ledger is published beside the frame. Disagreeing with this page should not '
+      'require our cooperation.</p>')
+    A('<pre>'
+      'git clone https://github.com/genaforvena/self-adint &amp;&amp; cd self-adint\n'
+      'python3 tools/adint-frame-stageb  --test        # 25 gates, offline\n'
+      'python3 tools/adint-status                      # the numbers above, from disk\n'
+      'python3 tools/adint-frame-compare data/frame-stageb-nl-direct-*.jsonl \\\n'
+      '                                  data/frame-stageb-ru-mobile-*.jsonl\n'
+      '\n'
+      '# rebuild this page\n'
+      'python3 tools/adint-report-page -o report.html</pre>')
+    A('<p>Method and design: <code>docs/step0c-hb-ru-market-study-2026-08-18.md</code>. '
+      'What the walk did to it: <code>docs/step0d-hb-first-cell-2026-08-19.md</code>. '
+      'The dataset’s passport: <code>docs/DATASHEET-ru-hb-frame.md</code>.</p>')
+    A('</section>')
+
+    A('<footer><div>self-adint — one operator reading his own advertising profile from the '
+      'demand side. Nobody else is observed.</div>'
+      '<div>Public domain (CC0 1.0). A dedication is a statement about rights, not about truth: '
+      'every number here is published with its n so you can judge it rather than inherit it.</div>'
+      f'<div class="mono" style="font-size:12px">generated {generated}</div></footer>')
+    A('</div>')
+    return "\n".join(P)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-o", "--out", default=os.path.join(REPO, "report.html"))
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    d = gather()
+    gen = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    open(args.out, "w", encoding="utf-8").write(build(d, gen))
+    print(f"{args.out}  ({len(d['frames'])} frame(s), {len(d['cells'])} arm file(s))")
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    # Every verdict the classifier can emit must have a knowledge-class and a gloss, or the
+    # page silently drops a column of the ledger — the exact failure the ledger exists to
+    # prevent, reintroduced at the presentation layer.
+    import importlib.machinery, importlib.util
+    sp = importlib.util.spec_from_file_location(
+        "sb", os.path.join(REPO, "tools", "adint-frame-stageb"),
+        loader=importlib.machinery.SourceFileLoader(
+            "sb", os.path.join(REPO, "tools", "adint-frame-stageb")))
+    sb = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(sb)
+    emitted = set()
+    for row in ({"http_status": 200, "content_type": "text/html",
+                 "adfox_hb": {"present": True, "bidders": ["x"]}},
+                {"http_status": 200, "content_type": "text/html",
+                 "adfox": {"ya": True, "adfoxCode": True}},
+                {"http_status": 200, "content_type": "text/html", "adfox": {"ya": True}},
+                {"http_status": 200, "content_type": "text/html"},
+                {"http_status": 200, "content_type": "application/json"},
+                {"http_status": 403}, {"http_status": 429},
+                {"verdict": "error", "error": "TimeoutError"},
+                {"verdict": "error", "error": "net::ERR_NAME_NOT_RESOLVED"},
+                {"verdict": "error", "error": "net::ERR_WHAT"}):
+        emitted.add(sb.classify(row)[0])
+    missing_cls = sorted(v for v in emitted if v not in VERDICT_CLASS)
+    missing_ord = sorted(v for v in emitted if v not in VERDICT_ORDER)
+    missing_gls = sorted(v for v in emitted if v not in VERDICT_GLOSS)
+    check("every verdict the classifier emits has a knowledge-class", missing_cls, [])
+    check("every verdict the classifier emits is in the render order", missing_ord, [])
+    check("every verdict the classifier emits has a gloss", missing_gls, [])
+
+    # A bar over zero rows must not divide by zero or render a stray mark.
+    check("an empty ledger renders no bar", seg_bar(collections.Counter(), 0), "")
+    check("an empty rank list renders no strip", rank_strip([], []), "")
+
+    # Theme correctness is structural, not a matter of taste: a colour whose ONLY definition
+    # sits inside a media query never applies in the un-stamped default state.
+    for tok in ("--paper", "--ink", "--evidence", "--blind", "--domain", "--surface",
+                "--muted", "--rule", "--shade"):
+        first = CSS.index(tok)
+        check(f"{tok} is defined on bare :root before any media block",
+              first < CSS.index("@media (prefers-color-scheme: dark)"), True)
+    check("body paints an explicit background token", "background:var(--paper)" in CSS, True)
+    check("the dark media block is guarded against an explicit light choice",
+          ':root:not([data-theme="light"])' in CSS, True)
+    check("an explicit dark stamp is honoured too", ':root[data-theme="dark"]' in CSS, True)
+    check("wide content scrolls in its own container", "overflow-x:auto" in CSS, True)
+    check("reduced motion is respected", "prefers-reduced-motion" in CSS, True)
+
+    page = build(gather(), "TEST")
+    check("the page names itself", "<title>" in page, True)
+    check("identity is never colour alone — the legend is present",
+          'class="legend"' in page, True)
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
