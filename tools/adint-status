@@ -126,7 +126,18 @@ def run_of(path):
     return b.split(".")[0]
 
 
-def complete_pairs(by_run_arm):
+def rendered(load):
+    """Did this arm SEE the page? A 4xx/5xx load is our access failing, not a measurement.
+
+    The capture already says so honestly per load (`http_status` >= 400, and a note that
+    the rows say nothing about the auction). What was missing is that the pair counter
+    believed it anyway.
+    """
+    st = load.get("http_status")
+    return st is not None and st < 400
+
+
+def complete_pairs(by_run_arm, rendered_only=False):
     """{run: {arm: {pair_id, ...}}} -> {run: n}, n = pairs present in EVERY arm.
 
     A pair_id counted inside one arm's file is that arm's ATTEMPT, not a pair: the other
@@ -134,6 +145,13 @@ def complete_pairs(by_run_arm):
     this file. Measured on the 2026-08-19 day cell — 14 NL loads, 10 RU loads, one id set
     of 14 in the NL file. Publishing that 14 as `pairs` is the run summary's own defect one
     layer up, in the table a reader actually sees.
+
+    `rendered_only` is the SECOND tier, and it is not pedantry. The evening cell pairs
+    `gismeteo.ru` and `rbc.ru`, which answer the NL vantage 403 and 401 in ~2 s — they are
+    two of the three frame holes CANONICAL-FRAME names as *our blindness*. Both arms wrote
+    a load, so the pair is complete; but one arm never saw the page, so there is no
+    contrast in it. A study whose whole claim is RU-versus-NL must not count those as
+    readable pairs.
     """
     out = {}
     for run, arms in by_run_arm.items():
@@ -152,6 +170,7 @@ def cells(include_private):
     # Both arms are read BEFORE any row is emitted, because a pair is a fact about the cell
     # and cannot be computed from one arm's file alone.
     by_run_arm = {}
+    by_run_arm_rendered = {}
     for f in files:
         ld = [r for r in read_jsonl(f) if r.get("kind") == "load"]
         if not ld:
@@ -159,7 +178,10 @@ def cells(include_private):
         arm = ld[0].get("arm") or os.path.basename(f)
         by_run_arm.setdefault(run_of(f), {})[arm] = {
             r["pair_id"] for r in ld if r.get("pair_id")}
+        by_run_arm_rendered.setdefault(run_of(f), {})[arm] = {
+            r["pair_id"] for r in ld if r.get("pair_id") and rendered(r)}
     done = complete_pairs(by_run_arm)
+    readable = complete_pairs(by_run_arm_rendered)
     for f in files:
         rows = [r for r in read_jsonl(f) if r.get("kind") == "load"]
         if not rows:
@@ -167,6 +189,8 @@ def cells(include_private):
         out.append({
             "run": run_of(f),
             "complete_pairs": done.get(run_of(f), 0),
+            "readable_pairs": readable.get(run_of(f), 0),
+            "blocked": sum(1 for r in rows if not rendered(r)),
             "file": os.path.basename(f),
             "arm": rows[0].get("arm"),
             "loads": len(rows),
@@ -239,15 +263,19 @@ def block(include_private):
         L += ["### No cell of the schedule has been captured yet.", ""]
     else:
         L += ["### Captured cells", "",
-              "`this arm` is what this arm attempted; **`both arms`** is the pair count — "
-              "the ids present in EVERY arm of the cell. They differ exactly when one arm "
-              "refused a load the other recorded, and only the second is a pair.", "",
-              "| cell | arm | loads | sites | this arm | **both arms** | window | "
-              "hours UTC | vantage verified |",
-              "|---|---|---:|---:|---:|---:|---|---|---:|"]
+              "Three counts, because they are three different facts. `this arm` is what "
+              "this arm attempted. `both arms` adds the other arm's load — they differ "
+              "exactly when one arm refused a load the other recorded. **`readable`** "
+              "additionally requires that BOTH arms saw the page: a 4xx/5xx is our access "
+              "failing, and a pair with a blocked half carries no RU-versus-NL contrast at "
+              "all. Only the last number is a comparison.", "",
+              "| cell | arm | loads | blocked | sites | this arm | both arms | "
+              "**readable** | window | hours UTC | vantage verified |",
+              "|---|---|---:|---:|---:|---:|---:|---:|---|---|---:|"]
         for c in cl:
-            L.append(f"| `{c['run']}` | `{c['arm']}` | {c['loads']} | {c['sites']} | "
-                     f"{c['pairs']} | **{c['complete_pairs']}** | "
+            L.append(f"| `{c['run']}` | `{c['arm']}` | {c['loads']} | {c['blocked']} | "
+                     f"{c['sites']} | "
+                     f"{c['pairs']} | {c['complete_pairs']} | **{c['readable_pairs']}** | "
                      f"{'/'.join(str(w) for w in c['windows'])} s | "
                      f"{','.join(str(h) for h in c['hours'])} | "
                      f"{c['verified']}/{c['loads']} |")
@@ -346,24 +374,36 @@ def selftest():
     # fixture shaped exactly like the 2026-08-19 day cell — one arm short by one load — and
     # reads the rendered row, so a tool that computes the intersection and then prints
     # something else still goes red.
-    for arm, n in (("nl-direct", 3), ("ru-mobile", 2)):
+    # A pair whose halves BOTH wrote a load is still not a comparison if one of them was
+    # blocked. gismeteo.ru answers the NL vantage 403 in ~2s and the RU vantage 200.
+    check("a 4xx load did not see the page", rendered({"http_status": 403}), False)
+    check("a 200 load did", rendered({"http_status": 200}), True)
+    check("a missing status is not silently treated as rendered",
+          rendered({"http_status": None}), False)
+    check("a 3xx that landed is rendered", rendered({"http_status": 302}), True)
+
+    # NL attempts s000..s002, one of them (s001) blocked; RU attempts s000..s001, both 200.
+    # so: this-arm 3/2 · both-arms 2 · readable 1.
+    for arm, n, blocked in (("nl-direct", 3, {1}), ("ru-mobile", 2, set())):
         with open(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"), "w") as fh:
             for i in range(n):
                 fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
                                      "hour_utc": 9, "url": f"https://d{i}.ru/",
                                      "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                     "http_status": 403 if i in blocked else 200,
                                      "pair_id": f"testcell-s{i:03d}"}) + "\n")
     b = block(False)
     row = [x for x in b.splitlines() if "`nl-direct`" in x and "`testcell`" in x]
     check("the rendered NL row exists", len(row), 1)
-    # 3 attempted by this arm, 2 present in both — the table must print both, and the pair
-    # count it emphasises must be the second.
-    check("the table prints this arm's attempts AND the cross-arm pair count",
-          row and row[0].split("|")[5].strip() == "3" and row[0].split("|")[6].strip() == "**2**",
-          True)
+    cols = [c.strip() for c in row[0].split("|")] if row else []
+    check("the table prints attempts, both-arms and readable as three columns",
+          cols[6:9] if cols else None, ["3", "2", "**1**"])
+    check("the blocked half is counted and shown", cols[4] if cols else None, "1")
     ru_row = [x for x in b.splitlines() if "`ru-mobile`" in x and "`testcell`" in x]
-    check("the short arm publishes the same pair count, not its own",
-          ru_row and ru_row[0].split("|")[6].strip() == "**2**", True)
+    rcols = [c.strip() for c in ru_row[0].split("|")] if ru_row else []
+    check("the unblocked arm publishes the SAME readable count, not its own",
+          rcols[8] if rcols else None, "**1**")
+    check("the unblocked arm reports zero blocked", rcols[4] if rcols else None, "0")
     for arm in ("nl-direct", "ru-mobile"):
         os.remove(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"))
 
