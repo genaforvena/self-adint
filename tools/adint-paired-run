@@ -160,8 +160,12 @@ def main():
                          "prints — the arms then differ in something besides the treatment")
     ap.add_argument("--nav-tries", type=int, default=1,
                     help="attempts each arm gets at a navigation that never connected. "
-                         "DEFAULT 1, i.e. OFF, and the measurement is why: in the night cell "
-                         "the immediate retry recovered 0 of 8 loads. The connection failure "
+                         "DEFAULT 1, i.e. OFF, and the measurement is why: over the FULL "
+                         "night cell the immediate retry recovered 2 of 25 loads that needed "
+                         "it — 8%, bought by doubling the arm's traffic on exactly the loads "
+                         "where the link is already failing. (Mid-cell it read 0 of 14; the "
+                         "final number is 2 of 25, and the decision is the same.) The "
+                         "connection failure "
                          "has a correlation time of MINUTES, so a retry seconds later lands "
                          "inside the same bad window — and it doubles the arm's traffic on "
                          "exactly the loads where the link is already failing. THE RETRY THAT "
