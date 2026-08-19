@@ -425,6 +425,9 @@ ECHO_TIMEOUT_MS = 12000
 # --echo-timeout already derives from --nav-timeout (120 s in a paired cell), so patience
 # was never the binding constraint and raising it further would have fixed nothing.
 ECHO_TRIES = 1
+# Navigation attempts. 1 by default for the same reason as ECHO_TRIES: a retry is a claim
+# about the link and has to be asked for.
+NAV_TRIES = 1
 # The attempts are RECORDED, not smoothed away: a retry that hides its own count turns a
 # degrading link into a clean one, and the count is the only place the degradation shows.
 ECHO_ATTEMPT_PAUSE_S = 2.0
@@ -493,8 +496,12 @@ def pair_key(prefix, index):
 
 
 def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None,
-            use_proxy=True, vantage_probe=True, pair_id=None):
+            use_proxy=True, vantage_probe=True, pair_id=None, nav_tries=None):
     """One page load. Returns (load_row, request_rows).
+
+    `nav_tries` defaults to NAV_TRIES (1). Resolved here, never in the signature, so the
+    module default stays live rather than being bound once at def time — the trap that made
+    `--ip-echo` silently inert once already.
 
     `pair_id` is step0c §2.4's requirement that pairing be recoverable FROM THE DATA and not
     reconstructed later by timestamp arithmetic. `load_id` cannot carry it: it is a fresh
@@ -521,6 +528,10 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         "schema": SCHEMA, "kind": "load", "load_id": load_id, "pair_id": pair_id,
         "ts": t_wall.strftime("%Y-%m-%dT%H:%M:%SZ"), "hour_utc": t_wall.hour,
         "url": url, "run_idx": run_idx, "arm": arm, "arm_note": arm_note,
+        # The arm's PATIENCE, on the row. Once the arms may be given different nav budgets,
+        # a `no-answer` means "did not arrive within THIS many seconds" and the number is
+        # part of the reading — without it two arms' silences are not the same claim.
+        "nav_timeout_s": nav_timeout,
         # `egress_ip` is the address the BROWSER left from, never whichever one was easiest to
         # measure. The other path is recorded beside it so the row is unambiguous on its own.
         "egress_ip": (ip.get("egress_ip_proxied") if use_proxy else ip.get("egress_ip_direct"))
@@ -537,6 +548,8 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
     seen = {}      # playwright Request -> row
     table = load_domain_table()
     browser = ctx = None
+    if nav_tries is None:
+        nav_tries = NAV_TRIES
     t0 = time.time()
 
     def rel():
@@ -681,7 +694,38 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         page.on("response", on_response)
         page.on("requestfailed", on_failed)
 
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout * 1000)
+        # A NAVIGATION THAT NEVER CONNECTS IS TRANSIENT, and retrying it is the only lever
+        # left once the other two are measured out. Evidence, RU tether 2026-08-19:
+        #   - DNS was genuinely broken; fixing it moved the loss 46% -> 36%, p=0.56.
+        #   - PATIENCE IS NOT OURS TO SPEND. Given a 600 s budget, aif.ru and kp.ru failed at
+        #     133.1 s and 135.2 s with net::ERR_CONNECTION_TIMED_OUT — Chromium's own connect
+        #     timeout fires first, so any --nav-timeout above ~135 s is inert.
+        #   - mk.ru timed out at 120 s inside the cell and loaded in 3.8 s minutes later.
+        # That last line is the argument: the page is not slow and the site is not refusing
+        # us, the connection intermittently fails to establish. Same shape as the IP echo,
+        # same remedy, same obligation to RECORD the attempts — a load that needed three
+        # tries must never read as a first-try load.
+        resp = None
+        for attempt in range(1, max(1, nav_tries) + 1):
+            load["nav_attempts"] = attempt
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded",
+                                 timeout=nav_timeout * 1000)
+                break
+            except Exception:
+                if attempt >= max(1, nav_tries):
+                    raise
+                # A fresh page per attempt: the failed one may hold a half-open connection,
+                # and any rows it collected belong to an attempt that never rendered.
+                del rows[:]
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = ctx.new_page()
+                page.on("request", on_request)
+                page.on("response", on_response)
+                page.on("requestfailed", on_failed)
         load["http_status"] = resp.status if resp else None
         load["final_url"] = page.url
         if load["http_status"] is not None and load["http_status"] >= 400:
@@ -787,7 +831,9 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         row["answered_after_wrapper_deadline"] = bool(
             wt is not None and _lat_ms is not None and _lat_ms > wt)
         for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
-                  "browser_egress_ip", "browser_egress_attempts", "vantage_verified",
+                  "nav_timeout_s", "nav_attempts",
+                  "browser_egress_ip", "browser_egress_attempts",
+                  "vantage_verified",
                   "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
@@ -821,6 +867,12 @@ def main():
                     help="seconds the browser gets to read the IP echo (default: --nav-timeout, "
                          "min 12). Raise it on a slow vantage; it changes the patience, not the "
                          "gate — an unread echo still refuses the run")
+    ap.add_argument("--nav-tries", type=int, default=1,
+                    help="how many times a load may retry a navigation that never connected "
+                         "(default 1). Chromium's own connect timeout fires around 135 s, so "
+                         "this is the lever --nav-timeout is not: measured on the RU tether "
+                         "2026-08-19, mk.ru timed out at 120 s in a cell and loaded in 3.8 s "
+                         "minutes later. The attempts used are recorded on every load")
     ap.add_argument("--echo-tries", type=int, default=1,
                     help="how many times the browser may retry an unread IP echo before the "
                          "run is refused (default 1). Raise it on a link that fails the echo "
@@ -840,9 +892,10 @@ def main():
 
     # Patience for the echo read, in ms. Derived from --nav-timeout so a vantage that needs a
     # long navigation is not refused for a short echo, with the old 12s as the floor.
-    global ECHO_TIMEOUT_MS, IP_ECHO, ECHO_TRIES
+    global ECHO_TIMEOUT_MS, IP_ECHO, ECHO_TRIES, NAV_TRIES
     ECHO_TIMEOUT_MS = max(12, args.echo_timeout or args.nav_timeout) * 1000
     ECHO_TRIES = max(1, args.echo_tries)
+    NAV_TRIES = max(1, args.nav_tries)
     if args.ip_echo:
         IP_ECHO = args.ip_echo
 

@@ -109,7 +109,12 @@ def read_frame(path):
     return out
 
 
-def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tries=None):
+def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tries=None,
+            ip_echo=None, nav_tries=None):
+    # nav_timeout is per-ARM by the caller's choice (see --ru-nav-timeout). It is NOT the
+    # measurement window — that is `--settle`, fixed at 45 s for every arm by §2.1 — it is
+    # only how long the arm may wait for the page to arrive before giving up. Letting the
+    # slow arm wait longer changes WHICH loads exist, not how long any auction is watched.
     # The echo budget is given to BOTH arms and not just the flaky one. It costs the NL arm
     # nothing (its echo answers on the first read), and an allowance handed to one arm only
     # is an arm difference that is not the treatment — the pair would then differ in how
@@ -117,6 +122,16 @@ def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tr
     inner = [PY, CAPTURE, url, "--settle", str(window), "--nav-timeout", str(nav_timeout),
              "--arm", arm, "--via", "direct", "--pair-prefix", pair_prefix, "--out", out,
              "--echo-tries", str(echo_tries if echo_tries else 1)]
+    # Same echo host for both arms. The echo is the instrument, not the treatment: pointing
+    # the arms at different ones would make `vantage unproven` mean a different thing in
+    # each, which is the one word the pair cannot afford to have two meanings of.
+    if ip_echo:
+        inner += ["--ip-echo", ip_echo]
+    # Symmetric, like the echo budget: an arm allowed more attempts at reaching a page is an
+    # arm with a different chance of HAVING that page, which is a difference in the load set
+    # and not in the treatment.
+    if nav_tries:
+        inner += ["--nav-tries", str(nav_tries)]
     if netns:
         # runuser drops back to the user INSIDE the namespace; HOME is passed explicitly
         # because `sudo ip netns exec` does not carry it and playwright's browser path is
@@ -138,6 +153,23 @@ def main():
     ap.add_argument("--window", type=int, default=45,
                     help="window_s, fixed at 45 for every arm of the study (§2.1)")
     ap.add_argument("--nav-timeout", type=int, default=120)
+    ap.add_argument("--ru-nav-timeout", type=int, default=None,
+                    help="seconds the RU arm may wait for a page, when it must differ from "
+                         "--nav-timeout. Default: the same as both arms. Set it only from a "
+                         "MEASUREMENT of the link, and read the asymmetry warning the run "
+                         "prints — the arms then differ in something besides the treatment")
+    ap.add_argument("--nav-tries", type=int, default=2,
+                    help="attempts each arm gets at a navigation that never connected "
+                         "(default 2). Raising --nav-timeout instead is INERT above ~135 s, "
+                         "where Chromium's own connect timeout fires. Identical for both arms")
+    ap.add_argument("--ip-echo", default=None,
+                    help="echo host for BOTH arms. Must be one the RU vantage's resolver "
+                         "answers correctly: MTS returns api.ipify.org (the capture's "
+                         "default) and api.myip.com as the real /24 with the last octet "
+                         "ZEROED, so under carrier DNS the default echo is unreachable and "
+                         "every load would refuse. Measured working 2026-08-19: "
+                         "https://ifconfig.co (200, 0.39 s), https://icanhazip.com (200, "
+                         "1.23 s). https://ip.sb timed out at 90 s")
     ap.add_argument("--echo-tries", type=int, default=3,
                     help="attempts each arm gets to read the IP echo before its load is "
                          "refused as vantage-unproven (default 3, measured on the RU tether "
@@ -181,7 +213,18 @@ def main():
         log.write(line + "\n")
         log.flush()
 
-    say(f"echo_tries={args.echo_tries} (both arms)")
+    ru_nav = args.ru_nav_timeout or args.nav_timeout
+    say(f"echo_tries={args.echo_tries} nav_tries={args.nav_tries} (both arms)")
+    if ru_nav != args.nav_timeout:
+        # An asymmetry the reader must not have to infer from a flag they did not see.
+        say(f"WARNING ARM ASYMMETRY: nav_timeout {args.ru_arm}={ru_nav}s "
+            f"{args.nl_arm}={args.nav_timeout}s. The arms differ in PATIENCE as well as in "
+            f"vantage: a page the slow arm now waits for is a load the fast arm would have "
+            f"had anyway, so the arms' load SETS become more alike, not less — but a load "
+            f"that needed {ru_nav}s to arrive was fetched under conditions the other arm "
+            f"never met. Loads carry their own nav budget; split on it before comparing.")
+    else:
+        say(f"nav_timeout={args.nav_timeout}s (both arms)")
     say(f"run_id={run_id} zone_msk={zone} seed={seed} window_s={args.window} "
         f"replicates={args.replicates} frame={os.path.basename(args.frame)} n_sites={len(order)}")
     # The order is written BEFORE the run, so "both arms got the same list" is checkable
@@ -199,8 +242,10 @@ def main():
             procs = {}
             for arm, out, ns in ((args.nl_arm, out_nl, None),
                                  (args.ru_arm, out_ru, args.ru_netns)):
-                cmd = arm_cmd(arm, url, out, args.window, args.nav_timeout, pp, ns,
-                              echo_tries=args.echo_tries)
+                nav = ru_nav if arm == args.ru_arm else args.nav_timeout
+                cmd = arm_cmd(arm, url, out, args.window, nav, pp, ns,
+                              echo_tries=args.echo_tries, ip_echo=args.ip_echo,
+                              nav_tries=args.nav_tries)
                 procs[arm] = (subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                                stderr=subprocess.PIPE), time.time())
             done = {}
@@ -279,6 +324,18 @@ def selftest():
           any(x.startswith("HOME=") for x in ru), True)
     nl = arm_cmd("nl-direct", "https://x.ru/", "/tmp/o", 45, 120, "p", netns=None)
     # The echo budget is a property of the CELL, not of an arm: the same number in both.
+    check("both arms get the same echo HOST, or `unproven` means two things",
+          arm_cmd("ru-mobile", "https://x.ru/", "/tmp/o", 45, 120, "p",
+                  ip_echo="https://ifconfig.co")[-1],
+          arm_cmd("nl-direct", "https://x.ru/", "/tmp/o", 45, 120, "p",
+                  ip_echo="https://ifconfig.co")[-1])
+    check("no --ip-echo leaves the capture's own default alone",
+          "--ip-echo" in arm_cmd("a", "https://x.ru/", "/tmp/o", 45, 120, "p"), False)
+    check("both arms get the same navigation budget",
+          arm_cmd("ru-mobile", "https://x.ru/", "/tmp/o", 45, 120, "p", nav_tries=2)[-1],
+          arm_cmd("nl-direct", "https://x.ru/", "/tmp/o", 45, 120, "p", nav_tries=2)[-1])
+    check("the navigation budget is passed through, not pinned",
+          arm_cmd("a", "https://x.ru/", "/tmp/o", 45, 120, "p", nav_tries=5)[-1], "5")
     check("both arms get the same echo budget",
           ru[ru.index("--echo-tries") + 1] == nl[nl.index("--echo-tries") + 1], True)
     check("the echo budget is passed through, not pinned",
