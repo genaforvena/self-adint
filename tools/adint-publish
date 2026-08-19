@@ -29,12 +29,27 @@ travels as a dataset rather than as a file.
 
 import argparse
 import collections
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUB = os.path.join(REPO, "public-data")
+
+
+def _load(name):
+    path = os.path.join(REPO, "tools", name)
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), path,
+        loader=importlib.machinery.SourceFileLoader(name.replace("-", "_"), path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+SB = _load("adint-frame-stageb")
 
 # ── the allowlists, per ledger kind ───────────────────────────────────────────────────
 # Read these as the dataset's schema: what is published IS this list.
@@ -125,19 +140,33 @@ def main():
         print("usage: adint-publish --kind {frame,paired} <data/…jsonl>", file=sys.stderr)
         return 2
 
-    keep = KINDS[args.kind]
+    return publish(args.source, args.kind, args.out, args.rule)
+
+
+def publish(source, kind, out=None, rule="see docs/step0c-hb-ru-market-study-2026-08-18.md"):
+    keep = KINDS[kind]
     os.makedirs(PUB, exist_ok=True)
-    out = args.out or os.path.join(PUB, os.path.basename(args.source))
+    out = out or os.path.join(PUB, os.path.basename(source))
 
     dropped = collections.Counter()
     n = 0
     rows = []
-    with open(args.source, encoding="utf-8") as fh:
-        for line in fh:
+    redone = collections.Counter()
+    # THE EXPORT BOUNDARY. Inside this repo every reader re-derives a verdict written under an
+    # older classifier schema; a stranger who downloads this file has no such loader and reads
+    # `stageb_verdict` as gospel. So a frame ledger is re-derived HERE, once, on the way out —
+    # the last point at which the code that wrote a verdict is still knowable.
+    src_rows = None
+    if kind == "frame":
+        src_rows, redone, _schemas, _dupes = SB.load_rows(source)
+    with open(source, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#"):
                 continue
             r = json.loads(line)
+            if src_rows is not None:
+                r = src_rows[len(rows)]
             for k in r:
                 if k not in keep and k not in NESTED:
                     dropped[k] += 1
@@ -158,10 +187,16 @@ def main():
 
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(HEADER.format(
-            name=os.path.basename(out), src=os.path.basename(args.source),
-            tool="tools/adint-frame-stageb" if args.kind == "frame" else "tools/adint-hb-capture",
-            rule=args.rule, nkept=len(keep)))
+            name=os.path.basename(out), src=os.path.basename(source),
+            tool="tools/adint-frame-stageb" if kind == "frame" else "tools/adint-hb-capture",
+            rule=rule, nkept=len(keep)))
         fh.write(f"# ROWS       {n}\n")
+        if redone:
+            fh.write("# RE-DERIVED " + SB.schema_note(redone, collections.Counter()).split(
+                "): ", 1)[-1] + "\n")
+            fh.write("#            Rows written under an older classifier schema carry the\n"
+                     "#            verdict THIS code gives their stored probe fields, not the\n"
+                     "#            one recorded at walk time. The raw fields are untouched.\n")
         if dropped:
             fh.write("# DROPPED    " + ", ".join(
                 f"{k}({v})" for k, v in sorted(dropped.items())) + "\n")
@@ -170,6 +205,8 @@ def main():
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"{n} row(s) -> {out}")
+    if redone:
+        print("re-derived on the way out: " + " ".join(f"{k}={v}" for k, v in sorted(redone.items())))
     if dropped:
         print("dropped (not on the allowlist): "
               + ", ".join(f"{k}×{v}" for k, v in sorted(dropped.items())))
@@ -197,6 +234,30 @@ def selftest():
           sorted(kept), ["domain", "stageb_verdict"])
     check("an advertising id is not on the frame allowlist",
           "device_ifa" in FRAME_FIELDS, False)
+    # THE EXPORT BOUNDARY IS THE LAST PLACE THE RULE OF d28dbde CAN BE APPLIED. Everything
+    # inside this repo re-derives a stale verdict at read time; a stranger who downloads the
+    # published file has no such loader and will read `stageb_verdict` as written. So a frame
+    # ledger must not cross carrying a verdict from a retired classifier.
+    import tempfile as _tf
+    _d = _tf.mkdtemp()
+    _src = os.path.join(_d, "frame-stageb-t-2026-01-01.jsonl")
+    with open(_src, "w") as fh:
+        fh.write(json.dumps({"domain": "adserving.ru", "rank": 1, "vantage": "t",
+                             "stageb_verdict": "admit", "stageb_schema": 1,
+                             "http_status": 200, "content_type": "text/html",
+                             "adfox": {"ya": True, "adfoxCode": True, "hb_settings": False,
+                                       "ya_context": True},
+                             "adfox_hb": {"present": False}, "prebid": [], "globals": [],
+                             "browser_egress_ip": "1.2.3.4"}) + "\n")
+    _out = os.path.join(_d, "out.jsonl")
+    _rc = publish(_src, "frame", _out, rule="t")
+    _pub = [json.loads(l) for l in open(_out) if not l.startswith("#")]
+    check("a stale verdict does not cross the export boundary",
+          [(r["stageb_verdict"], r["stageb_schema"]) for r in _pub],
+          [("ad-serving-only", SB.SCHEMA)])
+    check("and the published header says the verdicts were re-derived",
+          "RE-DERIVED" in open(_out).read(), True)
+
     # The nested projection must behave like the top-level allowlist: named keys cross, and a
     # sub-key nobody anticipated does not.
     blob = {"prices": [{"value": 1.23}], "currency": "RUB", "raw_body": "NEVER"}

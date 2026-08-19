@@ -35,13 +35,13 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-19 13:34 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-19 13:37 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
 The study runs on the **`ru-mobile`** frame, declared in `ref/CANONICAL-FRAME`. Which vantage a frame is built from changes its membership, so this is a choice with a reason, recorded in that file.
 
-**Vantage `ru-mobile`** — **canonical** · 208 domains touched in rank order · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
+**Vantage `ru-mobile`** — **canonical** · 208 domains touched in rank order · 3 duplicate row(s) collapsed · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
 
 | verdict | n | what it means |
 |---|---:|---|

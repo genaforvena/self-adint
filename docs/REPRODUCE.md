@@ -81,15 +81,18 @@ rejections and their reasons:
 - The run is resumable: re-running skips domains already in the ledger.
 
 **Which vantage you walk from is not a detail.** `ref/CANONICAL-FRAME` declares the frame
-the study runs on and records the measurement behind the choice: an Amsterdam-built frame is
-missing `rbc.ru`, `gismeteo.ru` and `hh.ru`, while a Moscow-built one has no hole at all.
-Compare two walks yourself — the tool separates a HOLE (the other vantage admits it, this one
+the study runs on and records the measurement behind the choice. As of 2026-08-19, at ranks
+13–5117 reached by both walks, an Amsterdam-built frame is missing five publishers a Moscow
+one admits and a Moscow-built one is missing two — **neither is complete**, and the file
+splits those holes by cause (a `blocked`/`unreachable` hole is our own blindness and a later
+walk may close it; a hole whose cause is a different verdict is the site serving that vantage
+another page, and no retry closes that). Compare two walks yourself — the tool separates a HOLE (the other vantage admits it, this one
 reached it and refused) from a PENDING (this one has not reached it yet), which no
 disagreement total can do:
 
 ```bash
-python3 tools/adint-frame-compare data/frame-stageb-nl-direct-<date>-schema3.jsonl \
-                                  data/frame-stageb-ru-mobile-<date>-schema3.jsonl --quiet
+python3 tools/adint-frame-compare data/frame-stageb-nl-direct-<date>.jsonl \
+                                  data/frame-stageb-ru-mobile-<date>.jsonl --quiet
 ```
 
 Then publish the ledger through the allowlist (never copy it by hand):
@@ -97,6 +100,21 @@ Then publish the ledger through the allowlist (never copy it by hand):
 ```bash
 python3 tools/adint-publish --kind frame data/frame-stageb-nl-direct-<date>.jsonl
 ```
+
+**Publish from the RAW ledger, not from a `-schemaN` copy.** The raw file is the record of
+what was done; the `-schemaN` file is a convenience snapshot that goes stale the moment the
+walk continues past it. Every tool here — and `adint-publish` on the way out — re-derives the
+verdict of any row written under an older classifier schema from that row's stored probe
+fields, and says how many it moved. A walk long enough to be interrupted by a fix to the rule
+produces a MIXED ledger, and that is the normal case, not an accident:
+
+```
+re-derived on the way out: admit->ad-serving-only=7 error->no-web-apex=7 …
+```
+
+`--reclassify` still exists and is worth running when you want the corrected ledger on disk
+to diff — but nothing depends on your having remembered it. (Before `bbf4662` several tools
+read the stored verdict directly, and one of them published the admission list.)
 
 ### A rejection ages differently from an admission
 
