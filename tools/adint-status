@@ -174,6 +174,26 @@ def complete_pairs(by_run_arm, rendered_only=False):
     return out
 
 
+def _dedup_cell_files(files):
+    """(files, {(run, basename)}, [drift notes]). Published copy wins; drift is named."""
+    by_name, drift = {}, []
+    for f in files:
+        key = (run_of(f), os.path.basename(f))
+        if key in by_name:
+            a, b = by_name[key], f
+            pub = a if a.startswith(PUB) else b
+            other = b if pub is a else a
+            na = sum(1 for r in read_jsonl(pub) if r.get("kind") == "load")
+            nb = sum(1 for r in read_jsonl(other) if r.get("kind") == "load")
+            if na != nb:
+                drift.append(f"`{os.path.basename(f)}`: published {na} loads, "
+                             f"unpublished tree has {nb}")
+            by_name[key] = pub
+        else:
+            by_name[key] = f
+    return sorted(by_name.values()), set(by_name), drift
+
+
 def cells(include_private):
     """One paired run = one cell of the schedule."""
     out = []
@@ -181,8 +201,13 @@ def cells(include_private):
     if include_private:
         pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
     files = sorted(set(sum([glob.glob(p) for p in pats], [])))
-    # Both arms are read BEFORE any row is emitted, because a pair is a fact about the cell
-    # and cannot be computed from one arm's file alone.
+    # ONE ROW PER (cell, arm), not per FILE. A published cell exists in BOTH trees under the
+    # same basename, so reading with --include-private listed the morning cell twice and its
+    # loads were counted twice in the coverage percentage — the study's own progress figure,
+    # inflated by the act of publishing. Dedup on the identity of the CELL, keeping the
+    # published copy; if the two copies disagree on load count, that is publish drift and it
+    # is REPORTED rather than resolved by preference.
+    files, seen_key, drift = _dedup_cell_files(files)
     by_run_arm = {}
     by_run_arm_rendered = {}
     for f in files:
@@ -196,6 +221,7 @@ def cells(include_private):
             r["pair_id"] for r in ld if r.get("pair_id") and rendered(r)}
     done = complete_pairs(by_run_arm)
     readable = complete_pairs(by_run_arm_rendered)
+
     for f in files:
         rows = [r for r in read_jsonl(f) if r.get("kind") == "load"]
         if not rows:
@@ -216,6 +242,10 @@ def cells(include_private):
             "verified": sum(1 for r in rows if r.get("vantage_verified")),
             "egress": sorted({r.get("egress_ip") for r in rows if r.get("egress_ip")}),
             "private": f.startswith(PRIV),
+            # Carried on every row rather than returned beside them: a second return value
+            # is a thing a caller can forget to read, and a drift nobody prints is a drift
+            # nobody knows about.
+            "drift": drift,
         })
     return out
 
@@ -307,6 +337,14 @@ def block(include_private):
               f"({100.0*loads/designed:.1f} %) of the 14-day, two-arm schedule in §2.3 of "
               f"`docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is "
               f"a pilot of that design, not a sample of the Russian market.", ""]
+
+    # Publish drift: the same cell present in both trees with different load counts. Named
+    # rather than resolved, because which copy is right is not this tool's call.
+    dr = sorted({d for c in cl for d in c.get("drift", [])})
+    if dr:
+        L += ["> **The published copy and the working copy of a cell disagree.** "
+              + "; ".join(dr) + ". The table above reads the PUBLISHED copy. Re-run "
+              "`tools/adint-publish` — until then one of these two numbers is stale.", ""]
 
     # `"data/" in f["src"]` was TRUE for "public-data/" — the substring trap this project
     # documents, committed in the tool that reports on it. Compare against the marker itself.
@@ -433,8 +471,42 @@ def selftest():
           rcols[9] if rcols else None, "**1**")
     check("the RU arm's nav timeout is a no-answer and not a refusal",
           rcols[4:6] if rcols else None, ["0", "1"])
+    # ONE CELL, TWO TREES. A published cell exists in both, and listing it per FILE counted
+    # its loads twice in the coverage percentage — the study's own progress figure inflated
+    # by the act of publishing.
+    for arm, loads in fixture.items():
+        with open(os.path.join(PRIV, f"hb-paired-testcell.{arm}.jsonl"), "w") as fh:
+            for sid, st in loads:
+                fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
+                                     "hour_utc": 9, "url": f"https://{sid}.ru/",
+                                     "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                     "http_status": st,
+                                     "pair_id": f"testcell-{sid}"}) + "\n")
+    b2 = block(True)
+    check("a cell in both trees is ONE row per arm, not two",
+          len([x for x in b2.splitlines() if "`nl-direct`" in x and "`testcell`" in x]), 1)
+    check("its loads are counted once in the coverage line",
+          "6 of 8960 loads" in b2, True)
+    check("no drift is claimed when the copies agree",
+          "disagree" in b2, False)
+
+    # The copies disagreeing is publish drift: named, never resolved by preference.
+    with open(os.path.join(PRIV, "hb-paired-testcell.nl-direct.jsonl"), "a") as fh:
+        fh.write(json.dumps({"kind": "load", "arm": "nl-direct", "window_s": 45,
+                             "hour_utc": 9, "url": "https://s009.ru/",
+                             "egress_ip": "1.2.3.4", "vantage_verified": True,
+                             "http_status": 200, "pair_id": "testcell-s009"}) + "\n")
+    b3 = block(True)
+    check("a cell whose two copies differ says so", "disagree" in b3, True)
+    check("the drift note carries both counts",
+          "published 3 loads" in b3 and "unpublished tree has 4" in b3, True)
+    check("the table still reads the published copy",
+          [x for x in b3.splitlines()
+           if "`nl-direct`" in x and "`testcell`" in x][0].split("|")[3].strip(), "3")
+
     for arm in fixture:
         os.remove(os.path.join(PUB, f"hb-paired-testcell.{arm}.jsonl"))
+        os.remove(os.path.join(PRIV, f"hb-paired-testcell.{arm}.jsonl"))
 
     # A verdict this tool has never heard of must still be COUNTED, not dropped: a table that
     # silently omits an unknown row understates the denominator and flatters the frame.
