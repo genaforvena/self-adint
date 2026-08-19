@@ -416,14 +416,52 @@ IP_ECHO = "https://api.ipify.org"
 # this from --nav-timeout unless --echo-timeout says otherwise. The GATE is unchanged — an
 # unread echo still stops the run; only how long we wait before calling it unread moves.
 ECHO_TIMEOUT_MS = 12000
+# One attempt by default, because a retry is a claim about the LINK and must be asked for.
+# Measured on the RU tether 2026-08-19 (n=8 curls to the echo, `--max-time 30`): four read
+# the address (12.1 / 12.5 / 23.9 / 26.3 s) and four did not (two connection failures at
+# 19.8 s, two hard timeouts) — while the same tether carried eleven 45-second captures in
+# the same hour. So the echo fails TRANSIENTLY on a working vantage, and a single attempt
+# converts that into `vantage unproven`, which the run then refuses. It is not slowness:
+# --echo-timeout already derives from --nav-timeout (120 s in a paired cell), so patience
+# was never the binding constraint and raising it further would have fixed nothing.
+ECHO_TRIES = 1
+# The attempts are RECORDED, not smoothed away: a retry that hides its own count turns a
+# degrading link into a clean one, and the count is the only place the degradation shows.
+ECHO_ATTEMPT_PAUSE_S = 2.0
 
 
-def browser_egress(ctx, timeout_ms=None, echo=None):
+def echo_read(ctx, timeout_ms=None, echo=None, tries=None, pause_s=None):
+    """(address, attempts). Retries a TRANSIENT echo failure; the verdict is unchanged.
+
+    None still means the echo could not be read, and a caller still refuses on it — this
+    only stops one flaky read from being mistaken for that. `attempts` is what the row and
+    the preflight line report, so a vantage that needed three tries is visible as such.
+    """
+    if tries is None:
+        tries = ECHO_TRIES
+    if pause_s is None:
+        pause_s = ECHO_ATTEMPT_PAUSE_S
+    attempts = 0
+    for i in range(max(1, tries)):
+        if i:
+            time.sleep(pause_s)
+        attempts += 1
+        got = _echo_once(ctx, timeout_ms, echo)
+        if got is not None:
+            return got, attempts
+    return None, attempts
+
+
+def browser_egress(ctx, timeout_ms=None, echo=None, tries=None):
     """The exit address as the BROWSER sees it. None when the echo cannot be read.
 
     None is not a failure of the arm — it is the absence of evidence about the arm, and it
     must stay distinguishable from a verified match.
     """
+    return echo_read(ctx, timeout_ms, echo, tries)[0]
+
+
+def _echo_once(ctx, timeout_ms=None, echo=None):
     p = None
     # Both defaults resolve HERE, not in the signature: a default argument is bound once at
     # def time, so `echo=IP_ECHO` in the signature would pin the module value and silently
@@ -525,7 +563,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # A launch flag is an intention and the parent's curl measures the parent; neither is
         # this browser's vantage. Missing renders null — never the expected value.
         if vantage_probe:
-            load["browser_egress_ip"] = browser_egress(ctx)
+            load["browser_egress_ip"], load["browser_egress_attempts"] = echo_read(ctx)
             expected = load.get("egress_ip")
             load["vantage_verified"] = (
                 None if load["browser_egress_ip"] is None
@@ -749,7 +787,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         row["answered_after_wrapper_deadline"] = bool(
             wt is not None and _lat_ms is not None and _lat_ms > wt)
         for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
-                  "browser_egress_ip", "vantage_verified",
+                  "browser_egress_ip", "browser_egress_attempts", "vantage_verified",
                   "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
@@ -783,6 +821,11 @@ def main():
                     help="seconds the browser gets to read the IP echo (default: --nav-timeout, "
                          "min 12). Raise it on a slow vantage; it changes the patience, not the "
                          "gate — an unread echo still refuses the run")
+    ap.add_argument("--echo-tries", type=int, default=1,
+                    help="how many times the browser may retry an unread IP echo before the "
+                         "run is refused (default 1). Raise it on a link that fails the echo "
+                         "transiently — it changes how many reads are attempted, never what "
+                         "an unread echo means. The count used is recorded on every row")
     ap.add_argument("--arm-offset", type=int, default=0,
                     help="shift the alternation; use 1 on the next pass so a site does not "
                          "always land in the same arm (see arm_plan)")
@@ -797,8 +840,9 @@ def main():
 
     # Patience for the echo read, in ms. Derived from --nav-timeout so a vantage that needs a
     # long navigation is not refused for a short echo, with the old 12s as the floor.
-    global ECHO_TIMEOUT_MS, IP_ECHO
+    global ECHO_TIMEOUT_MS, IP_ECHO, ECHO_TRIES
     ECHO_TIMEOUT_MS = max(12, args.echo_timeout or args.nav_timeout) * 1000
+    ECHO_TRIES = max(1, args.echo_tries)
     if args.ip_echo:
         IP_ECHO = args.ip_echo
 
@@ -864,7 +908,7 @@ def main():
                                        args=[] if up else ["--no-proxy-server"],
                                        **({} if env is None else {"env": env}))
                 try:
-                    seen_exits[a] = browser_egress(b.new_context())
+                    seen_exits[a] = browser_egress(b.new_context())  # tries per ECHO_TRIES
                 finally:
                     b.close()
             print(f"preflight vantage: proxy={seen_exits['proxy']} direct={seen_exits['direct']}",
@@ -890,10 +934,11 @@ def main():
             env = {k: v for k, v in os.environ.items() if k not in PROXY_VARS}
             b = pw.chromium.launch(headless=True, args=["--no-proxy-server"], env=env)
             try:
-                seen = browser_egress(b.new_context())
+                seen, seen_tries = echo_read(b.new_context())
             finally:
                 b.close()
-            print(f"preflight vantage: via=direct exit={seen}", file=sys.stderr)
+            print(f"preflight vantage: via=direct exit={seen} echo_attempts={seen_tries}"
+                  f"/{ECHO_TRIES}", file=sys.stderr)
             if seen is None:
                 print("refusing: the echo could not be read, so --via direct is unproven",
                       file=sys.stderr)
@@ -1162,7 +1207,49 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
 
     priced = by.get("betweendigital", {})
     prices = (priced.get("detail") or {}).get("prices") or []
+
+    # ── the echo retry (measured on the RU tether 2026-08-19; see ECHO_TRIES) ──
+    # A fake context, because the thing under test is what happens when the echo FAILS, and
+    # a live echo that succeeds cannot exercise it. The first fake fails a fixed number of
+    # times and then answers — a transient link; the second never answers — a dead one. The
+    # two must end differently, or the retry has quietly turned a refusal into a pass.
+    class _FlakyEcho:
+        def __init__(self, fail_first):
+            self.fail_first = fail_first
+            self.calls = 0
+
+        def new_page(self):
+            self.calls += 1
+            fails = self.calls <= self.fail_first
+            outer = self
+
+            class _P:
+                def goto(self, url, **kw):
+                    if fails:
+                        raise RuntimeError("net::ERR_CONNECTION_TIMED_OUT")
+
+                def inner_text(self, sel):
+                    return "  91.79.81.62 "
+
+                def close(self):
+                    pass
+            return _P()
+
+    flaky_1try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=1, pause_s=0)
+    flaky_3try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=3, pause_s=0)
+    dead_3try = echo_read(_FlakyEcho(99), timeout_ms=1, tries=3, pause_s=0)
+    clean_3try = echo_read(_FlakyEcho(0), timeout_ms=1, tries=3, pause_s=0)
+
     checks = [
+        # ── the echo retry ──
+        # This first gate is the RED one: it states the defect that cost the 2026-08-19 day
+        # cell three of its fourteen RU loads. Delete the retry and the next gate matches it.
+        ("one attempt reads a transiently-failing echo as unreadable", flaky_1try == (None, 1)),
+        ("three attempts read it", flaky_3try == ("91.79.81.62", 3)),
+        # The retry must not become a way of passing a vantage that is actually gone.
+        ("an echo that never answers is still unread after every attempt",
+         dead_3try == (None, 3)),
+        ("a working echo costs exactly one attempt", clean_3try == ("91.79.81.62", 1)),
         # ── the pair key (step0c §2.4) ──
         # Reconstructing pairs by timestamp is what this replaces, so the assertion is that
         # two SEPARATE capture() calls — different load_ids, different arms — carry the same

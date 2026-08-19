@@ -49,6 +49,39 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = os.path.expanduser("~/.venv-browser/bin/python3")
 CAPTURE = os.path.join(REPO, "tools", "adint-hb-capture")
 
+# An arm's return code is a CAUSE, not a boolean. rc2 is the capture refusing to label a
+# load whose vantage it could not prove — no row reaches disk — and rc1 is the two arms
+# having collapsed onto one exit. Neither produced a pair, and neither is an error in the
+# ordinary sense, so `pairs=N` counted over attempts folds three different facts into the
+# study's headline number. The 2026-08-19 day cell is the case: 14 attempts, 3 of them with
+# no RU side at all, and the old summary would have said `pairs=14`.
+ARM_RC = {0: "recorded", 1: "arms-collapsed", 2: "vantage-unproven"}
+
+
+def rc_cause(rc):
+    return ARM_RC.get(rc, f"error-rc{rc}")
+
+
+def tally_pairs(results):
+    """results: [{arm: rc, ...}, ...] in attempt order -> (attempted, complete, causes).
+
+    `complete` counts only attempts where EVERY arm recorded. `causes` is keyed
+    "<arm>:<cause>" and counts the arms that did not, so an incomplete attempt is
+    attributable rather than merely subtracted.
+    """
+    attempted = len(results)
+    complete = 0
+    causes = {}
+    for r in results:
+        if all(rc == 0 for rc in r.values()):
+            complete += 1
+            continue
+        for arm, rc in sorted(r.items()):
+            if rc != 0:
+                causes[f"{arm}:{rc_cause(rc)}"] = causes.get(f"{arm}:{rc_cause(rc)}", 0) + 1
+    return attempted, complete, causes
+
+
 # MSK zones of §2.2, stored in UTC. The market's clock is Moscow's; the label is derived
 # from the wall clock at the START of the cell and recorded, never inferred later.
 def zone_msk(dt):
@@ -76,9 +109,14 @@ def read_frame(path):
     return out
 
 
-def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None):
+def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tries=None):
+    # The echo budget is given to BOTH arms and not just the flaky one. It costs the NL arm
+    # nothing (its echo answers on the first read), and an allowance handed to one arm only
+    # is an arm difference that is not the treatment — the pair would then differ in how
+    # hard we tried to prove it, which is exactly the confound the pairing exists to remove.
     inner = [PY, CAPTURE, url, "--settle", str(window), "--nav-timeout", str(nav_timeout),
-             "--arm", arm, "--via", "direct", "--pair-prefix", pair_prefix, "--out", out]
+             "--arm", arm, "--via", "direct", "--pair-prefix", pair_prefix, "--out", out,
+             "--echo-tries", str(echo_tries if echo_tries else 1)]
     if netns:
         # runuser drops back to the user INSIDE the namespace; HOME is passed explicitly
         # because `sudo ip netns exec` does not carry it and playwright's browser path is
@@ -100,6 +138,10 @@ def main():
     ap.add_argument("--window", type=int, default=45,
                     help="window_s, fixed at 45 for every arm of the study (§2.1)")
     ap.add_argument("--nav-timeout", type=int, default=120)
+    ap.add_argument("--echo-tries", type=int, default=3,
+                    help="attempts each arm gets to read the IP echo before its load is "
+                         "refused as vantage-unproven (default 3, measured on the RU tether "
+                         "2026-08-19). Identical for both arms, on purpose")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--sites", type=int, default=0, help="cap the site count (0 = the frame)")
     ap.add_argument("--ru-netns", default="ruvantage")
@@ -139,6 +181,7 @@ def main():
         log.write(line + "\n")
         log.flush()
 
+    say(f"echo_tries={args.echo_tries} (both arms)")
     say(f"run_id={run_id} zone_msk={zone} seed={seed} window_s={args.window} "
         f"replicates={args.replicates} frame={os.path.basename(args.frame)} n_sites={len(order)}")
     # The order is written BEFORE the run, so "both arms got the same list" is checkable
@@ -146,6 +189,8 @@ def main():
     say("order=" + ",".join(order))
 
     skews = []
+    attempts = []
+    zone_drifted = []
     for rep in range(1, args.replicates + 1):
         for idx, domain in enumerate(order, 1):
             url = f"https://{domain}/"
@@ -154,7 +199,8 @@ def main():
             procs = {}
             for arm, out, ns in ((args.nl_arm, out_nl, None),
                                  (args.ru_arm, out_ru, args.ru_netns)):
-                cmd = arm_cmd(arm, url, out, args.window, args.nav_timeout, pp, ns)
+                cmd = arm_cmd(arm, url, out, args.window, args.nav_timeout, pp, ns,
+                              echo_tries=args.echo_tries)
                 procs[arm] = (subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                                stderr=subprocess.PIPE), time.time())
             done = {}
@@ -164,15 +210,32 @@ def main():
                              (err or b"").decode("utf-8", "replace")[-200:])
             skew = round(abs(done[args.nl_arm][1] - done[args.ru_arm][1]), 1)
             skews.append(skew)
+            attempts.append({a: done[a][0] for a in done})
+            # The zone is the study's treatment axis, and it is stamped ONCE at the cell's
+            # start — so a cell that overruns its 6-hour window keeps a run_id that is wrong
+            # for its own tail. It happened on the first run of this code: the 2026-08-19
+            # day cell began 14:25Z and its last pairs landed after 15:00Z, which is MSK
+            # evening. The run_id is not rewritten (it is the join key, and the pairs before
+            # the boundary really are day) — the DRIFT is named per pair, so the consumer
+            # can drop or re-label the tail instead of trusting the id.
+            zone_now = zone_msk(datetime.now(timezone.utc))
+            drift = "" if zone_now == zone else f" ZONE-DRIFT={zone_now}(run says {zone})"
+            if drift:
+                zone_drifted.append(pp)
             say(f"rep{rep} [{idx}/{len(order)}] {domain} pair={pp} "
                 + " ".join(f"{a}=rc{done[a][0]}/{done[a][1]}s" for a in done)
-                + f" barrier_wait={skew}s total={round(time.time()-t0,1)}s")
+                + f" barrier_wait={skew}s total={round(time.time()-t0,1)}s{drift}")
             for a, (rc, _, err) in done.items():
                 if rc != 0 and err.strip():
                     say(f"    {a} stderr: {err.strip()[:200]}")
 
-    say(f"done · pairs={len(skews)} · median arm-duration gap="
-        f"{sorted(skews)[len(skews)//2] if skews else 'na'}s")
+    attempted, complete, causes = tally_pairs(attempts)
+    cause_s = (" · " + " ".join(f"{k}={v}" for k, v in sorted(causes.items()))) if causes else ""
+    say(f"done · attempted={attempted} · complete={complete} · median arm-duration gap="
+        f"{sorted(skews)[len(skews)//2] if skews else 'na'}s{cause_s}")
+    if zone_drifted:
+        say(f"WARNING zone drift: {len(zone_drifted)} of {attempted} pair(s) finished outside "
+            f"the run's `{zone}` window — {','.join(zone_drifted)}")
     say(f"out ru={out_ru} nl={out_nl}")
     log.close()
     return 0
@@ -215,6 +278,37 @@ def selftest():
     check("the RU arm carries HOME into the namespace",
           any(x.startswith("HOME=") for x in ru), True)
     nl = arm_cmd("nl-direct", "https://x.ru/", "/tmp/o", 45, 120, "p", netns=None)
+    # The echo budget is a property of the CELL, not of an arm: the same number in both.
+    check("both arms get the same echo budget",
+          ru[ru.index("--echo-tries") + 1] == nl[nl.index("--echo-tries") + 1], True)
+    check("the echo budget is passed through, not pinned",
+          arm_cmd("a", "https://x.ru/", "/tmp/o", 45, 120, "p",
+                  echo_tries=7)[-1], "7")
+
+    # A cell that overruns its zone must SAY so; the zone is the treatment axis.
+    check("14:25Z is day and 15:01Z is not, so a cell across the boundary drifts",
+          (zone_msk(dt(2026, 8, 19, 14, 25)), zone_msk(dt(2026, 8, 19, 15, 1))),
+          ("day", "evening"))
+
+    # ── the summary counts PAIRS, and a pair needs both arms ──
+    # The 2026-08-19 day cell is the case this is written from: three of fourteen attempts
+    # had no RU side at all (rc2 — the capture refusing to label an unproven vantage), and
+    # the old summary counted every attempt, so it would have reported `pairs=14`.
+    day_cell = ([{"nl-direct": 0, "ru-mobile": 0}] * 11
+                + [{"nl-direct": 0, "ru-mobile": 2}] * 3)
+    check("an attempt with one arm refused is not a pair",
+          tally_pairs(day_cell)[:2], (14, 11))
+    check("the refusal is attributed to the arm and the cause",
+          tally_pairs(day_cell)[2], {"ru-mobile:vantage-unproven": 3})
+    check("a clean cell reports no causes at all",
+          tally_pairs([{"a": 0, "b": 0}] * 4), (4, 4, {}))
+    check("arms collapsing onto one exit is a DIFFERENT cause from an unproven vantage",
+          tally_pairs([{"a": 1, "b": 0}])[2], {"a:arms-collapsed": 1})
+    check("an unnamed return code is not folded into a named one",
+          tally_pairs([{"a": 137, "b": 0}])[2], {"a:error-rc137": 1})
+    check("both arms failing is one incomplete attempt, counted twice by cause",
+          tally_pairs([{"a": 2, "b": 2}]), (1, 0, {"a:vantage-unproven": 1,
+                                                   "b:vantage-unproven": 1}))
     check("the NL arm is NOT namespaced", "netns" in nl, False)
     check("both arms are given the same pair prefix",
           ru[ru.index("--pair-prefix") + 1] == nl[nl.index("--pair-prefix") + 1], True)

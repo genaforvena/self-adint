@@ -2,7 +2,9 @@
 
 date: 2026-08-19 · by: the `adint` window · status: **frame walk in progress; the rule was
 corrected twice while running it, one paired cell was captured, and the walk's own first
-null result expired on schedule (§4).** Every count below is
+null result expired on schedule (§4). §9 adds the second cell — the first against the
+CANONICAL frame — and the three instrument defects it exposed, one of which silently cost
+that cell four of its fourteen RU loads.** Every count below is
 re-derivable — the commands are named beside each claim. Tallies are deliberately NOT typed
 in: run `python3 tools/adint-status` and `tools/adint-frame-compare`, which read the ledgers
 on disk. A number typed into prose is true on the day it is typed.
@@ -357,3 +359,98 @@ as evidence — never as admission criteria, since the study's object is Adfox a
 
 That we know anything about what the Russian header-bidding market pays. The frame holds two
 sites. Every number above is about our instrument.
+
+---
+
+## 9. The second cell, and the instrument that refuses a working vantage
+
+Added 2026-08-19 after the first cell run against the **canonical** frame
+(`ref/CANONICAL-FRAME` → `ru-mobile`, 14 admitted sites). The cell above was run on two sites
+of the *nl-direct* frame while its walk was still in progress; this is the first one on the
+frame the study actually declares.
+
+`run_id=2026-08-19-day-2026081914` · 14 sites × 1 replicate · window 45 s. Its own summary
+line said **`done · pairs=14`**. On disk:
+
+```
+data/hb-paired-2026-08-19-day-2026081914.nl.jsonl   14 loads
+data/hb-paired-2026-08-19-day-2026081914.ru.jsonl   10 loads
+```
+
+**Four of the fourteen attempts have no RU side at all**, so the cell holds ten pairs and four
+unpaired NL loads — and the number the run printed was the one that could not be checked
+against anything. Three separate defects, each of which survives every gate the tools had.
+
+### 9.1 The vantage proof fails transiently on a vantage that is working
+
+Each load verifies its own arm from inside the browser before the site is opened: read an IP
+echo, compare it to the arm's expected exit. Unread ⇒ `vantage_verified: null` ⇒ the run
+refuses (rc 2) rather than record a load it cannot label. That refusal is right, and it is not
+what went wrong. What went wrong is that **one unread echo was the whole verdict.**
+
+Measured on the RU tether during the cell (n = 8, `curl --max-time 30` to the same echo, from
+inside the `ruvantage` netns):
+
+| read the address | did not |
+|---|---|
+| 12.1 s · 12.5 s · 23.9 s · 26.3 s | 19.8 s · 19.8 s (connection failure) · 30 s · 30 s (timeout) |
+
+Four of eight — **while the same tether carried eleven 45-second captures in the same hour.**
+The echo fails transiently on a link that is up. One attempt turns that into `vantage
+unproven`, and the study loses the load.
+
+**The obvious diagnosis is wrong and worth writing down.** The module constant is
+`ECHO_TIMEOUT_MS = 12000`, every successful read above took ≥ 12.1 s, and it is very tempting
+to stop there. But that constant is overridden at startup from `--nav-timeout` — 120 s in a
+paired cell — so the browser had ten times the patience of the slowest success and still read
+nothing. Patience was never the binding constraint; raising it would have fixed nothing and
+the fix would have been reported as working, because the failure is intermittent enough to
+disappear on the next run either way.
+
+The fix is `--echo-tries` (`tools/adint-hb-capture`), default **1** — a retry is a claim about
+the link and has to be asked for — and **3** in a paired cell, *identical for both arms*. An
+allowance given only to the flaky arm is an arm difference that is not the treatment: the pair
+would then differ in how hard we tried to prove it, which is the confound pairing exists to
+remove. The attempt count is recorded on every load (`browser_egress_attempts`) and printed at
+preflight, because **a retry that hides its own count converts a degrading link into a clean
+one** — the count is the only place the degradation is visible.
+
+### 9.2 `pairs=N` counted attempts, and an attempt is not a pair
+
+An arm's return code is a cause, not a boolean: rc 2 is the refusal above (no row reaches
+disk), rc 1 is the two arms having collapsed onto one exit. Neither produced a pair and
+neither is an error in the ordinary sense, so a summary counting attempts folds three facts
+into the study's headline number. The runner now reports
+
+```
+done · attempted=14 · complete=10 · ru-mobile:vantage-unproven=4
+```
+
+`complete` counts only attempts where **every** arm recorded; the rest are attributed by arm
+and by cause, with an unrecognised return code kept as `error-rc<n>` rather than absorbed into
+a named one.
+
+### 9.3 A cell that overruns its window keeps a zone label that is wrong for its tail
+
+The MSK zone is the study's **treatment axis** and it is stamped once, at the cell's start.
+This cell began 14:25 Z (MSK day) and its last four pairs landed after 15:00 Z, which is MSK
+evening — under a `run_id` that says `day`. The id is not rewritten (it is the join key, and
+the pairs before the boundary really are day); instead each pair re-derives its own zone and
+the drift is named per pair and summarised, so a consumer can drop or re-label the tail rather
+than trust the id.
+
+### 9.4 Two contaminations, recorded because nothing else would show them
+
+- **The tether measurement above perturbed the cell it measured.** Those eight curls ran
+  14:52–14:57 Z, and the RU arm's duration for the two sites in that window jumps to 258 s and
+  240 s against a ~140 s median. The vantage probe and the capture share one HSDPA link.
+- **A concurrent `adint-frame-stageb` walk rewrote the canonical frame at 14:49 Z, mid-cell**
+  (lock pid 3516205, since exited). The admitted set is unchanged — only the header tallies
+  moved — so the cell stands, but nothing in this repository claims single-writer on a ledger
+  a running cell is reading, and the next collision need not be this harmless.
+
+### 9.5 What this does not change
+
+Nothing here is a result about the Russian market. The frame holds fourteen sites, the study
+holds ten complete pairs from one zone, and §2.3's design asks for 4480 loads per arm. Every
+fix above makes the instrument's own failures countable; none of them makes the sample bigger.

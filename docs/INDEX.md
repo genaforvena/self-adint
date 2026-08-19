@@ -26,7 +26,7 @@ demand side hand over about it for free?* Everything here is observation.
 | `step0-prebid-vantage-2026-08-16.md` | the first header-bidding sweep, and what our VANTAGE forbids us to conclude from it |
 | `step0b-ru-vantage-note3-2026-08-18.md` | building a Russian-resident mobile vantage from a rooted phone's tether; the vantage as a live cause of one bidder's silence |
 | **`step0c-hb-ru-market-study-2026-08-18.md`** | **the study's design**: the sampling frame, the schedule, the pairing, the channel confound. Start here for the current work |
-| `step0d-hb-first-cell-2026-08-19.md` | the first frame built and the first paired cell run under that design — and the three places the design did not survive contact |
+| `step0d-hb-first-cell-2026-08-19.md` | the first frame built and the first paired cell run under that design — and the three places the design did not survive contact. **§9**: the first cell on the *canonical* frame, and why its own `pairs=14` was four pairs short |
 | `prebid-local-runbook.md` | standing up prebid locally, and what counts as the artifact |
 | `REPRODUCE.md` | **the commands.** How to re-run any of the above and how to check the gates |
 
