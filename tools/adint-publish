@@ -251,9 +251,17 @@ def selftest():
     # publishing it a deliberate act rather than a widening nobody reviewed.
     check("the bid request body is NOT published", "req_body" in PAIRED_FIELDS, False)
     check("nor its length, which leaks profile size", "req_body_bytes" in PAIRED_FIELDS, False)
+    # SCHEMA 7: the QUERY STRING is the same class of evidence. A GET-based exchange carries
+    # the profile in the url, so an allowlist that stops `req_body` and lets `req_url_full`
+    # through stops nothing — it just moves the leak to the other half of the request.
+    check("nor the full query string, which is the profile for a GET exchange",
+          "req_url_full" in PAIRED_FIELDS, False)
+    check("nor its length", "req_url_bytes" in PAIRED_FIELDS, False)
     paired = {"bidder": "adriver", "outcome": "no-bid",
               "req_body": '{"user":{"buyeruid":"REAL-PERSON","ext":{"segments":[1,2]}}}',
-              "req_body_bytes": 61, "req_body_truncated": False}
+              "req_body_bytes": 61, "req_body_truncated": False,
+              "req_url_full": "https://ssp.example/rtb?uid=REAL-PERSON&seg=1,2",
+              "req_url_bytes": 47, "req_url_truncated": False}
     kept_p = {k: paired[k] for k in PAIRED_FIELDS if k in paired}
     check("a schema-6 row publishes its outcome and not the payload",
           sorted(kept_p), ["bidder", "outcome"])

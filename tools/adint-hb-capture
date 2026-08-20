@@ -67,12 +67,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # request, readable without buying the impression. It was never on disk. A schema<=5 row
 # cannot answer the profile question at all; its absence there is not evidence of an empty
 # request.
-SCHEMA = 6
+SCHEMA = 7
 # Per-body cap. OpenRTB requests here run 2-8 KB; 16 KB keeps the whole of a normal one and
 # bounds a pathological one. A truncated body is FLAGGED, never silently shortened — a
 # profile field missing because we cut the string reads exactly like a profile field the
 # exchange did not send.
 REQ_BODY_CAP = 16384
+# The SAME cap for the query string, for the same reason. `url` stays a 500-char preview so
+# every existing reader keeps working; `req_url_full` is the evidence column and carries the
+# same privacy class as the body — it is a description of one real person and does not cross
+# adint-publish's allowlist.
+REQ_URL_CAP = 16384
 OUT = os.path.join(REPO, "data", "hb-auction.jsonl")
 DOMAINS = os.path.join(REPO, "ref", "exchange-domains.tsv")
 
@@ -313,6 +318,22 @@ def _profile_age_s(profile_dir):
         return None
 
 
+def _profile_for_arm(arm, warm_arm, profile_dir):
+    """Which profile dir THIS load runs in. None means a cold, fresh context.
+
+    Without `--warm-arm` the profile applies to every load, which forces cold and warmed into
+    two separate runs at two different hours — and the hour is this market's dominant
+    confounder, so a block-assigned warming study measures the evening and calls it warming.
+    With it, one run alternates the arms per load and the profile is the only thing that
+    differs between them.
+    """
+    if profile_dir is None:
+        return None
+    if warm_arm is None:
+        return profile_dir
+    return profile_dir if arm == warm_arm else None
+
+
 def _profile_stamp(profile_dir):
     """Create the profile dir if absent and stamp its birth. Returns nothing.
 
@@ -328,6 +349,27 @@ def _profile_stamp(profile_dir):
     os.makedirs(profile_dir, exist_ok=True)
     with open(os.path.join(profile_dir, ".created"), "w") as fh:
         fh.write("%.3f" % time.time())
+
+
+def _req_url_fields(url):
+    """{req_url_full, req_url_bytes, req_url_truncated} for one request.
+
+    THE OTHER HALF OF THE REQUEST. Schema 6 kept the POST body because "the audience profile
+    arrives inside the bid request" — and then recorded the URL as `url[:500]`, so every
+    exchange that asks by GET had its question cut mid-query-string with nothing on the row
+    saying so. Measured on the 2026-08-20 cold sweep before this landed: 212 request rows sat
+    at exactly 500 chars, among them `ssp01.rambler.ru`, a real SSP that sends no body at all.
+    Its census read `no-body` and its actual question was unread.
+
+    A silent cut is the trap the body cap already names: a field missing because we cut the
+    string reads exactly like a field the exchange never sent. So the length and the cut are
+    both on the row.
+    """
+    u = url or ""
+    n = len(u)
+    return {"req_url_full": u[:REQ_URL_CAP],
+            "req_url_bytes": n,
+            "req_url_truncated": n > REQ_URL_CAP}
 
 
 def _req_body_fields(req):
@@ -696,6 +738,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                     # OWN profile and it is NOT in adint-publish's allowlist — see the gate
                     # named for it there.
                     **_req_body_fields(req),
+                    **_req_url_fields(req.url),
                     "outcome": None, "t_response_s": None, "status": None,
                 }
                 seen[req] = row
@@ -968,6 +1011,12 @@ def main():
                          "storage survive between loads). Absent = a cold profile, which is "
                          "what every load before 2026-08-20 was. The row records "
                          "profile_age_s so the two are told apart on the row, not by run")
+    ap.add_argument("--warm-arm", default=None,
+                    help="make --profile-dir apply to THIS arm only; every other arm gets a "
+                         "fresh cold context. Without it the profile applies to every load, "
+                         "which forces cold and warmed into separate runs at separate hours "
+                         "— and the hour is this market's dominant confounder, so a "
+                         "block-assigned warming study measures the evening")
     ap.add_argument("--nav-tries", type=int, default=1,
                     help="how many times a load may retry a navigation that never connected "
                          "(default 1). Chromium's own connect timeout fires around 135 s, so "
@@ -1116,7 +1165,8 @@ def main():
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
                                  arm, arm_note=args.arm_note, use_proxy=use_proxy,
                                  pair_id=pair_id, nav_tries=NAV_TRIES,
-                                 profile_dir=args.profile_dir)
+                                 profile_dir=_profile_for_arm(
+                                     arm, args.warm_arm, args.profile_dir))
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
@@ -1644,6 +1694,35 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
         ("the stamp is not rewritten on a later load, so age accumulates",
          (_profile_stamp(_aged), _profile_age_s(_aged) >= 3500)[1]),
     ]
+    # --- the query string is evidence too, and its cut must be on the row -------------
+    _long = "https://ssp.example/rtb?" + ("k=v&" * 6000)
+    _f = _req_url_fields(_long)
+    _s = _req_url_fields("https://ssp.example/rtb?k=v")
+    checks += [
+        # The mutant: go back to `url[:500]` with nothing beside it. A GET exchange's question
+        # is then cut at 500 with no flag, and 212 rows of the 2026-08-20 sweep looked whole.
+        ("a long query string is kept past 500 chars",
+         len(_f["req_url_full"]) > 500),
+        ("a cut query string SAYS it was cut, and how long it really was",
+         _f["req_url_truncated"] is True and _f["req_url_bytes"] == len(_long)),
+        ("a short url is not flagged as truncated",
+         _s["req_url_truncated"] is False and _s["req_url_bytes"] == 27),
+        ("the request row carries the full url beside the 500-char preview",
+         all(("req_url_full" in r and "req_url_bytes" in r) for r in rows)),
+    ]
+
+    checks += [
+        ("no --profile-dir means every load is cold, whatever the arm",
+         _profile_for_arm("warm", "warm", None) is None),
+        ("--warm-arm gives the profile to its own arm only",
+         _profile_for_arm("warm", "warm", "/p") == "/p"
+         and _profile_for_arm("cold", "warm", "/p") is None),
+        # Without the flag the profile applies to EVERY load — the old behaviour, kept so a
+        # single-arm warming run still works, and named so it is a choice rather than a bug.
+        ("without --warm-arm the profile applies to every arm",
+         _profile_for_arm("cold", None, "/p") == "/p"),
+    ]
+
     if live.get("warm"):
         w = live["warm"]
         checks += [

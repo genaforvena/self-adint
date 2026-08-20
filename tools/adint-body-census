@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""What does each exchange path actually ASK FOR about the person? A census of bid-request
+key paths, per exchange host, that never reports a value.
+
+WHY THIS TOOL EXISTS
+`adint-hb-capture` schema 6 keeps the bid request's raw body, because the README's thesis is
+that the audience profile arrives inside that request. A raw body answers the question but
+cannot be published: it describes one real person and this repository is public. So the
+finding and the evidence are separated here. This tool reads the private bodies and emits the
+SHAPE of each request — which key paths an exchange sends, and what kind of value sits at
+each — with the values themselves replaced by a class and a length. The shape is publishable;
+the body is not.
+
+WHAT IT REFUSES TO CONFLATE
+An exchange we never saw send a body, and an exchange whose body carries no audience field,
+are different facts, and the second is the only one that is a finding. Three states, never
+merged:
+
+    no-request    we never observed this host at all in this ledger
+    no-body       we saw requests, none carried a payload we could read (a GET, an opaque
+                  blob, a body the browser would not hand us)
+    read          we read N bodies — and only here does "carries no identity field" mean
+                  anything
+
+A GET-based exchange encodes the same profile in its QUERY STRING, so `no-body` is the
+loudest possible "look here next", not a null result.
+
+THE TAXONOMY IS A HEURISTIC AND SAYS SO
+Fields are bucketed by name (identity / segments / geo / consent / device / content). Name
+matching is a lead, not a verdict: `user.ext.eids` is an identity graph by definition, but a
+key called `sid` might be a session id or a segment id and this tool cannot tell. So every
+bucket also prints the RAW key paths it matched, and `--paths` prints the unbucketed census,
+so a reader can disagree with the bucketing without re-running the capture.
+"""
+
+import argparse
+import base64
+import collections
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+SCHEMA = 1
+
+# ── the taxonomy ──────────────────────────────────────────────────────────────────────
+# Matched against the LAST segment of a key path first, then against the whole path. Last
+# segment first because `user.ext.eids[].uids[].id` is an identity field and `imp[].id` is
+# not, and a whole-path substring match on "id" calls both of them one thing.
+LEAF = {
+    "identity": {
+        "eids", "buyeruid", "buyerid", "buyeruids", "ifa", "idfa", "gaid", "aaid", "adid",
+        "did", "dpid", "macsha1", "macmd5", "didsha1", "didmd5", "dpidsha1", "dpidmd5",
+        "yandexuid", "icookie", "puid", "uid", "uids", "userid", "user_id", "customerid",
+        "fpid", "sessionid", "ssp_user_id", "tuid", "duid", "cuid", "hid", "suid",
+    },
+    "segments": {
+        "segment", "segments", "segtax", "segclass", "keywords", "kw", "interests",
+        "audience", "audiences", "taxonomy", "topics", "cohort", "cohorts", "targeting",
+    },
+    "geo": {
+        "geo", "lat", "lon", "country", "region", "regionfips104", "city", "zip", "metro",
+        "utcoffset", "accuracy", "ipservice", "ip", "ipv6", "ip6",
+    },
+    "consent": {
+        "consent", "gdpr", "gdprapplies", "us_privacy", "usprivacy", "gpp", "gpp_sid",
+        "coppa", "dnt", "lmt", "regs",
+    },
+    "device": {
+        "ua", "sua", "devicetype", "make", "model", "os", "osv", "hwv", "language", "langb",
+        "carrier", "mccmnc", "connectiontype", "js", "h", "w", "ppi", "pxratio", "flashver",
+    },
+    "content": {
+        "cat", "sectioncat", "pagecat", "cattax", "domain", "page", "ref", "referer",
+        "referrer", "targetref", "title", "keywords_page",
+    },
+}
+# Whole-path rules, applied when the leaf did not decide. Ordered: first match wins.
+PATH = [
+    ("identity", re.compile(r"(^|\.)user\.(ext\.)?(id|eids)", re.I)),
+    ("segments", re.compile(r"(^|\.)user\.(data|ext\.data)", re.I)),
+    ("geo", re.compile(r"(^|\.)(user|device)\.geo(\.|$)", re.I)),
+    ("consent", re.compile(r"(^|\.)(regs|ext\.consent)", re.I)),
+    ("device", re.compile(r"(^|\.)device(\.|$)", re.I)),
+    ("content", re.compile(r"(^|\.)(site|app)(\.|$)", re.I)),
+]
+BUCKETS = ["identity", "segments", "geo", "consent", "device", "content"]
+
+
+def bucket(path):
+    leaf = path.rsplit(".", 1)[-1].replace("[]", "").lower()
+    for name, names in LEAF.items():
+        if leaf in names:
+            return name
+    for name, rx in PATH:
+        if rx.search(path):
+            return name
+    return None
+
+
+# ── value shapes: what KIND of thing sits there, never the thing ──────────────────────
+HEX = re.compile(r"^[0-9a-f]+$", re.I)
+B64ISH = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def shape(v):
+    """A class and a size. Never the value — this output is meant to be publishable."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, (int, float)):
+        return "num"
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return "str:empty"
+        if UUID.match(s):
+            return "uuid"
+        if len(s) >= 16 and HEX.match(s):
+            return "hex:%d" % len(s)
+        if len(s) >= 24 and B64ISH.match(s):
+            return "opaque:%d" % len(s)
+        return "str:%d" % len(s)
+    if isinstance(v, list):
+        return "list:%d" % len(v)
+    if isinstance(v, dict):
+        return "obj:%d" % len(v)
+    return type(v).__name__
+
+
+def flatten(obj, prefix="", out=None, depth=0):
+    """Dotted key paths. Arrays collapse to `[]` so ten imps are one path, not ten."""
+    out = {} if out is None else out
+    if depth > 12:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = ("%s.%s" % (prefix, k)) if prefix else str(k)
+            if isinstance(v, (dict, list)):
+                flatten(v, p, out, depth + 1)
+            else:
+                out.setdefault(p, set()).add(shape(v))
+    elif isinstance(obj, list):
+        p = prefix + "[]"
+        if not obj:
+            out.setdefault(p, set()).add("list:0")
+        for v in obj:
+            if isinstance(v, (dict, list)):
+                flatten(v, p, out, depth + 1)
+            else:
+                out.setdefault(p, set()).add(shape(v))
+    return out
+
+
+def parse_body(body):
+    """(format, flattened) — or (format, None) when the payload is real but unreadable.
+
+    None is not {}: a body we could not parse carries an unknown number of audience fields,
+    and rendering it as an empty census would publish "this exchange asks for nothing" about
+    a request we never read.
+    """
+    if body is None:
+        return None, None
+    s = body.strip()
+    if not s:
+        return "empty", {}
+    if s[0] in "{[":
+        try:
+            return "json", flatten(json.loads(s))
+        except Exception:
+            pass
+    # A urlencoded form is a real wire format here, not a fallback: several RU paths post
+    # `key=value&...` with the profile spread across the keys.
+    if "=" in s and "\n" not in s[:200]:
+        try:
+            pairs = urllib.parse.parse_qsl(s, keep_blank_values=True)
+            if pairs and all(re.match(r"^[\w.\[\]-]+$", k) for k, _ in pairs):
+                out = {}
+                for k, v in pairs:
+                    # A urlencoded value is very often itself JSON — unwrap one level, so
+                    # `data={"user":{...}}` is censused as user.* and not as one opaque blob.
+                    vs = v.strip()
+                    if vs[:1] in "{[":
+                        try:
+                            flatten(json.loads(vs), k, out)
+                            continue
+                        except Exception:
+                            pass
+                    out.setdefault(k, set()).add(shape(v))
+                return "urlencoded", out
+        except Exception:
+            pass
+    return "unparsed", None
+
+
+def census(rows):
+    """host -> {state, n_req, n_body, n_read, formats, paths{path: {shapes, n}}}"""
+    per = collections.defaultdict(lambda: {
+        "n_req": 0, "n_body": 0, "n_read": 0, "n_unparsed": 0, "n_truncated": 0,
+        "n_url_q": 0, "n_url_maybe_cut": 0,
+        "formats": collections.Counter(), "paths": {}, "qpaths": {},
+    })
+    for r in rows:
+        if r.get("kind") != "request":
+            continue
+        host = (r.get("host") or "").lower()
+        if not host:
+            continue
+        h = per[host]
+        h["n_req"] += 1
+
+        # THE QUERY STRING IS THE OTHER HALF OF THE QUESTION. A GET-based exchange puts the
+        # same profile there that a POST one puts in the body, so a census that reads only
+        # bodies reports `no-body` — indistinguishable from "asked nothing about the person"
+        # — for exactly the paths most worth reading. Schema 7 keeps the full url; a
+        # schema<=6 row has only a 500-char preview and its query census is a FLOOR, never a
+        # complete reading, which is why `url_truncated` is counted separately.
+        full = r.get("req_url_full")
+        if full is None:
+            full = r.get("url")
+            if full and len(full) >= 500:
+                h["n_url_maybe_cut"] += 1
+        if r.get("req_url_truncated"):
+            h["n_url_maybe_cut"] += 1
+        q = urllib.parse.urlsplit(full or "").query
+        if q:
+            h["n_url_q"] += 1
+            for k, v in urllib.parse.parse_qsl(q, keep_blank_values=True):
+                vs = v.strip()
+                sub = None
+                if vs[:1] in "{[":
+                    try:
+                        sub = flatten(json.loads(vs), "?" + k)
+                    except Exception:
+                        sub = None
+                if sub is None:
+                    sub = {"?" + k: {shape(v)}}
+                for pth, shapes in sub.items():
+                    e = h["qpaths"].setdefault(pth, {"n": 0, "shapes": set()})
+                    e["n"] += 1
+                    e["shapes"] |= shapes
+
+        body = r.get("req_body")
+        if body is None:
+            continue
+        h["n_body"] += 1
+        if r.get("req_body_truncated"):
+            h["n_truncated"] += 1
+        fmt, flat = parse_body(body)
+        h["formats"][fmt or "none"] += 1
+        if flat is None:
+            h["n_unparsed"] += 1
+            continue
+        h["n_read"] += 1
+        for p, shapes in flat.items():
+            e = h["paths"].setdefault(p, {"n": 0, "shapes": set()})
+            e["n"] += 1
+            e["shapes"] |= shapes
+    for h in per.values():
+        # Four states, and the middle two are the ones a body-only census merged. `url-only`
+        # is a real reading of a real question; `no-payload` is the only one that can support
+        # "this path asked nothing".
+        h["state"] = ("read" if h["n_read"] else
+                      ("url-only" if h["qpaths"] else
+                       ("no-payload" if h["n_req"] else "no-request")))
+    return per
+
+
+def buckets_of(h, half="both"):
+    """Bucket the body paths, the query paths, or both. A query path is prefixed `?`, so the
+    two halves stay distinguishable in the output rather than pooling into one claim."""
+    out = {b: [] for b in BUCKETS}
+    src = []
+    if half in ("both", "body"):
+        src += sorted(h["paths"])
+    if half in ("both", "url"):
+        src += sorted(h["qpaths"])
+    for p in src:
+        b = bucket(p.lstrip("?"))
+        if b:
+            out[b].append(p)
+    return out
+
+
+def load(paths):
+    rows, schemas = [], collections.Counter()
+    for path in paths:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                schemas[r.get("schema")] += 1
+                rows.append(r)
+    return rows, schemas
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="adint-body-census", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ledgers", nargs="*")
+    ap.add_argument("--host", help="census one host in full")
+    ap.add_argument("--paths", action="store_true",
+                    help="print every key path, unbucketed, with its value shapes")
+    ap.add_argument("--min-req", type=int, default=1,
+                    help="hide hosts seen fewer than this many times (default 1: hide none)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not args.ledgers:
+        ap.error("no ledger given")
+
+    rows, schemas = load(args.ledgers)
+    # Schema<=5 discarded the body. Reading such a ledger and reporting "no audience data"
+    # would be exactly the error the schema-6 commit was written against, so it is named.
+    old = sum(n for s, n in schemas.items() if isinstance(s, int) and s < 6)
+    per = census(rows)
+
+    if args.json:
+        out = {}
+        for host, h in per.items():
+            if h["n_req"] < args.min_req:
+                continue
+            out[host] = {
+                "state": h["state"], "n_req": h["n_req"], "n_body": h["n_body"],
+                "n_read": h["n_read"], "n_unparsed": h["n_unparsed"],
+                "n_truncated": h["n_truncated"], "formats": dict(h["formats"]),
+                "n_url_q": h["n_url_q"], "n_url_maybe_cut": h["n_url_maybe_cut"],
+                "buckets": buckets_of(h),
+                "buckets_body": buckets_of(h, "body"),
+                "buckets_url": buckets_of(h, "url"),
+                "paths": {p: {"n": e["n"], "shapes": sorted(e["shapes"])}
+                          for p, e in h["paths"].items()},
+                "qpaths": {p: {"n": e["n"], "shapes": sorted(e["shapes"])}
+                           for p, e in h["qpaths"].items()},
+            }
+        print(json.dumps({"census_schema": SCHEMA,
+                          "rows_schema<6": old, "hosts": out},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    if old:
+        print("NOTE %d row(s) come from schema<6, which parsed the body and DISCARDED it."
+              % old)
+        print("     Their silence about a profile is not evidence the request carried none.")
+        print()
+
+    if args.host:
+        h = per.get(args.host)
+        if not h:
+            print("%s: no-request — never seen in this ledger" % args.host)
+            return 0
+        print("%s  state=%s  requests=%d bodies=%d read=%d unparsed=%d truncated=%d"
+              % (args.host, h["state"], h["n_req"], h["n_body"], h["n_read"],
+                 h["n_unparsed"], h["n_truncated"]))
+        print("  formats: " + ", ".join("%s=%d" % kv for kv in h["formats"].most_common()))
+        print("  query strings read=%d  urls possibly CUT=%d"
+              % (h["n_url_q"], h["n_url_maybe_cut"]))
+        if h["n_url_maybe_cut"]:
+            print("  WARNING %d url(s) may be cut. Missing query params here are OUR limit,"
+                  % h["n_url_maybe_cut"])
+            print("          not a question the exchange did not ask.")
+        for b, ps in buckets_of(h).items():
+            print("  %-9s %s" % (b, ", ".join(ps) if ps else "—"))
+        if args.paths:
+            print("  ── body key paths ──")
+            for p in sorted(h["paths"]):
+                e = h["paths"][p]
+                print("   %-52s n=%-4d %s" % (p, e["n"], "|".join(sorted(e["shapes"]))))
+            print("  ── query key paths ──")
+            for p in sorted(h["qpaths"]):
+                e = h["qpaths"][p]
+                print("   %-52s n=%-4d %s" % (p, e["n"], "|".join(sorted(e["shapes"]))))
+        return 0
+
+    hdr = ("%-30s %-10s %5s %5s %5s  %s"
+           % ("host", "state", "req", "body", "url?", "audience buckets"))
+    print(hdr)
+    print("-" * len(hdr))
+    for host, h in sorted(per.items(), key=lambda kv: (-kv[1]["n_read"], -kv[1]["n_req"])):
+        if h["n_req"] < args.min_req:
+            continue
+        bs = buckets_of(h)
+        mark = " ".join(("%s:%d" % (b[:4], len(bs[b]))) for b in BUCKETS if bs[b]) or "—"
+        cut = "!" if h["n_url_maybe_cut"] else " "
+        print("%-30s %-10s %5d %5d %4d%s  %s"
+              % (host[:30], h["state"], h["n_req"], h["n_read"], h["n_url_q"], cut, mark))
+    return 0
+
+
+def selftest():
+    ok = True
+    checks = []
+
+    # The three states must never merge.
+    per = census([
+        {"kind": "request", "host": "a.example", "req_body": '{"user":{"id":"x"}}'},
+        {"kind": "request", "host": "b.example", "req_body": None},
+        {"kind": "request", "host": "c.example", "req_body": "\x00\x01binary"},
+    ])
+    checks.append(("a host with a readable body is `read`", per["a.example"]["state"] == "read"))
+    checks.append(("a host we saw send no payload at all is `no-payload`, not `read`",
+                   per["b.example"]["state"] == "no-payload"))
+    checks.append(("a host never seen is absent, so the caller renders no-request",
+                   "z.example" not in per))
+    # THE CENTRAL REFUSAL: an unreadable payload must not census as an empty request.
+    checks.append(("an unparsed body is NOT counted as read",
+                   per["c.example"]["state"] == "no-payload"
+                   and per["c.example"]["n_unparsed"] == 1
+                   and per["c.example"]["paths"] == {}))
+
+    # THE GET EXCHANGE. Body-only censusing filed these as "sent nothing" — the loudest
+    # possible wrong answer, since the query string IS the bid request for such a path.
+    perq = census([
+        {"kind": "request", "host": "g.example", "req_body": None,
+         "req_url_full": "https://g.example/rtb?uid=abc123&segments=%5B1%2C2%5D&gdpr=1"},
+        # schema<=6: only a 500-char preview exists, and it sits AT the cap.
+        {"kind": "request", "host": "old.example", "req_body": None,
+         "url": "https://old.example/rtb?" + "k=v&" * 130},
+    ])
+    checks.append(("a GET exchange with query params is `url-only`, never `no-payload`",
+                   perq["g.example"]["state"] == "url-only"))
+    checks.append(("a query param is censused under a `?` prefix, so the halves never pool",
+                   "?uid" in perq["g.example"]["qpaths"]))
+    checks.append(("a query param's value is a shape, never the value",
+                   perq["g.example"]["qpaths"].get("?uid", {}).get("shapes") == {"str:6"}))
+    checks.append(("a JSON-valued query param is unwrapped, not left opaque",
+                   "?segments[]" in perq["g.example"]["qpaths"]))
+    checks.append(("query params bucket like body fields",
+                   buckets_of(perq["g.example"], "url")["consent"] == ["?gdpr"]))
+    # A url read from a 500-char preview is a FLOOR. Saying so is the whole point: absent
+    # params there are OUR cut, not the exchange's silence.
+    checks.append(("a url at the schema<=6 preview cap is counted as possibly CUT",
+                   perq["old.example"]["n_url_maybe_cut"] == 1))
+    checks.append(("an uncut short url is not flagged",
+                   perq["g.example"]["n_url_maybe_cut"] == 0))
+
+    # Values never appear in the output.
+    flat = flatten({"user": {"buyeruid": "8f14e45fceea167a5a36dedd4bea2543",
+                             "geo": {"lat": 55.75}},
+                    "imp": [{"id": "1"}, {"id": "2"}]})
+    checks.append(("an identifier is reported as a shape, never as its value",
+                   flat["user.buyeruid"] == {"hex:32"}))
+    checks.append(("an array collapses to one path, not one per element",
+                   [k for k in flat if k.startswith("imp")] == ["imp[].id"]))
+    checks.append(("no output string contains the identifier itself",
+                   not any("8f14e45f" in s for s in json.dumps(
+                       {k: sorted(v) for k, v in flat.items()}))))
+
+    # Bucketing: the leaf decides before the path, else every `id` is an identity.
+    checks.append(("imp[].id is not an identity field", bucket("imp[].id") is None))
+    checks.append(("user.ext.eids[].uids[].id IS an identity field",
+                   bucket("user.ext.eids[].uids[].id") == "identity"))
+    checks.append(("device.ip is geo, not content", bucket("device.ip") == "geo"))
+    checks.append(("regs.ext.gdpr is consent", bucket("regs.ext.gdpr") == "consent"))
+    checks.append(("site.page is content, never audience", bucket("site.page") == "content"))
+
+    # urlencoded is a real wire format, and a JSON value inside it is unwrapped.
+    fmt, flat2 = parse_body('sid=99&data={"user":{"segment":["a","b"]}}')
+    checks.append(("a urlencoded body is parsed, not filed unparsed", fmt == "urlencoded"))
+    checks.append(("JSON nested inside a urlencoded value is censused, not left opaque",
+                   "data.user.segment[]" in (flat2 or {})))
+
+    # A truncated body is flagged, because a field missing because we cut the string reads
+    # exactly like a field the exchange never sent.
+    per2 = census([{"kind": "request", "host": "t.example", "req_body": '{"a":1}',
+                    "req_body_truncated": True}])
+    checks.append(("a truncated body is counted as truncated",
+                   per2["t.example"]["n_truncated"] == 1))
+
+    for name, good in checks:
+        print(("ok   " if good else "FAIL ") + name)
+        ok = ok and good
+    print("--test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
