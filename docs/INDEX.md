@@ -27,6 +27,7 @@ demand side hand over about it for free?* Everything here is observation.
 | `step0b-ru-vantage-note3-2026-08-18.md` | building a Russian-resident mobile vantage from a rooted phone's tether; the vantage as a live cause of one bidder's silence |
 | **`step0c-hb-ru-market-study-2026-08-18.md`** | **the study's design**: the sampling frame, the schedule, the pairing, the channel confound. Start here for the current work |
 | `step0d-hb-first-cell-2026-08-19.md` | the first frame built and the first paired cell run under that design — and the three places the design did not survive contact. **§9**: the first cell on the *canonical* frame, and why its own `pairs=14` was four pairs short |
+| **`step0e-bid-request-audience-2026-08-20.md`** | **what the bid request actually SAYS about the person.** The payload was never read before this: schemas 1–5 parsed it and threw it away, and schema 6 kept the body while cutting every GET exchange's query string at 500 chars. Answers the README's thesis with a refinement and a negative — 18 of 23 bid-request paths carry no audience field at all, and the identity that does travel is the wrapper operator's |
 | `prebid-local-runbook.md` | standing up prebid locally, and what counts as the artifact |
 | `REPRODUCE.md` | **the commands.** How to re-run any of the above and how to check the gates |
 
