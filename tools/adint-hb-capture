@@ -296,6 +296,40 @@ def parse_response(body_text):
     return "priced", {"prices": prices, "currency": cur, "has_seatbid": has_seatbid}
 
 
+def _profile_age_s(profile_dir):
+    """Seconds since this profile was created. 0 means COLD — no history at all.
+
+    Read from a stamp file written at creation, never from the directory mtime: mtime moves
+    every time the browser writes a cookie, which would make an OLD profile look newly born
+    exactly when it is most warmed.
+    """
+    if not profile_dir:
+        return 0
+    stamp = os.path.join(profile_dir, ".created")
+    try:
+        with open(stamp) as fh:
+            return max(0, int(time.time() - float(fh.read().strip())))
+    except Exception:
+        return None
+
+
+def _profile_stamp(profile_dir):
+    """Create the profile dir if absent and stamp its birth. Returns nothing.
+
+    The stamp is written ONLY when we create the directory. A dir that already exists without
+    a stamp is a profile whose age we genuinely do not know, and `_profile_age_s` must keep
+    rendering that as None: stamping it here would date it from first USE and report a warmed
+    profile as newborn — the treatment axis reading zero exactly where the treatment is
+    strongest. Nothing wrote this stamp until 2026-08-20, so every persistent profile scored
+    None and cold/warmed were indistinguishable on the row.
+    """
+    if not profile_dir or os.path.exists(profile_dir):
+        return
+    os.makedirs(profile_dir, exist_ok=True)
+    with open(os.path.join(profile_dir, ".created"), "w") as fh:
+        fh.write("%.3f" % time.time())
+
+
 def _req_body_fields(req):
     """{req_body, req_body_bytes, req_body_truncated} for one request.
 
@@ -526,7 +560,8 @@ def pair_key(prefix, index):
 
 
 def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_note=None,
-            use_proxy=True, vantage_probe=True, pair_id=None, nav_tries=None):
+            use_proxy=True, vantage_probe=True, pair_id=None, nav_tries=None,
+            profile_dir=None):
     """One page load. Returns (load_row, request_rows).
 
     `nav_tries` defaults to NAV_TRIES (1). Resolved here, never in the signature, so the
@@ -541,6 +576,9 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
     coincidence. The two arms are launched with the same --pair-id; a run with no pairing
     leaves it null rather than inventing a key that would make unpaired rows look paired."""
     load_id = uuid.uuid4().hex[:12]
+    # Stamp BEFORE the age is read into the row below, else the profile's very first load
+    # reports None instead of the 0 it actually is.
+    _profile_stamp(profile_dir)
     t_wall = datetime.now(timezone.utc)
     load = {
         # schema 2 added evidence_strength (protocol vs attribution-only) and the
@@ -570,9 +608,16 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         "egress_ip_proxied": ip.get("egress_ip_proxied") if isinstance(ip, dict) else None,
         "egress_ip_direct": ip.get("egress_ip_direct") if isinstance(ip, dict) else None,
         "proxy_env": ip.get("proxy_env") if isinstance(ip, dict) else None,
-        # Fresh context per load: the profile has no history, so cookie age can never become
-        # an unrecorded covariate. It is stated rather than assumed.
-        "profile_age_s": 0, "window_s": settle,
+        # PROFILE AGE IS THE TREATMENT, not a constant. Until 2026-08-20 this field was
+        # hardcoded 0 and the comment below explained why that was safe — a fresh context per
+        # load means cookie age cannot become an unrecorded covariate. True, and it also made
+        # the study permanently blind to the variable the README's thesis is ABOUT: a bid
+        # request describes an audience, and a browser with no history has no audience to
+        # describe. With --profile-dir the age is the real age of that profile in seconds, so
+        # cold and warmed rows are distinguishable on the row rather than by which run
+        # produced them.
+        "profile_age_s": _profile_age_s(profile_dir), "window_s": settle,
+        "profile_dir": os.path.basename(profile_dir) if profile_dir else None,
     }
     rows = []
     seen = {}      # playwright Request -> row
@@ -597,11 +642,23 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         # is kept because it is harmless and states the intent.
         launch_env = None if use_proxy else {
             k: v for k, v in os.environ.items() if k not in PROXY_VARS}
-        browser = pw.chromium.launch(headless=not headed,
-                                     args=[] if use_proxy else ["--no-proxy-server"],
-                                     **({} if launch_env is None else {"env": launch_env}))
-        ctx = browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow",
-                                  viewport={"width": 1366, "height": 900})
+        ctx_args = dict(locale="ru-RU", timezone_id="Europe/Moscow",
+                        viewport={"width": 1366, "height": 900})
+        if profile_dir:
+            # A persistent context IS the browser — there is no separate browser object to
+            # close, and closing the context is what flushes cookies to disk. Getting that
+            # wrong loses the warming between runs, which would silently turn the treatment
+            # arm back into the control.
+            ctx = pw.chromium.launch_persistent_context(
+                profile_dir, headless=not headed,
+                args=[] if use_proxy else ["--no-proxy-server"],
+                **({} if launch_env is None else {"env": launch_env}), **ctx_args)
+            browser = None
+        else:
+            browser = pw.chromium.launch(headless=not headed,
+                                         args=[] if use_proxy else ["--no-proxy-server"],
+                                         **({} if launch_env is None else {"env": launch_env}))
+            ctx = browser.new_context(**ctx_args)
         # The arm is verified from INSIDE the browser, per load, before the site is opened.
         # A launch flag is an intention and the parent's curl measures the parent; neither is
         # this browser's vantage. Missing renders null — never the expected value.
@@ -789,6 +846,9 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         except Exception:
             pass
         try:
+            # None for a persistent context: the ctx close above already tore it down AND
+            # flushed its cookies. Calling close on a missing browser would raise inside the
+            # finally and mask whatever real error brought us here.
             if browser:
                 browser.close()
         except Exception:
@@ -903,6 +963,11 @@ def main():
                     help="seconds the browser gets to read the IP echo (default: --nav-timeout, "
                          "min 12). Raise it on a slow vantage; it changes the patience, not the "
                          "gate — an unread echo still refuses the run")
+    ap.add_argument("--profile-dir", default=None,
+                    help="run in a PERSISTENT browser profile at this path (cookies and "
+                         "storage survive between loads). Absent = a cold profile, which is "
+                         "what every load before 2026-08-20 was. The row records "
+                         "profile_age_s so the two are told apart on the row, not by run")
     ap.add_argument("--nav-tries", type=int, default=1,
                     help="how many times a load may retry a navigation that never connected "
                          "(default 1). Chromium's own connect timeout fires around 135 s, so "
@@ -1050,7 +1115,8 @@ def main():
             pair_id = pair_key(args.pair_prefix, i)
             load, rows = capture(pw, u, args.settle, args.nav_timeout, ip, args.run_idx,
                                  arm, arm_note=args.arm_note, use_proxy=use_proxy,
-                                 pair_id=pair_id)
+                                 pair_id=pair_id, nav_tries=NAV_TRIES,
+                                 profile_dir=args.profile_dir)
             with open(args.out, "a") as fh:
                 fh.write(json.dumps(load, ensure_ascii=False) + "\n")
                 for r in rows:
@@ -1083,6 +1149,7 @@ def selftest(sync_playwright):
     """
     import http.server
     import socketserver
+    import tempfile as _tf
     import threading
 
     ok = True
@@ -1159,6 +1226,8 @@ def selftest(sync_playwright):
             elif self.path.startswith("/binary"):
                 self._send(200, bytes([0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe, 0x00, 0x80]),
                            "application/octet-stream")
+            elif self.path.startswith("/warm"):
+                self._send(200, b'{"ok":1}')
             elif self.path.startswith("/silent"):
                 # Answers long after the capture window closes: asked, never answered.
                 time.sleep(60)
@@ -1238,10 +1307,17 @@ fetch('{base}/beacon?evt=pageview', {{method: 'POST', body: '{{"evt":"pv"}}'}}).
 fetch('{base}/binary?evt=px', {{method: 'POST', body: '{{"evt":"px"}}'}}).catch(function(e) {{}});
 // The network failing is not a bidder going quiet.
 fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[{{"id":"1"}}]}}'}}).catch(function(e) {{}});
+// THE WARMING PROBE. Reports the cookie jar as it was found, BEFORE writing to it — a report
+// taken after the write says '1' on a cold profile too, which is exactly the reading that
+// would make a broken persistent context look like a working one.
+fetch('{base}/warm', {{method: 'POST',
+                       body: JSON.stringify({{cookie_before: document.cookie}})}}).catch(function(e) {{}});
+document.cookie = 'adint_warm=1; path=/; max-age=3600';
 </script></body></html>"""
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-    live = {"ran": False, "proxied": None, "direct": None, "load": None, "why": None}
+    live = {"ran": False, "proxied": None, "direct": None, "load": None, "why": None,
+            "warm": None}
     try:
         with sync_playwright() as pw:
             load, rows = capture(pw, f"{base}/page", 2, 20,
@@ -1257,6 +1333,34 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
                                       "proxy_env": "http://127.0.0.1:8118"}, 7, "direct",
                                      use_proxy=False, vantage_probe=False,
                                      pair_id=pair_key("t", 4))
+            # PERSISTENT PROFILE: two loads on one dir. The second must FIND the cookie the
+            # first left, which is the only evidence the context persisted anything — a
+            # profile flag that silently fell back to an ephemeral context would turn the
+            # warmed arm back into the control while every row still said `warm`.
+            _pdir = os.path.join(_tf.mkdtemp(prefix="adint-warm-gate-"), "p")
+            warm1, wrows1 = capture(pw, f"{base}/page", 2, 20,
+                                    {"egress_ip_proxied": "p", "egress_ip_direct": "d",
+                                     "proxy_env": None}, 7, "warm",
+                                    vantage_probe=False, profile_dir=_pdir)
+            warm2, wrows2 = capture(pw, f"{base}/page", 2, 20,
+                                    {"egress_ip_proxied": "p", "egress_ip_direct": "d",
+                                     "proxy_env": None}, 8, "warm",
+                                    vantage_probe=False, profile_dir=_pdir)
+
+            def _warm_cookie(rs):
+                for r in rs:
+                    if "/warm" in (r.get("url") or ""):
+                        try:
+                            return json.loads(r.get("req_body") or "{}").get("cookie_before")
+                        except Exception:
+                            return None
+                return None
+
+            live["warm"] = {
+                "age1": warm1.get("profile_age_s"), "dir1": warm1.get("profile_dir"),
+                "c1": _warm_cookie(wrows1), "c2": _warm_cookie(wrows2),
+            }
+
             # THE LIVE LEG. Everything above runs against 127.0.0.1, which Chromium exempts
             # from any proxy — so a localhost fixture cannot tell a bypassed proxy from an
             # obeyed one, and the two legs above would pass unchanged with the browser going
@@ -1515,6 +1619,47 @@ fetch('http://127.0.0.1:{dead_port}/refused', {{method: 'POST', body: '{{"imp":[
         ("the arm note travels on every row, not just the load",
          all("arm_note" in r for r in rows)),
     ]
+
+    # --- profile age: the treatment axis must be READABLE ON THE ROW -----------------
+    # Nothing wrote the `.created` stamp until 2026-08-20, so every persistent profile
+    # scored None and a warmed run was indistinguishable from a cold one on the row.
+    # The mutant to run against these four: delete the `_profile_stamp` call in capture().
+    _tmp = _tf.mkdtemp(prefix="adint-profile-gate-")
+    _fresh = os.path.join(_tmp, "fresh")
+    _profile_stamp(_fresh)
+    _unstamped = os.path.join(_tmp, "unstamped")
+    os.makedirs(_unstamped)
+    _aged = os.path.join(_tmp, "aged")
+    _profile_stamp(_aged)
+    with open(os.path.join(_aged, ".created"), "w") as _fh:
+        _fh.write("%.3f" % (time.time() - 3600))
+    checks += [
+        ("no profile dir is COLD — age 0, not unknown", _profile_age_s(None) == 0),
+        ("a profile we created reads age 0, not None",
+         _profile_age_s(_fresh) == 0),
+        # The trap this exists for: stamping on first USE would date an old profile from now
+        # and report the most-warmed arm as newborn. Unknown must stay unknown.
+        ("a profile dir we did NOT create reads None, never 0",
+         _profile_age_s(_unstamped) is None),
+        ("the stamp is not rewritten on a later load, so age accumulates",
+         (_profile_stamp(_aged), _profile_age_s(_aged) >= 3500)[1]),
+    ]
+    if live.get("warm"):
+        w = live["warm"]
+        checks += [
+            # Against the mutant "delete the _profile_stamp call in capture()": playwright
+            # creates the dir itself, so the row's age falls back to None and this goes red.
+            ("a persistent profile's FIRST load is stamped, so the row says 0 not unknown",
+             w["age1"] == 0 and w["dir1"] == "p"),
+            # Against the mutant "use browser.new_context instead of
+            # launch_persistent_context": nothing survives and c2 is empty like c1.
+            ("the first load of a fresh profile finds an EMPTY cookie jar", w["c1"] == ""),
+            ("the second load FINDS the first load's cookie — the profile really persisted",
+             "adint_warm=1" in (w["c2"] or "")),
+        ]
+    else:
+        print("SKIP the persistent-profile leg: it did not run")
+
     if live["ran"]:
         checks += [
             # RED against the mutant: drop the env strip in capture() (flag only, the way
