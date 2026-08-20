@@ -1,14 +1,13 @@
 ---
 title: I went looking for my ad profile inside the bid request. It wasn't there.
 tags: privacy, adtech, opensource, datascience
-canonical_url: https://github.com/genaforvena/self-adint
 ---
 
-When an ad is auctioned for your phone, a bid request goes out that describes *you* —
+When an ad is auctioned for you, a bid request goes out that describes *you* —
 segments, identity graphs, consent state, location precision. Buyers see that description for
 free, before anyone pays for anything.
 
-So I tried to read mine. One operator, one phone, his own data, everything public:
+So I tried to read mine. One operator, one browser, my own data, everything public:
 [genaforvena/self-adint](https://github.com/genaforvena/self-adint), data CC0.
 
 The result is a negative for the naive form of that idea, and the negative is more interesting
