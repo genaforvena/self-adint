@@ -481,6 +481,23 @@ _ECHO_BODY_MAX = 64
 _ECHO_RE = re.compile(r"""^["'\s]*([0-9a-fA-F:.]{7,45})["'\s]*$""")
 
 
+# One echo is a single point of failure for BOTH arms at once. Measured over the 28 pairs of
+# the 2026-08-20 night cell: rep1 ran 14/14 with both arms proven on Yandex's echo, then rep2
+# lost 13 of 14 RU arms AND 3 us-exit arms to that same host going unreadable — the border did
+# not move and the parse did not change, the host did. So the answer is SEVERAL echoes, and the
+# cheap way to spend them is across the ATTEMPTS that already exist: attempt i asks host
+# i % len(hosts), so `--echo-tries 3` over three hosts costs three reads, not nine. Hammering
+# one host three times is the one arrangement that cannot survive that host being down.
+def echo_hosts(echo=None):
+    """The echo URLs to try, in order. A single URL behaves exactly as it always has."""
+    raw = IP_ECHO if echo is None else echo
+    if isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        parts = str(raw).split(",")
+    return [h.strip() for h in parts if h and h.strip()] or [IP_ECHO]
+
+
 def echo_ip(txt):
     """The address an echo body states, or None if it does not state exactly one."""
     if txt is None:
@@ -493,12 +510,16 @@ def echo_ip(txt):
 
 
 def _curl_ip(env, timeout=15):
-    try:
-        r = subprocess.run(["curl", "-s", "--max-time", str(timeout), IP_ECHO],
-                           capture_output=True, text=True, timeout=timeout + 5, env=env)
-        return echo_ip(r.stdout)
-    except Exception:
-        return None
+    for host in echo_hosts():
+        try:
+            r = subprocess.run(["curl", "-s", "--max-time", str(timeout), host],
+                               capture_output=True, text=True, timeout=timeout + 5, env=env)
+            got = echo_ip(r.stdout)
+            if got is not None:
+                return got
+        except Exception:
+            continue
+    return None
 
 
 def egress_ips(timeout=15):
@@ -575,12 +596,13 @@ def echo_read(ctx, timeout_ms=None, echo=None, tries=None, pause_s=None):
         tries = ECHO_TRIES
     if pause_s is None:
         pause_s = ECHO_ATTEMPT_PAUSE_S
+    hosts = echo_hosts(echo)
     attempts = 0
     for i in range(max(1, tries)):
         if i:
             time.sleep(pause_s)
         attempts += 1
-        got = _echo_once(ctx, timeout_ms, echo)
+        got = _echo_once(ctx, timeout_ms, hosts[i % len(hosts)])
         if got is not None:
             return got, attempts
     return None, attempts
@@ -1024,9 +1046,12 @@ def main():
                          "an arm `direct` does NOT make the run direct — the arm is a label "
                          "and this is the switch")
     ap.add_argument("--ip-echo",
-                    help="URL returning a bare IP, used for BOTH the parent's curl and the "
-                         "browser's read (default https://api.ipify.org). Change it when the "
-                         "vantage's resolver mangles the default's records — see IP_ECHO")
+                    help="comma-separated URL(s) returning a bare IP (the address may be "
+                         "quoted), used for BOTH the parent's curl and the browser's read "
+                         "(default https://api.ipify.org). Give SEVERAL: attempt i asks host "
+                         "i %% len(hosts), so the retries you already pay for buy host "
+                         "diversity instead of hammering one. Change it when the vantage "
+                         "cannot reach or its resolver mangles the default — see IP_ECHO")
     ap.add_argument("--echo-timeout", type=int,
                     help="seconds the browser gets to read the IP echo (default: --nav-timeout, "
                          "min 12). Raise it on a slow vantage; it changes the patience, not the "
@@ -1520,6 +1545,41 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
 
     quoted_read = echo_read(_QuotedEcho(), timeout_ms=1, tries=1, pause_s=0)
 
+    class _HostEcho:
+        """Records which echo each ATTEMPT asked, and answers for one host only."""
+
+        def __init__(self, answers_for=None):
+            self.answers_for = answers_for
+            self.visited = []
+
+        def new_page(self):
+            outer = self
+
+            class _P:
+                def goto(self, url, **kw):
+                    outer.visited.append(url)
+                    if url != outer.answers_for:
+                        raise RuntimeError("net::ERR_CONNECTION_TIMED_OUT")
+
+                def inner_text(self, sel):
+                    return "91.79.81.62"
+
+                def close(self):
+                    pass
+            return _P()
+
+    rot_c = _HostEcho(answers_for="C")
+    rot_read = echo_read(rot_c, timeout_ms=1, echo="A,B,C", tries=3, pause_s=0)
+    rot_b = _HostEcho(answers_for="B")
+    rot_b_read = echo_read(rot_b, timeout_ms=1, echo="A,B", tries=2, pause_s=0)
+    one_host = _HostEcho(answers_for=None)
+    one_read = echo_read(one_host, timeout_ms=1, echo="A", tries=3, pause_s=0)
+    # Nothing answers: the ONLY arrangement in which the read budget is visible. With a host
+    # that answers, rotating and trying-all-per-attempt both stop at the same read, so a
+    # budget gate written against a working host passes under both and asserts nothing.
+    dead_all = _HostEcho(answers_for=None)
+    dead_all_read = echo_read(dead_all, timeout_ms=1, echo="A,B,C", tries=3, pause_s=0)
+
     flaky_1try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=1, pause_s=0)
     flaky_3try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=3, pause_s=0)
     dead_3try = echo_read(_FlakyEcho(99), timeout_ms=1, tries=3, pause_s=0)
@@ -1554,6 +1614,24 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
          echo_ip('"' * 200 + "91.79.81.62" + '"' * 200) is None),
         ("a body that states no address is unread",
          echo_ip("null") is None and echo_ip("") is None and echo_ip(None) is None),
+        # ── several echoes (2026-08-20 night cell) ──
+        # RED gate: hammering ONE host is the arrangement that cannot survive that host being
+        # down, and that is what cost rep2 13 of 14 RU arms and 3 us-exit arms.
+        ("a dead host is covered by the next one on the following attempt",
+         rot_b_read == ("91.79.81.62", 2)),
+        ("the attempts rotate hosts instead of repeating one",
+         rot_read == ("91.79.81.62", 3) and rot_c.visited == ["A", "B", "C"]),
+        # Diversity must not be bought by spending more reads than the caller asked for:
+        # three hosts x three tries is THREE reads, not nine.
+        ("three dead hosts over three tries costs three reads, not nine",
+         dead_all_read == (None, 3) and dead_all.visited == ["A", "B", "C"]),
+        # A single echo must behave exactly as it always has.
+        ("one host is still asked on every attempt, and still refuses",
+         one_read == (None, 3) and one_host.visited == ["A", "A", "A"]),
+        ("the host list drops blanks and keeps order",
+         echo_hosts("a, b ,,") == ["a", "b"] and echo_hosts(["x", "y"]) == ["x", "y"]),
+        ("no host given falls back to the module default",
+         echo_hosts() == [IP_ECHO] and echo_hosts("") == [IP_ECHO]),
         # ── the pair key (step0c §2.4) ──
         # Reconstructing pairs by timestamp is what this replaces, so the assertion is that
         # two SEPARATE capture() calls — different load_ids, different arms — carry the same
