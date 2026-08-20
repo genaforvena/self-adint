@@ -399,6 +399,52 @@ def buckets_of(h, half="both"):
     return out
 
 
+def by_arm(rows):
+    """{arm: census}. The arm is read from the ROW, never from which file it came in.
+
+    A warming study's whole content is a difference between two arms, and the difference that
+    matters is which key paths APPEAR — `user.eids[]` sitting empty on a cold profile and
+    populated on a warmed one is the README's thesis in one field. Splitting by row keeps a
+    single interleaved ledger (one hour, one vantage) as the unit, instead of two runs whose
+    difference includes the hour.
+    """
+    per = collections.defaultdict(list)
+    for r in rows:
+        per[r.get("arm")].append(r)
+    return {arm: census(rs) for arm, rs in per.items()}
+
+
+def arm_diff(a, b, host):
+    """(only_in_a, only_in_b, shape_changed) for one host across two arm censuses.
+
+    A host absent from an arm yields NO diff rather than "everything is new": the two arms
+    load different pages at different moments and an exchange that simply did not appear is
+    not a field that arrived.
+    """
+    ha, hb = a.get(host), b.get(host)
+    if not ha or not hb:
+        return None
+    pa = dict(ha["paths"]); pa.update({k: v for k, v in ha["qpaths"].items()})
+    pb = dict(hb["paths"]); pb.update({k: v for k, v in hb["qpaths"].items()})
+    only_a = sorted(set(pa) - set(pb))
+    only_b = sorted(set(pb) - set(pa))
+    changed = sorted(k for k in set(pa) & set(pb)
+                     if pa[k]["shapes"] != pb[k]["shapes"])
+
+    # AN EMPTY ARRAY THAT FILLS UP LOOKS LIKE A FIELD THAT VANISHED. `flatten` collapses
+    # `"eids": []` to the single path `user.eids[]` and `"eids":[{"source":…}]` to
+    # `user.eids[].source`, so the arrival of an identity graph renders as
+    #   - only under cold   user.eids[]
+    #   + only under warm   user.eids[].source
+    # and the minus line reads as LOSS when it is the exact gain the study is looking for.
+    # Named `filled` and lifted out of `only_a`, because the sign is the finding.
+    filled = sorted(k for k in only_a
+                    if any(q.startswith(k + ".") or q.startswith(k[:-2] + "[].")
+                           for q in only_b))
+    only_a = [k for k in only_a if k not in set(filled)]
+    return only_a, only_b, changed, filled
+
+
 def load(paths):
     rows, schemas = [], collections.Counter()
     for path in paths:
@@ -421,6 +467,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ledgers", nargs="*")
     ap.add_argument("--host", help="census one host in full")
+    ap.add_argument("--by-arm", nargs=2, metavar=("BASE", "OTHER"),
+                    help="split the ledger by the row's `arm` and diff two of them: which "
+                         "key paths appear only under OTHER, and which changed value shape")
     ap.add_argument("--decode", action="store_true",
                     help="open one layer inside opaque values (base64, then gzip/zlib) and "
                          "census what is in there, marked `~b64`. Still shapes, never "
@@ -474,6 +523,50 @@ def main():
               % old)
         print("     Their silence about a profile is not evidence the request carried none.")
         print()
+
+    if args.by_arm:
+        base, other = args.by_arm
+        arms = by_arm(rows)
+        missing = [a for a in (base, other) if a not in arms]
+        if missing:
+            print("arm(s) not in this ledger: " + ", ".join(missing))
+            print("present: " + ", ".join(sorted(str(a) for a in arms)))
+            return 2
+        A, B = arms[base], arms[other]
+        na = sum(1 for r in rows if r.get("arm") == base and r.get("kind") == "load")
+        nb = sum(1 for r in rows if r.get("arm") == other and r.get("kind") == "load")
+        print("%s: %d load(s)   %s: %d load(s)" % (base, na, other, nb))
+        print("hosts in both: %d   only %s: %d   only %s: %d"
+              % (len(set(A) & set(B)), base, len(set(A) - set(B)),
+                 other, len(set(B) - set(A))))
+        print()
+        for host in sorted(set(A) & set(B)):
+            d = arm_diff(A, B, host)
+            if d is None:
+                continue
+            only_a, only_b, changed, filled = d
+            if not (only_a or only_b or changed or filled):
+                continue
+            print("%s" % host)
+            for p in filled:
+                print("   * FILLED under %-5s %-46s was %s"
+                      % (other, p, "|".join(sorted(
+                          (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]))))
+            for p in only_b:
+                print("   + only under %-6s %-46s %s"
+                      % (other, p, "|".join(sorted(
+                          (B[host]["paths"].get(p) or B[host]["qpaths"][p])["shapes"]))))
+            for p in only_a:
+                print("   - only under %-6s %-46s %s"
+                      % (base, p, "|".join(sorted(
+                          (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]))))
+            for p in changed:
+                sa = (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]
+                sb = (B[host]["paths"].get(p) or B[host]["qpaths"][p])["shapes"]
+                print("   ~ %-58s %s -> %s"
+                      % (p, "|".join(sorted(sa)), "|".join(sorted(sb))))
+            print()
+        return 0
 
     if args.host:
         h = per.get(args.host)
@@ -618,6 +711,38 @@ def selftest():
                     "req_body_truncated": True}])
     checks.append(("a truncated body is counted as truncated",
                    per2["t.example"]["n_truncated"] == 1))
+
+    # --- by-arm: the warming study's whole content is a diff between two arms ----------
+    _rows = [
+        {"kind": "request", "arm": "cold", "host": "x.example",
+         "req_body": '{"user":{"eids":[],"id":"a"}}'},
+        {"kind": "request", "arm": "warm", "host": "x.example",
+         "req_body": '{"user":{"eids":[{"source":"s"}],"id":"a","data":[{"segment":[1]}]}}'},
+        # An exchange that appeared in only one arm. Two arms load different pages at
+        # different moments; a host that simply did not show up is NOT a field that arrived.
+        {"kind": "request", "arm": "warm", "host": "only-warm.example",
+         "req_body": '{"user":{"id":"z"}}'},
+    ]
+    _arms = by_arm(_rows)
+    _rows[0]["req_body"] = '{"user":{"eids":[],"id":"a"}}'
+    _rows[1]["req_body"] = ('{"user":{"eids":[{"source":"s"}],'
+                            '"id":"8f14e45fceea167a5a36dedd4bea2543",'
+                            '"data":[{"segment":[1]}]}}')
+    _arms = by_arm(_rows)
+    _d = arm_diff(_arms["cold"], _arms["warm"], "x.example")
+    checks += [
+        ("the arm comes from the ROW, so one interleaved ledger splits cleanly",
+         sorted(_arms) == ["cold", "warm"]),
+        ("a path present only under the warmed arm is reported as arriving",
+         "user.data[].segment[]" in _d[1]),
+        ("a path whose value SHAPE changed is reported, not just new paths",
+         "user.id" in _d[2]),
+        # The sign is the finding: an identity graph arriving must not render as loss.
+        ("an empty array that FILLS is reported as filled, never as a path that vanished",
+         _d[3] == ["user.eids[]"] and "user.eids[]" not in _d[0]),
+        ("a host seen in only one arm yields no diff, never a whole-host `arrived`",
+         arm_diff(_arms["cold"], _arms["warm"], "only-warm.example") is None),
+    ]
 
     # --- --decode: one layer inside an opaque value ------------------------------------
     import base64 as _b64
