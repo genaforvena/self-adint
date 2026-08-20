@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Keep the Note3 RU vantage RAISED for the length of a capture cell.
+#
+# Why this exists: wifi coming back ON is what drops the PDP, and the PDP is the vantage.
+# Measured 2026-08-20 across two cells, both showing the SAME shape — replicate 1 healthy,
+# the RU arm collapsing 30-39 min in:
+#   cell 2026082020 launched 20:21Z, RU refusals from 21:00Z (39 min); wifi found ON at 21:11Z
+#   cell 2026082021 launched 21:38Z, RU refusals from 22:08Z (30 min); wifi found ON, rmnet0 DOWN
+# Disabling wifi at 21:33Z did not hold: it was on again within ~35-65 min. So the vantage
+# needs TENDING for the length of a cell, not raising once at the start.
+#
+# Honest contract: phone unreachable -> exit 2 (honest n/a), never a silent pass.
+# The gate is EGRESS, not the wifi bit: "wifi is off" is a proxy, and the claim is "the
+# vantage can reach the world". A proxy that is not the claim is how a dead organ reads green.
+set -u
+SERIAL="${ADINT_NOTE3_SERIAL:-4d00553d61ab90b7}"
+NS="${ADINT_RU_NETNS:-ruvantage}"
+ECHO_URL="${ADINT_IP_ECHO:-https://ipv4.internet.yandex.net/api/v0/ip}"
+LOG="${ADINT_KEEP_LOG:-$HOME/.mesh/ru-vantage-keep.log}"
+TEST_MODE=0
+[ "${1:-}" = "--test" ] && TEST_MODE=1
+# A dry run must NEVER write the log a human or watchdog reads for liveness.
+[ "$TEST_MODE" = 1 ] && LOG="${ADINT_KEEP_TEST_LOG:-/tmp/adint-ru-vantage-keep.test.log}"
+
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+say(){ printf '%s %s\n' "$(now)" "$*" | tee -a "$LOG"; }
+adb_(){ timeout 25 adb -s "$SERIAL" "$@" 2>/dev/null; }
+
+adb_ get-state >/dev/null 2>&1 || { echo "n/a: adb device $SERIAL unreachable" >&2; exit 2; }
+
+egress_ok(){
+  local out
+  out=$(timeout 40 sudo -n ip netns exec "$NS" curl -s -m 25 "$ECHO_URL" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | grep -qE '[0-9]{1,3}(\.[0-9]{1,3}){3}' || return 1
+  printf '%s' "$out" | tr -d '"'
+}
+
+if [ "$TEST_MODE" = 1 ]; then
+  wifi=$(adb_ shell "su -c 'settings get global wifi_on'" | tr -d '\r\n')
+  rm0=$(adb_ shell "su -c 'ip addr show rmnet0'" | grep -c 'inet ')
+  ip=$(egress_ok) && st="ok:$ip" || st="unreachable"
+  say "--test wifi_on=$wifi rmnet0_inet=$rm0 egress=$st"
+  # Assert the REAL read, not the offline branch: the vantage must actually answer.
+  if [ "$st" = "unreachable" ]; then
+    echo "--test: FAIL — vantage has no egress (wifi_on=$wifi rmnet0_inet=$rm0)" >&2; exit 1
+  fi
+  echo "--test: ok"; exit 0
+fi
+
+if ip=$(egress_ok); then
+  say "ok egress=$ip"
+  exit 0
+fi
+
+wifi=$(adb_ shell "su -c 'settings get global wifi_on'" | tr -d '\r\n')
+say "DOWN — no egress; wifi_on=$wifi; re-raising"
+adb_ shell "su -c 'svc wifi disable'" >/dev/null
+adb_ shell "su -c 'settings put global wifi_on 0'" >/dev/null
+adb_ shell "su -c 'settings put global wifi_scan_always_enabled 0'" >/dev/null
+sleep 25
+if ip=$(egress_ok); then
+  say "RAISED egress=$ip"
+  exit 0
+fi
+say "STILL DOWN after re-raise (wifi_on was $wifi)"
+exit 1
