@@ -37,6 +37,7 @@ import argparse
 import base64
 import collections
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -236,12 +237,29 @@ def _leaf(p, v, out, depth):
     clear, and pooling them would let a census say "site.page was on the wire" about
     something only a base64 round-trip revealed.
     """
-    out.setdefault(p, set()).add(shape(v))
+    e = out.setdefault(p, {"shapes": set(), "vals": set()})
+    e["shapes"].add(shape(v))
+    if len(e["vals"]) < VAL_CAP:
+        e["vals"].add(vhash(v))
     if not DECODE or depth > 6:
         return
     inner = unwrap(v)
     if inner is not None:
         flatten(inner, p + "~b64", out, depth + 1)
+
+
+VAL_CAP = 500   # distinct values tracked per path before the count is marked saturated
+
+
+def vhash(v):
+    """A stable, one-way tag for a value. NEVER reversible, never printed — only counted.
+
+    Identifier STABILITY is the sharpest test of the README's thesis and it cannot be done
+    with shapes: `uuid` and `uuid` are the same shape whether they are the same uuid or two
+    freshly minted ones. Counting distinct values answers it and publishes nothing, because
+    the count is the finding and the values never leave this process.
+    """
+    return hashlib.blake2b(repr(v).encode("utf-8", "replace"), digest_size=8).digest()
 
 
 def flatten(obj, prefix="", out=None, depth=0):
@@ -259,7 +277,7 @@ def flatten(obj, prefix="", out=None, depth=0):
     elif isinstance(obj, list):
         p = prefix + "[]"
         if not obj:
-            out.setdefault(p, set()).add("list:0")
+            out.setdefault(p, {"shapes": set(), "vals": set()})["shapes"].add("list:0")
         for v in obj:
             if isinstance(v, (dict, list)):
                 flatten(v, p, out, depth + 1)
@@ -302,18 +320,42 @@ def parse_body(body):
                             continue
                         except Exception:
                             pass
-                    out.setdefault(k, set()).add(shape(v))
+                    _leaf(k, v, out, 0)
                 return "urlencoded", out
         except Exception:
             pass
     return "unparsed", None
 
 
+def _merge(dst, path, ent, load_id):
+    """Fold one request's reading of one key path into the running census.
+
+    `vals` is a set of one-way tags, capped at VAL_CAP. Saturation is recorded rather than
+    silently truncated: a path that hit the cap has AT LEAST that many distinct values, and
+    reporting the cap as if it were the count would turn "thousands of distinct values"
+    into a fixed number that looks like a measurement.
+    """
+    e = dst.setdefault(path, {"n": 0, "shapes": set(), "loads": set(),
+                              "vals": set(), "vals_saturated": False})
+    e["n"] += 1
+    e["shapes"] |= ent["shapes"]
+    room = VAL_CAP - len(e["vals"])
+    if room <= 0:
+        if ent["vals"] - e["vals"]:
+            e["vals_saturated"] = True
+    else:
+        e["vals"] |= set(list(ent["vals"])[:room])
+        if len(e["vals"]) >= VAL_CAP:
+            e["vals_saturated"] = True
+    if load_id:
+        e["loads"].add(load_id)
+
+
 def census(rows):
     """host -> {state, n_req, n_body, n_read, formats, paths{path: {shapes, n}}}"""
     per = collections.defaultdict(lambda: {
         "n_req": 0, "n_body": 0, "n_read": 0, "n_unparsed": 0, "n_truncated": 0,
-        "n_url_q": 0, "n_url_maybe_cut": 0,
+        "n_url_q": 0, "n_url_maybe_cut": 0, "loads": set(),
         "formats": collections.Counter(), "paths": {}, "qpaths": {},
     })
     for r in rows:
@@ -324,6 +366,12 @@ def census(rows):
             continue
         h = per[host]
         h["n_req"] += 1
+        # THE LOAD, not the request, is the unit for "does this field appear". A page that
+        # fires one exchange twenty times and a field that shows up on twenty pages are the
+        # same request count and completely different evidence.
+        lid = r.get("load_id")
+        if lid:
+            h["loads"].add(lid)
 
         # THE QUERY STRING IS THE OTHER HALF OF THE QUESTION. A GET-based exchange puts the
         # same profile there that a POST one puts in the body, so a census that reads only
@@ -352,10 +400,8 @@ def census(rows):
                 if sub is None:
                     sub = {}
                     _leaf("?" + k, v, sub, 0)
-                for pth, shapes in sub.items():
-                    e = h["qpaths"].setdefault(pth, {"n": 0, "shapes": set()})
-                    e["n"] += 1
-                    e["shapes"] |= shapes
+                for pth, ent in sub.items():
+                    _merge(h["qpaths"], pth, ent, lid)
 
         body = r.get("req_body")
         if body is None:
@@ -369,10 +415,8 @@ def census(rows):
             h["n_unparsed"] += 1
             continue
         h["n_read"] += 1
-        for p, shapes in flat.items():
-            e = h["paths"].setdefault(p, {"n": 0, "shapes": set()})
-            e["n"] += 1
-            e["shapes"] |= shapes
+        for p, ent in flat.items():
+            _merge(h["paths"], p, ent, lid)
     for h in per.values():
         # Four states, and the middle two are the ones a body-only census merged. `url-only`
         # is a real reading of a real question; `no-payload` is the only one that can support
@@ -414,7 +458,7 @@ def by_arm(rows):
     return {arm: census(rs) for arm, rs in per.items()}
 
 
-def arm_diff(a, b, host):
+def arm_diff(a, b, host, min_loads=1):
     """(only_in_a, only_in_b, shape_changed) for one host across two arm censuses.
 
     A host absent from an arm yields NO diff rather than "everything is new": the two arms
@@ -426,8 +470,17 @@ def arm_diff(a, b, host):
         return None
     pa = dict(ha["paths"]); pa.update({k: v for k, v in ha["qpaths"].items()})
     pb = dict(hb["paths"]); pb.update({k: v for k, v in hb["qpaths"].items()})
-    only_a = sorted(set(pa) - set(pb))
-    only_b = sorted(set(pb) - set(pa))
+    # A PATH SEEN ON ONE LOAD IS NOT A TREATMENT EFFECT. The two arms load the same 23 sites
+    # but a page is not the same page twice: a video that started, an error that fired, a lazy
+    # block that scrolled into view all add key paths that have nothing to do with the
+    # profile. `min_loads` is the floor under which a difference is page variance, and it is
+    # applied to the arm the path is claimed to be IN — a field present on 12 of 23 warmed
+    # loads and 0 cold ones is a finding; 1 versus 0 is noise wearing the same shape.
+    def _n(e):
+        return len(e.get("loads") or ()) or e["n"]
+
+    only_a = sorted(k for k in set(pa) - set(pb) if _n(pa[k]) >= min_loads)
+    only_b = sorted(k for k in set(pb) - set(pa) if _n(pb[k]) >= min_loads)
     changed = sorted(k for k in set(pa) & set(pb)
                      if pa[k]["shapes"] != pb[k]["shapes"])
 
@@ -442,7 +495,21 @@ def arm_diff(a, b, host):
                     if any(q.startswith(k + ".") or q.startswith(k[:-2] + "[].")
                            for q in only_b))
     only_a = [k for k in only_a if k not in set(filled)]
-    return only_a, only_b, changed, filled
+    counts = {k: (_n(pa[k]) if k in pa else 0, _n(pb[k]) if k in pb else 0)
+              for k in set(only_a) | set(only_b) | set(changed) | set(filled)}
+
+    # IDENTIFIER STABILITY, which shapes cannot answer: `uuid` and `uuid` are the same shape
+    # whether they are the same uuid on every load or a fresh one each time. A field taking
+    # ONE value across 23 loads is an identity that persists; one taking 23 is an id minted
+    # per load and carries nothing about who is behind it.
+    stab = {}
+    for k in set(pa) & set(pb):
+        va, vb = len(pa[k].get("vals") or ()), len(pb[k].get("vals") or ())
+        la, lb = _n(pa[k]), _n(pb[k])
+        if la >= min_loads and lb >= min_loads and (va, la) != (vb, lb):
+            stab[k] = (va, la, vb, lb,
+                       bool(pa[k].get("vals_saturated") or pb[k].get("vals_saturated")))
+    return only_a, only_b, changed, filled, counts, stab
 
 
 def load(paths):
@@ -470,6 +537,14 @@ def main():
     ap.add_argument("--by-arm", nargs=2, metavar=("BASE", "OTHER"),
                     help="split the ledger by the row's `arm` and diff two of them: which "
                          "key paths appear only under OTHER, and which changed value shape")
+    ap.add_argument("--min-loads", type=int, default=1,
+                    help="with --by-arm, ignore a difference seen on fewer than this many "
+                         "LOADS. Below it a difference is page variance — a video that "
+                         "started, an error that fired — not the treatment (default 1: keep "
+                         "everything, which is the honest default for a first look)")
+    ap.add_argument("--audience-only", action="store_true",
+                    help="with --by-arm, show only differences in fields that make a claim "
+                         "ABOUT THE PERSON (identity / segments / consent)")
     ap.add_argument("--decode", action="store_true",
                     help="open one layer inside opaque values (base64, then gzip/zlib) and "
                          "census what is in there, marked `~b64`. Still shapes, never "
@@ -541,30 +616,44 @@ def main():
                  other, len(set(B) - set(A))))
         print()
         for host in sorted(set(A) & set(B)):
-            d = arm_diff(A, B, host)
+            d = arm_diff(A, B, host, args.min_loads)
             if d is None:
                 continue
-            only_a, only_b, changed, filled = d
-            if not (only_a or only_b or changed or filled):
+            only_a, only_b, changed, filled, counts, stab = d
+            stab_ks = sorted(stab)
+            if args.audience_only:
+                keep = lambda ps: [p for p in ps if bucket(p)
+                                   in ("identity", "segments", "consent")]
+                only_a, only_b = keep(only_a), keep(only_b)
+                changed, filled = keep(changed), keep(filled)
+                stab_ks = keep(stab_ks)
+            if not (only_a or only_b or changed or filled or stab_ks):
                 continue
-            print("%s" % host)
+            print("%s   [%d/%d loads]"
+                  % (host, len(A[host]["loads"]), len(B[host]["loads"])))
+
+            def _sh(cen, p):
+                return "|".join(sorted(
+                    (cen[host]["paths"].get(p) or cen[host]["qpaths"][p])["shapes"]))
+
+            def _c(p):
+                a, b = counts.get(p, (0, 0))
+                return "%d/%d" % (a, b)
+
             for p in filled:
-                print("   * FILLED under %-5s %-46s was %s"
-                      % (other, p, "|".join(sorted(
-                          (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]))))
+                print("   * FILLED %-6s %-7s %-40s was %s"
+                      % (other, _c(p), p, _sh(A, p)))
             for p in only_b:
-                print("   + only under %-6s %-46s %s"
-                      % (other, p, "|".join(sorted(
-                          (B[host]["paths"].get(p) or B[host]["qpaths"][p])["shapes"]))))
+                print("   + only %-8s %-7s %-40s %s" % (other, _c(p), p, _sh(B, p)))
             for p in only_a:
-                print("   - only under %-6s %-46s %s"
-                      % (base, p, "|".join(sorted(
-                          (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]))))
+                print("   - only %-8s %-7s %-40s %s" % (base, _c(p), p, _sh(A, p)))
             for p in changed:
-                sa = (A[host]["paths"].get(p) or A[host]["qpaths"][p])["shapes"]
-                sb = (B[host]["paths"].get(p) or B[host]["qpaths"][p])["shapes"]
-                print("   ~ %-58s %s -> %s"
-                      % (p, "|".join(sorted(sa)), "|".join(sorted(sb))))
+                print("   ~ shape    %-7s %-40s %s -> %s"
+                      % (_c(p), p, _sh(A, p), _sh(B, p)))
+            for p in stab_ks:
+                va, la, vb, lb, sat = stab[p]
+                print("   = values   %-7s %-40s %d over %d load(s) -> %d over %d%s"
+                      % ("", p, va, la, vb, lb, "  (saturated)" if sat else ""))
             print()
         return 0
 
@@ -663,12 +752,12 @@ def selftest():
                              "geo": {"lat": 55.75}},
                     "imp": [{"id": "1"}, {"id": "2"}]})
     checks.append(("an identifier is reported as a shape, never as its value",
-                   flat["user.buyeruid"] == {"hex:32"}))
+                   flat["user.buyeruid"]["shapes"] == {"hex:32"}))
     checks.append(("an array collapses to one path, not one per element",
                    [k for k in flat if k.startswith("imp")] == ["imp[].id"]))
     checks.append(("no output string contains the identifier itself",
-                   not any("8f14e45f" in s for s in json.dumps(
-                       {k: sorted(v) for k, v in flat.items()}))))
+                   "8f14e45f" not in json.dumps(
+                       {k: sorted(v["shapes"]) for k, v in flat.items()})))
 
     # Bucketing: the leaf decides before the path, else every `id` is an identity.
     checks.append(("imp[].id is not an identity field", bucket("imp[].id") is None))
@@ -704,6 +793,21 @@ def selftest():
     checks.append(("a urlencoded body is parsed, not filed unparsed", fmt == "urlencoded"))
     checks.append(("JSON nested inside a urlencoded value is censused, not left opaque",
                    "data.user.segment[]" in (flat2 or {})))
+
+    # A urlencoded body must survive the FULL census path, not just parse_body. The live data
+    # found this: `flatten` grew a {shapes, vals} entry and the urlencoded branch still built
+    # a bare set, so every ledger containing one urlencoded request crashed in `_merge` —
+    # and every gate passed, because they all fed JSON. A parser gate is not a census gate.
+    _ue = census([{"kind": "request", "host": "u.example", "load_id": "L1",
+                   "req_body": "sid=99&k=v"}])
+    checks.append(("a urlencoded body survives the whole census, not just the parser",
+                   _ue["u.example"]["state"] == "read"
+                   and _ue["u.example"]["paths"]["sid"]["shapes"] == {"str:2"}))
+    # And so must a query string, for the same reason and by the same route.
+    _q2 = census([{"kind": "request", "host": "q.example", "load_id": "L1",
+                   "req_body": None, "req_url_full": "https://q.example/x?a=1"}])
+    checks.append(("a query-string-only request survives the whole census",
+                   _q2["q.example"]["qpaths"]["?a"]["shapes"] == {"str:1"}))
 
     # A truncated body is flagged, because a field missing because we cut the string reads
     # exactly like a field the exchange never sent.
@@ -744,6 +848,86 @@ def selftest():
          arm_diff(_arms["cold"], _arms["warm"], "only-warm.example") is None),
     ]
 
+    # IDENTIFIER STABILITY. The sharpest test the README's thesis has, and shapes are blind
+    # to it: one uuid on every load and a fresh uuid each load are the same shape.
+    _st = [{"kind": "request", "arm": "cold", "host": "s.example", "load_id": "L%d" % i,
+            "req_body": json.dumps({"uid": "cold-%d" % i, "pin": "same"})}
+           for i in range(5)]
+    _st += [{"kind": "request", "arm": "warm", "host": "s.example", "load_id": "W%d" % i,
+             "req_body": json.dumps({"uid": "stable", "pin": "same"})} for i in range(5)]
+    _sa = by_arm(_st)
+    _sd = arm_diff(_sa["cold"], _sa["warm"], "s.example", 1)
+    checks += [
+        ("a field with a fresh value every load is counted as 5 distinct over 5 loads",
+         _sd[5].get("uid", ())[:2] == (5, 5)),
+        ("the same field stable across the warmed arm is 1 distinct over 5 loads",
+         _sd[5].get("uid", ())[2:4] == (1, 5)),
+        # Shapes would have called these two identical, which is the whole point.
+        ("shapes alone cannot see it — the shape did not change",
+         "uid" not in _sd[2]),
+        ("a field identical in both arms raises no stability line",
+         "pin" not in _sd[5]),
+        # The values themselves must never be reachable from the census.
+        ("stability is counted from one-way tags, so no value is retained",
+         all(isinstance(v, bytes) and len(v) == 8
+             for v in _sa["cold"]["s.example"]["paths"]["uid"]["vals"])),
+    ]
+
+    # SATURATION. A path with more distinct values than the cap has AT LEAST that many;
+    # reporting the cap as the count would turn "thousands" into a number that looks measured.
+    _sat_rows = [{"kind": "request", "arm": "cold", "host": "sat.example",
+                  "load_id": "L%d" % i, "req_body": json.dumps({"u": "v%d" % i})}
+                 for i in range(VAL_CAP + 10)]
+    _satc = census(_sat_rows)["sat.example"]["paths"]["u"]
+    checks += [
+        ("a path past the distinct-value cap is MARKED saturated, not silently truncated",
+         _satc["vals_saturated"] is True and len(_satc["vals"]) == VAL_CAP),
+    ]
+
+    # THE PAGE-VARIANCE FLOOR. Two arms load the same sites and a page is not the same page
+    # twice; without a floor, one video that happened to start under one arm reports thirty
+    # "fields the warmed profile caused".
+    _v = [{"kind": "request", "arm": "cold", "host": "v.example", "load_id": "L%d" % i,
+           "req_body": '{"user":{"id":"a"}}'} for i in range(6)]
+    _v += [{"kind": "request", "arm": "warm", "host": "v.example", "load_id": "W%d" % i,
+            "req_body": '{"user":{"id":"a"},"steady":1}'} for i in range(6)]
+    # One warmed load, and one only, sees a field. That is page variance, not a treatment.
+    _v.append({"kind": "request", "arm": "warm", "host": "v.example", "load_id": "W9",
+               "req_body": '{"user":{"id":"a"},"oneoff":1}'})
+    _va = by_arm(_v)
+    _lo = arm_diff(_va["cold"], _va["warm"], "v.example", 1)
+    _hi = arm_diff(_va["cold"], _va["warm"], "v.example", 3)
+    checks += [
+        ("with no floor, a one-load difference is reported",
+         "oneoff" in _lo[1] and "steady" in _lo[1]),
+        ("with a floor of 3 loads, the one-load difference is dropped",
+         "oneoff" not in _hi[1] and "steady" in _hi[1]),
+        # The count is on the row so the reader can apply their own floor, not just mine.
+        ("every reported path carries its per-arm LOAD count",
+         _lo[4]["steady"] == (0, 6) and _lo[4]["oneoff"] == (0, 1)),
+        # A field on twenty requests of one page is not a field on twenty pages.
+        ("the unit is the load, not the request",
+         arm_diff(by_arm([
+             {"kind": "request", "arm": "cold", "host": "r.example", "load_id": "L1",
+              "req_body": '{"a":1}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'}])["cold"],
+             by_arm([
+             {"kind": "request", "arm": "cold", "host": "r.example", "load_id": "L1",
+              "req_body": '{"a":1}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'},
+             {"kind": "request", "arm": "warm", "host": "r.example", "load_id": "W1",
+              "req_body": '{"a":1,"b":2}'}])["warm"],
+             "r.example", 2)[1] == []),
+    ]
+
     # --- --decode: one layer inside an opaque value ------------------------------------
     import base64 as _b64
     _payload = _b64.b64encode(
@@ -758,7 +942,8 @@ def selftest():
         ("decoding is OFF by default — a census is a plain reading unless asked",
          DECODE_DEFAULT is False),
         ("with decoding off an opaque value stays opaque",
-         list(_off) == ["bids"] and any(x.startswith("opaque:") for x in _off["bids"])),
+         list(_off) == ["bids"]
+         and any(x.startswith("opaque:") for x in _off["bids"]["shapes"])),
         ("with --decode the layer inside is censused",
          "bids~b64[].bidderName" in _on),
         # The mark is the point: a field only a base64 round-trip revealed is not a field the
@@ -766,13 +951,14 @@ def selftest():
         ("a decoded path is MARKED `~b64`, never merged into the parent",
          all(k.startswith("bids~b64") for k in _on if k.startswith("bids") and k != "bids")),
         ("the decoded value is still reported as a shape",
-         _on.get("bids~b64[].user.buyeruid") == {"str:11"}),
+         _on["bids~b64[].user.buyeruid"]["shapes"] == {"str:11"}),
         ("no decoded value leaks into the output",
-         "REAL-PERSON" not in json.dumps({k: sorted(v) for k, v in _on.items()})),
+         "REAL-PERSON" not in json.dumps(
+             {k: sorted(v["shapes"]) for k, v in _on.items()})),
         # base64 of a decimal is a decode, not a failure — a 19-digit id minted from a clock
         # is a finding about what kind of identifier it is.
         ("base64 of a decimal opens, and its length is on the row",
-         _on.get("duid~b64._decimal") == {"digits:19"}),
+         _on["duid~b64._decimal"]["shapes"] == {"digits:19"}),
         # AND THE REFUSAL: a value that does not open stays opaque and says so.
         # THE REFUSAL, asserted on `unwrap` itself: a mutant that turned a failed decode into
         # `{}` left the path census unchanged (an empty dict contributes no paths), so the
