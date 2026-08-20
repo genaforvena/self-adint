@@ -78,6 +78,38 @@ has nothing to put in it** — a fact about the browser, not about the protocol.
 `kimberlite.io` reads 0 filled / 1 always empty: it asks for a stable id on all 18 requests
 and never gets one.
 
+## Where the audience profile actually is: not the bid request, the analytics call
+
+`mc.yandex.com` — Yandex Metrica, the same operator that runs the wrapper — receives a
+`site-info` map in its query string with **295 key paths**. Most are the publisher's own UI
+taxonomy (page sections, menu items). Among them is a block of **publisher-declared visitor
+labels, written in plain Russian, as key names**:
+
+| key path | reading | shape on this browser |
+|---|---|---|
+| `Пользователь.Подозрительный` | "User: Suspicious" | `str:2` |
+| `Пользователь.Лояльность.Disloyal` | "User: Loyalty: Disloyal" | `str:2` |
+| `Пользователь.Комментатор` | "User: Commenter" | `str:6` |
+| `Пользователь.Достижения` | "User: Achievements" | `str:7` |
+| `Пользователь.Авторизация` | "User: Authorization" | `str:16` |
+| `__ymu.Пользователь.Лояльность (просмотры за 30 дней).Новый` | "loyalty, views in 30 days: New" | `str:1` |
+| `__ymu.authStat` | Metrica userParams | `str:13` |
+| `__ymu.pgUserID` | | `str:1` |
+| `__ymu.pgUserName` | **the visitor's username** | **`str:empty`** |
+
+`__ymu` is Metrica's `userParams` — publisher-declared attributes attached to the visitor.
+The host reads **14 filled audience slots and one present-but-always-empty**: `pgUserName`.
+The username slot exists, and a browser that never logged in has nothing to put in it.
+
+**What this is NOT.** `mc.yandex.com` is the analytics endpoint, not a bid request. Nothing
+measured here shows these labels reaching an auction. Yandex operates both, and Metrica
+segments are usable for targeting as a matter of product documentation — but that is a link
+this capture does not evidence, and it is not claimed.
+
+**What it is.** The plainest answer to "what does the demand side get told about a person" in
+this market is not in the bid request at all. It is a publisher telling the wrapper operator,
+in its own language, that this visitor is suspicious and disloyal and has not logged in.
+
 ## The identity that does travel
 
 Paired design, one hour, one vantage, the two arms adjacent on each site. The treatment is
@@ -148,10 +180,38 @@ seats), each with its campaign id and how long it took (n=93, min 416 ms, median
   client-side and is less exposed to that, but it is not immune.
 - **`sapeFpUids` populated is n=2, on one site.** The cold arm's 0/22 is the control, but the
   positive is small.
-- **The taxonomy is name matching, and it has under-reported three times** — `adtech_uid`,
-  `puidN`, and `sapeFpUids` were each scored as nothing on first contact with real data. Read
-  the headline as *"no audience field this taxonomy recognises"*, never *"no audience data"*.
-  `--paths` prints the unbucketed census so a reader can disagree without re-running capture.
+- **The taxonomy is name matching, and it under-reported four times in one day** —
+  `adtech_uid`, `puidN`, `sapeFpUids`, and then every Russian-language visitor label on the
+  market's dominant analytics path, because the taxonomy was written in English. *A taxonomy
+  is a copy of the world in one language.* Read the headline as *"no audience field this
+  taxonomy recognises"*, never *"no audience data"*. `--paths` prints the unbucketed census
+  so a reader can disagree without re-running the capture.
+- **`mc.yandex.com` is analytics, not an auction.** The visitor labels above are not shown
+  reaching a bid request, and no such link is claimed.
+
+## The published dataset, and the leak that nearly went with it
+
+`public-data/census-2026-08-20-paired.jsonl` — 2655 rows, CC0, one per (host, key path),
+carrying the shape, the buckets, the load counts, the distinct-value counts and the
+`empty_slot` flag. The ledger it was read from is not published and will not be.
+
+**The first version of that file leaked, and no gate could see it.** Every gate in
+`adint-publish` asserts a field NAME; the leak was in the CONTENT of an allowed field.
+Diffing the published file against every 12+ character token that had been on the wire
+returned **349 matches** — because a KEY can be an identifier (the census publishes key paths,
+and `top100_session_id.<19-digit id>` puts one in a path), and a HOSTNAME can embed one
+(`2-6a871d048f403bcd46b18008.id.…`, a per-sync domain, published verbatim in the `host`
+column).
+
+The fix redacts identifier-shaped segments of paths and hostnames to their shape, keeping
+short segments so a 7-digit publisher site id — not a person, and the thing that makes the
+cross-site result readable — survives. **The diff that found it is now a gate**, narrowed to
+the wire's VALUES plus ids hiding inside names (asserting "no wire token survives" fails on
+`top100_session_id`, a field name this study exists to report). After the fix: 0 identifiers,
+16 remaining overlaps, all publisher domains and field names.
+
+Recorded here rather than quietly fixed, because it is the same failure the study measures —
+an absence that was really a blindness — committed by the tool built to avoid it.
 
 ## Reproducing
 
