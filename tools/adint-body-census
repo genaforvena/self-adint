@@ -100,12 +100,20 @@ LEAF_RX = [
     # name would send a reader the other way.
     ("segments", re.compile(r"^puid\d+$")),
     ("identity", re.compile(r"^(fp|fingerprint)(_?key|_?id)?$")),
+    # `places[].sapeFpUids[].id` / `.source` is an eids-shaped identity GRAPH — an array of
+    # {source, id} pairs — and the exact-name set scored it as nothing because its leaves are
+    # the two most generic words in the schema. The vendor prefix is the only distinguishing
+    # part of the name, so the family matches the PARENT.
+    ("identity", re.compile(r"fp_?uids?$")),
+    # `places[].solta_stable`: a field whose name asserts persistence.
+    ("identity", re.compile(r"_stable$")),
 ]
 
 # Whole-path rules, applied when the leaf did not decide. Ordered: first match wins.
 PATH = [
     # `top100_session_id.<site id>` — the leaf is the publisher's numeric site id, so no leaf
     # rule can see this one. The identifier is in the PARENT key.
+    ("identity", re.compile(r"fp_?uids?\[\]", re.I)),
     ("identity", re.compile(r"sess(ion)?_?id", re.I)),
     ("identity", re.compile(r"(^|\.)user\.(ext\.)?(id|eids)", re.I)),
     ("segments", re.compile(r"(^|\.)user\.(data|ext\.data)", re.I)),
@@ -356,6 +364,7 @@ def census(rows):
     per = collections.defaultdict(lambda: {
         "n_req": 0, "n_body": 0, "n_read": 0, "n_unparsed": 0, "n_truncated": 0,
         "n_url_q": 0, "n_url_maybe_cut": 0, "loads": set(),
+        "n_candidate": 0, "n_noncandidate": 0, "n_unclassified": 0, "bidders": set(),
         "formats": collections.Counter(), "paths": {}, "qpaths": {},
     })
     for r in rows:
@@ -366,6 +375,19 @@ def census(rows):
             continue
         h = per[host]
         h["n_req"] += 1
+        # WHETHER THIS PATH IS AN AUCTION AT ALL is not this tool's judgement to make. The
+        # capture tool classifies each request (`is_bid_candidate`, `bidder`) behind its own
+        # gates, and re-deciding it here by hostname would be a second, unreviewed classifier
+        # disagreeing with the first. A row that predates the field renders `None`, and a host
+        # whose rows are all `None` is UNKNOWN — never "not an exchange".
+        if r.get("is_bid_candidate") is True:
+            h["n_candidate"] += 1
+        elif r.get("is_bid_candidate") is False:
+            h["n_noncandidate"] += 1
+        else:
+            h["n_unclassified"] += 1
+        if r.get("bidder"):
+            h["bidders"].add(r["bidder"])
         # THE LOAD, not the request, is the unit for "does this field appear". A page that
         # fires one exchange twenty times and a field that shows up on twenty pages are the
         # same request count and completely different evidence.
@@ -425,6 +447,30 @@ def census(rows):
                       ("url-only" if h["qpaths"] else
                        ("no-payload" if h["n_req"] else "no-request")))
     return per
+
+
+EMPTY_SHAPES = {"list:0", "obj:0", "str:empty", "null"}
+
+
+def slots(h):
+    """(empty, filled) audience key paths for one host.
+
+    THE MOST INFORMATIVE STATE IS `PRESENT AND EMPTY`, and it is the one a bucket count hides.
+    `places[].sapeFpUids[]` is an eids-shaped identity graph that sape asks for on every bid
+    request; on this browser it arrives `list:0` twenty-two times out of twenty-four. Counted
+    as "sape carries an identity field" it overstates; counted as "sape asks nothing about
+    the person" it understates and misses the finding entirely. The slot EXISTS and is EMPTY,
+    which is a fact about this browser rather than about the protocol.
+
+    A path is `filled` if it was ever seen non-empty and `empty` if every reading of it was.
+    """
+    empty, filled = [], []
+    for src in (h["paths"], h["qpaths"]):
+        for p, e in src.items():
+            if bucket(p) not in ("identity", "segments", "consent"):
+                continue
+            (empty if e["shapes"] <= EMPTY_SHAPES else filled).append(p)
+    return sorted(empty), sorted(filled)
 
 
 def buckets_of(h, half="both"):
@@ -552,6 +598,11 @@ def main():
                          "what the exchange sent than one sent in the clear")
     ap.add_argument("--paths", action="store_true",
                     help="print every key path, unbucketed, with its value shapes")
+    ap.add_argument("--candidates", choices=["only", "exclude", "all"], default="all",
+                    help="restrict to hosts the CAPTURE TOOL classified as bid candidates "
+                         "(`only`), to those it did not (`exclude`), or neither. The verdict "
+                         "is the capture tool's, read off the row — this tool does not "
+                         "re-decide what an auction is by hostname")
     ap.add_argument("--min-req", type=int, default=1,
                     help="hide hosts seen fewer than this many times (default 1: hide none)")
     ap.add_argument("--json", action="store_true")
@@ -674,6 +725,12 @@ def main():
             print("          not a question the exchange did not ask.")
         for b, ps in buckets_of(h).items():
             print("  %-9s %s" % (b, ", ".join(ps) if ps else "—"))
+        emp, fil = slots(h)
+        print("  audience slots: %d filled, %d present-but-ALWAYS-EMPTY" % (len(fil), len(emp)))
+        if emp:
+            print("    empty: " + ", ".join(emp))
+        if fil:
+            print("    filled: " + ", ".join(fil))
         if args.paths:
             print("  ── body key paths ──")
             for p in sorted(h["paths"]):
@@ -685,8 +742,12 @@ def main():
                 print("   %-52s n=%-4d %s" % (p, e["n"], "|".join(sorted(e["shapes"]))))
         return 0
 
-    hdr = ("%-30s %-10s %5s %5s %5s  %s"
-           % ("host", "state", "req", "body", "url?", "audience buckets"))
+    if args.candidates != "all":
+        want = args.candidates == "only"
+        per = {k: v for k, v in per.items()
+               if (v["n_candidate"] > 0) == want}
+    hdr = ("%-30s %-10s %5s %5s %5s %5s  %s"
+           % ("host", "state", "req", "body", "url?", "cand", "audience buckets"))
     print(hdr)
     print("-" * len(hdr))
     for host, h in sorted(per.items(), key=lambda kv: (-kv[1]["n_read"], -kv[1]["n_req"])):
@@ -694,9 +755,15 @@ def main():
             continue
         bs = buckets_of(h)
         mark = " ".join(("%s:%d" % (b[:4], len(bs[b]))) for b in BUCKETS if bs[b]) or "—"
+        emp, fil = slots(h)
+        if emp or fil:
+            mark += "   slots %d filled / %d ALWAYS EMPTY" % (len(fil), len(emp))
         cut = "!" if h["n_url_maybe_cut"] else " "
-        print("%-30s %-10s %5d %5d %4d%s  %s"
-              % (host[:30], h["state"], h["n_req"], h["n_read"], h["n_url_q"], cut, mark))
+        cand = ("%d" % h["n_candidate"] if h["n_candidate"]
+                else ("?" if h["n_unclassified"] and not h["n_noncandidate"] else "-"))
+        print("%-30s %-10s %5d %5d %4d%s %5s  %s"
+              % (host[:30], h["state"], h["n_req"], h["n_read"], h["n_url_q"], cut,
+                 cand, mark))
     return 0
 
 
@@ -846,6 +913,61 @@ def selftest():
          _d[3] == ["user.eids[]"] and "user.eids[]" not in _d[0]),
         ("a host seen in only one arm yields no diff, never a whole-host `arrived`",
          arm_diff(_arms["cold"], _arms["warm"], "only-warm.example") is None),
+    ]
+
+    # PRESENT-AND-EMPTY. The state a bucket count hides, and the one that carries the finding.
+    _sl = census([
+        # sape's real shape: an eids-style graph, asked for on every request, empty on this
+        # browser — except once.
+        {"kind": "request", "host": "sl.example", "load_id": "L1",
+         "req_body": '{"places":[{"sapeFpUids":[],"solta_stable":"","targetRef":"p"}]}'},
+        {"kind": "request", "host": "sl.example", "load_id": "L2",
+         "req_body": '{"places":[{"sapeFpUids":[],"solta_stable":"","targetRef":"p"}]}'},
+        {"kind": "request", "host": "sl.example", "load_id": "L3",
+         "req_body": '{"places":[{"sapeFpUids":[{"source":"s","id":"x"}],'
+                     '"solta_stable":"","targetRef":"p"}]}'},
+    ])["sl.example"]
+    _emp, _fil = slots(_sl)
+    checks += [
+        # The vendor prefix is the only distinguishing part of the name: its leaves are `id`
+        # and `source`, the two most generic words in the schema, so an exact-name set scored
+        # this identity graph as nothing.
+        ("an eids-shaped graph under a vendor prefix is identity",
+         bucket("places[].sapeFpUids[].id") == "identity"
+         and bucket("places[].sapeFpUids[]") == "identity"),
+        ("a field that was EVER non-empty counts as filled",
+         "places[].sapeFpUids[].id" in _fil),
+        # The distinction: asked for on every request, never answered.
+        ("a field present on every request and always empty is reported as an EMPTY SLOT",
+         "places[].solta_stable" in _emp),
+        ("an empty slot is not counted as filled",
+         "places[].solta_stable" not in _fil),
+        # And the boundary: a placement id is not a slot for a person.
+        ("a non-audience field is not a slot at all",
+         "places[].targetRef" not in _emp + _fil),
+    ]
+
+    # THE CANDIDATE VERDICT IS READ, NEVER RE-DECIDED. Three states, because a row that
+    # predates the field is not a row that says "not an exchange".
+    _cc = census([
+        {"kind": "request", "host": "bid.example", "load_id": "L1",
+         "is_bid_candidate": True, "bidder": "adriver", "req_body": '{"imp":[]}'},
+        {"kind": "request", "host": "px.example", "load_id": "L1",
+         "is_bid_candidate": False, "req_body": '{"evt":"pv"}'},
+        {"kind": "request", "host": "old.example", "load_id": "L1", "req_body": '{"a":1}'},
+    ])
+    checks += [
+        ("a candidate request is counted as one, and its bidder kept",
+         _cc["bid.example"]["n_candidate"] == 1
+         and _cc["bid.example"]["bidders"] == {"adriver"}),
+        ("a request the capture tool called NOT a candidate is not counted as one",
+         _cc["px.example"]["n_candidate"] == 0
+         and _cc["px.example"]["n_noncandidate"] == 1),
+        # The distinction that stops a schema-blind ledger reading as a market with no
+        # exchanges in it.
+        ("a row with no verdict is UNCLASSIFIED, never 'not an exchange'",
+         _cc["old.example"]["n_unclassified"] == 1
+         and _cc["old.example"]["n_noncandidate"] == 0),
     ]
 
     # IDENTIFIER STABILITY. The sharpest test the README's thesis has, and shapes are blind
