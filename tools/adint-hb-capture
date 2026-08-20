@@ -467,11 +467,36 @@ PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
               "http_proxy", "https_proxy", "all_proxy")
 
 
+# The echo contract is "a bare IP and nothing else" — the right contract for a host WE choose.
+# It stops being a choice when the region under test can reach exactly one echo. Measured
+# 2026-08-20 from inside the MTS netns, five echoes were unreachable (api.ipify.org,
+# ifconfig.co, icanhazip.com, ident.me, ipinfo.io — all rc=28) and the only one that answered
+# was Yandex's, which returns the address JSON-QUOTED: "91.79.84.208". The quote is not in
+# [0-9a-fA-F:.], so the strict full-match read a perfectly good answer as unreadable, and the
+# preflight refused every load on a vantage that fetched 6/6 of the corpus in the same minute.
+# So the address may now be WRAPPED, and nothing more. The body stays capped, because the cap
+# is what the full-match was really buying: an HTML page that merely CONTAINS an address must
+# never satisfy a gate whose whole job is to prove where we are.
+_ECHO_BODY_MAX = 64
+_ECHO_RE = re.compile(r"""^["'\s]*([0-9a-fA-F:.]{7,45})["'\s]*$""")
+
+
+def echo_ip(txt):
+    """The address an echo body states, or None if it does not state exactly one."""
+    if txt is None:
+        return None
+    t = txt.strip()
+    if not t or len(t) > _ECHO_BODY_MAX:
+        return None
+    m = _ECHO_RE.match(t)
+    return m.group(1) if m else None
+
+
 def _curl_ip(env, timeout=15):
     try:
         r = subprocess.run(["curl", "-s", "--max-time", str(timeout), IP_ECHO],
                            capture_output=True, text=True, timeout=timeout + 5, env=env)
-        return r.stdout.strip() or None
+        return echo_ip(r.stdout)
     except Exception:
         return None
 
@@ -583,7 +608,7 @@ def _echo_once(ctx, timeout_ms=None, echo=None):
         p = ctx.new_page()
         p.goto(echo, wait_until="domcontentloaded", timeout=timeout_ms)
         txt = (p.inner_text("body") or "").strip()
-        return txt if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", txt or "") else None
+        return echo_ip(txt)
     except Exception:
         return None
     finally:
@@ -1478,6 +1503,23 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
                     pass
             return _P()
 
+    class _QuotedEcho:
+        """Yandex's echo, which is the only one the MTS vantage could reach."""
+
+        def new_page(self):
+            class _P:
+                def goto(self, url, **kw):
+                    pass
+
+                def inner_text(self, sel):
+                    return '"91.79.84.208"'
+
+                def close(self):
+                    pass
+            return _P()
+
+    quoted_read = echo_read(_QuotedEcho(), timeout_ms=1, tries=1, pause_s=0)
+
     flaky_1try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=1, pause_s=0)
     flaky_3try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=3, pause_s=0)
     dead_3try = echo_read(_FlakyEcho(99), timeout_ms=1, tries=3, pause_s=0)
@@ -1493,6 +1535,25 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
         ("an echo that never answers is still unread after every attempt",
          dead_3try == (None, 3)),
         ("a working echo costs exactly one attempt", clean_3try == ("91.79.81.62", 1)),
+        # ── the echo BODY (2026-08-20) ──
+        # RED gate: with the strict full-match, a JSON-quoted body reads as unreadable, and
+        # on the MTS vantage that body was the only one reachable at all.
+        ("a quoted echo body is read through the real path",
+         quoted_read == ("91.79.84.208", 1)),
+        ("a quoted body states the address it contains",
+         echo_ip('"91.79.84.208"') == "91.79.84.208"),
+        ("a bare body is still read exactly", echo_ip("  91.79.81.62 ") == "91.79.81.62"),
+        # Two DIFFERENT guards, gated separately, because they fail apart. The anchoring is
+        # what refuses a page that merely CONTAINS an address...
+        ("a page that merely contains an address is not an echo",
+         echo_ip("<html><body>your ip address is 91.79.81.62 today</body></html>") is None),
+        # ...and the cap is what bounds the regex's work on a pathological body. This case
+        # would satisfy the pattern if the cap were not there, which is the only way to gate
+        # a constant: assert the input it, and nothing else, refuses.
+        ("an oversized body is refused even when it matches the pattern",
+         echo_ip('"' * 200 + "91.79.81.62" + '"' * 200) is None),
+        ("a body that states no address is unread",
+         echo_ip("null") is None and echo_ip("") is None and echo_ip(None) is None),
         # ── the pair key (step0c §2.4) ──
         # Reconstructing pairs by timestamp is what this replaces, so the assertion is that
         # two SEPARATE capture() calls — different load_ids, different arms — carry the same
