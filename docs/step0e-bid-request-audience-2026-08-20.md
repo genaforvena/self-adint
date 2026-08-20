@@ -213,6 +213,12 @@ the wire's VALUES plus ids hiding inside names (asserting "no wire token survive
 Recorded here rather than quietly fixed, because it is the same failure the study measures —
 an absence that was really a blindness — committed by the tool built to avoid it.
 
+## Presented
+
+A shareable write-up of this step: <https://claude.ai/code/artifact/67ffcca9-5901-4241-9f03-aff93616e433>
+(private until shared from the page's own menu). It carries the same numbers as this document
+and the same scope section; nothing is in it that is not here.
+
 ## Reproducing
 
 ```bash
