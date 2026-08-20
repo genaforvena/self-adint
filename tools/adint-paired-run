@@ -162,7 +162,7 @@ def main():
                     help="attempts each arm gets at a navigation that never connected. "
                          "DEFAULT 1, i.e. OFF, and the measurement is why: over the FULL "
                          "night cell the immediate retry recovered 2 of 25 loads that needed "
-                         "it — 8%, bought by doubling the arm's traffic on exactly the loads "
+                         "it — 8%%, bought by doubling the arm's traffic on exactly the loads "
                          "where the link is already failing. (Mid-cell it read 0 of 14; the "
                          "final number is 2 of 25, and the decision is the same.) The "
                          "connection failure "
