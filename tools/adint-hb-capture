@@ -60,7 +60,19 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ask — every reader had to pick the newest schema PRESENT IN THE FILE and call that current.
 # A file whose newest rows are old then reads as fully current, which is the one thing the
 # stamp exists to prevent. The per-schema history lives beside the load row below.
-SCHEMA = 5
+# schema 6 KEEPS THE REQUEST BODY. Schemas 1-5 parsed `post_data` for three narrow things
+# (floor, is-it-OpenRTB, adfox placement ids) and then DISCARDED it — so `req_openrtb` on
+# disk was a boolean and the payload was gone. That payload is the thing this project says
+# it exists to read: README's thesis is that the audience profile arrives INSIDE the bid
+# request, readable without buying the impression. It was never on disk. A schema<=5 row
+# cannot answer the profile question at all; its absence there is not evidence of an empty
+# request.
+SCHEMA = 6
+# Per-body cap. OpenRTB requests here run 2-8 KB; 16 KB keeps the whole of a normal one and
+# bounds a pathological one. A truncated body is FLAGGED, never silently shortened — a
+# profile field missing because we cut the string reads exactly like a profile field the
+# exchange did not send.
+REQ_BODY_CAP = 16384
 OUT = os.path.join(REPO, "data", "hb-auction.jsonl")
 DOMAINS = os.path.join(REPO, "ref", "exchange-domains.tsv")
 
@@ -282,6 +294,24 @@ def parse_response(body_text):
         return "no-bid", {"reason": "no-price-in-body", "has_seatbid": has_seatbid,
                           "seatbid": len(doc.get("seatbid", [])) if isinstance(doc, dict) else None}
     return "priced", {"prices": prices, "currency": cur, "has_seatbid": has_seatbid}
+
+
+def _req_body_fields(req):
+    """{req_body, req_body_bytes, req_body_truncated} for one request.
+
+    Absent body renders `None`, never `""` — a GET with no payload and a POST whose body we
+    failed to read are different facts, and an empty string would merge them.
+    """
+    try:
+        body = req.post_data
+    except Exception:
+        return {"req_body": None, "req_body_bytes": None, "req_body_truncated": None}
+    if body is None:
+        return {"req_body": None, "req_body_bytes": 0, "req_body_truncated": False}
+    n = len(body)
+    return {"req_body": body[:REQ_BODY_CAP],
+            "req_body_bytes": n,
+            "req_body_truncated": n > REQ_BODY_CAP}
 
 
 def request_adfox_places(post_data):
@@ -603,6 +633,12 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
                     "floor": parse_request_floor(req.post_data),
                     "req_openrtb": request_is_openrtb(req.post_data),
                     "req_adfox": request_adfox_places(req.post_data),
+                    # THE PAYLOAD ITSELF, kept raw rather than parsed into fields. A derived
+                    # field ages the moment the parser improves (d28dbde's lesson); the raw
+                    # body can be re-read by a better parser forever. It is the operator's
+                    # OWN profile and it is NOT in adint-publish's allowlist — see the gate
+                    # named for it there.
+                    **_req_body_fields(req),
                     "outcome": None, "t_response_s": None, "status": None,
                 }
                 seen[req] = row

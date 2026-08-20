@@ -96,6 +96,20 @@ PAIRED_FIELDS = [
     "n_candidates", "error",
 ]
 
+# `req_body` IS DELIBERATELY ABSENT, AND THIS PARAGRAPH IS THE REASON.
+#
+# Schema 6 keeps the bid request's payload, because that payload is what the project exists
+# to read. It is also, precisely and by design, A DESCRIPTION OF ONE REAL PERSON: his device,
+# his segments, his identity graph, his consent state, whatever the exchange was told about
+# him. Publishing the outcome columns tells a reader what the market did. Publishing the
+# bodies hands them the operator's own advertising profile.
+#
+# The allowlist already excludes it by construction — anything not named here does not cross.
+# That is not enough on its own: "it is safe because nobody added it" is a property of the
+# current list, not of the design, and the next person widening this file for a good reason
+# will not know. So `selftest` asserts the absence directly, and any deliberate publication
+# of request payloads has to delete that gate and mean it.
+#
 # `detail` is the parsed answer, and it is the only NESTED thing that crosses. It is not
 # allowlisted whole: a nested blob whose shape we do not control is exactly what an allowlist
 # exists to stop. These sub-keys are named, and anything else inside `detail` is dropped the
@@ -232,6 +246,20 @@ def selftest():
     kept = {k: row[k] for k in FRAME_FIELDS if k in row}
     check("an unanticipated field is dropped by default",
           sorted(kept), ["domain", "stageb_verdict"])
+    # THE REQUEST PAYLOAD MUST NOT CROSS. Asserted by name, not left to the allowlist's
+    # default-deny: the default is what protects it today, and this gate is what makes
+    # publishing it a deliberate act rather than a widening nobody reviewed.
+    check("the bid request body is NOT published", "req_body" in PAIRED_FIELDS, False)
+    check("nor its length, which leaks profile size", "req_body_bytes" in PAIRED_FIELDS, False)
+    paired = {"bidder": "adriver", "outcome": "no-bid",
+              "req_body": '{"user":{"buyeruid":"REAL-PERSON","ext":{"segments":[1,2]}}}',
+              "req_body_bytes": 61, "req_body_truncated": False}
+    kept_p = {k: paired[k] for k in PAIRED_FIELDS if k in paired}
+    check("a schema-6 row publishes its outcome and not the payload",
+          sorted(kept_p), ["bidder", "outcome"])
+    check("no published field's VALUE carries the payload either",
+          any("REAL-PERSON" in str(v) for v in kept_p.values()), False)
+
     check("an advertising id is not on the frame allowlist",
           "device_ifa" in FRAME_FIELDS, False)
     # THE EXPORT BOUNDARY IS THE LAST PLACE THE RULE OF d28dbde CAN BE APPLIED. Everything
