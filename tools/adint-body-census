@@ -36,11 +36,13 @@ so a reader can disagree with the bucketing without re-running the capture.
 import argparse
 import base64
 import collections
+import gzip
 import json
 import os
 import re
 import sys
 import urllib.parse
+import zlib
 
 SCHEMA = 1
 
@@ -151,6 +153,13 @@ def shape(v):
             return "str:empty"
         if UUID.match(s):
             return "uuid"
+        # A long all-decimal string matches the hex alphabet, and calling it `hex` hides what
+        # it is: yandex's `duid` decodes to 19 decimal digits whose leading 10 are a unix
+        # timestamp, i.e. an id MINTED FROM THE CLOCK — a different animal from a 32-char
+        # random hex. Split before the hex rule, and only where hex would have claimed it, so
+        # no shorter shape changes.
+        if len(s) >= 16 and s.isdigit():
+            return "digits:%d" % len(s)
         if len(s) >= 16 and HEX.match(s):
             return "hex:%d" % len(s)
         if len(s) >= 24 and B64ISH.match(s):
@@ -161,6 +170,78 @@ def shape(v):
     if isinstance(v, dict):
         return "obj:%d" % len(v)
     return type(v).__name__
+
+
+def unwrap(v):
+    """One layer down an opaque value, or None. Never returns the plaintext to a caller that
+    would print it — the result is fed straight back into `flatten`, which emits shapes.
+
+    Measured on yandex.ru 2026-08-20: `?bids` is base64 of
+    `[{"bidderName":"betweendigital","campaign_id":…}]` — the wrapper reporting EVERY OTHER
+    BIDDER'S BID to Yandex — and `?duid` is base64 of a 19-digit decimal. Left as
+    `opaque:1844` and `opaque:28`, a census calls the most interesting field on the wire "an
+    opaque blob".
+
+    A layer that does not decode stays opaque and SAYS so, because `?grab` is base64 whose
+    payload is `{"grab_version":2}` followed by 3.7 KB that is not gzip, zlib or raw deflate.
+    "We could not read it" and "there is nothing in it" are the same distinction this whole
+    tool is built on.
+    """
+    if not isinstance(v, str) or len(v) < 16:
+        return None
+    s = v.strip()
+    for dec in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            raw = dec(s + "==")
+        except Exception:
+            continue
+        if not raw:
+            continue
+        for fn in (lambda b: b, gzip.decompress, zlib.decompress,
+                   lambda b: zlib.decompress(b, -15)):
+            try:
+                out = fn(raw)
+            except Exception:
+                continue
+            try:
+                txt = out.decode("utf-8")
+            except Exception:
+                continue
+            t = txt.strip()
+            if t[:1] in "{[":
+                try:
+                    return json.loads(t)
+                except Exception:
+                    pass
+            # A decimal id inside base64 is still a decoded value, and its LENGTH is the
+            # finding (a 19-digit id minted from a clock is not an identity graph).
+            if t.isdigit():
+                return {"_decimal": t}
+        break
+    return None
+
+
+DECODE = False   # set by --decode; off by default so a census is a plain reading
+# Captured at import, because the gate below sets DECODE by hand to drive both branches and
+# would otherwise be asserting the value it just wrote. `--decode --test` also mutates the
+# live flag before selftest runs, so only a snapshot taken here can see the real default.
+DECODE_DEFAULT = DECODE
+
+
+def _leaf(p, v, out, depth):
+    """Record one scalar, and — under --decode — one layer inside it if it opens.
+
+    The decoded path is marked `~b64` rather than merged into the parent: a field we had to
+    decode is a different claim about what the exchange sent than a field it sent in the
+    clear, and pooling them would let a census say "site.page was on the wire" about
+    something only a base64 round-trip revealed.
+    """
+    out.setdefault(p, set()).add(shape(v))
+    if not DECODE or depth > 6:
+        return
+    inner = unwrap(v)
+    if inner is not None:
+        flatten(inner, p + "~b64", out, depth + 1)
 
 
 def flatten(obj, prefix="", out=None, depth=0):
@@ -174,7 +255,7 @@ def flatten(obj, prefix="", out=None, depth=0):
             if isinstance(v, (dict, list)):
                 flatten(v, p, out, depth + 1)
             else:
-                out.setdefault(p, set()).add(shape(v))
+                _leaf(p, v, out, depth)
     elif isinstance(obj, list):
         p = prefix + "[]"
         if not obj:
@@ -183,7 +264,7 @@ def flatten(obj, prefix="", out=None, depth=0):
             if isinstance(v, (dict, list)):
                 flatten(v, p, out, depth + 1)
             else:
-                out.setdefault(p, set()).add(shape(v))
+                _leaf(p, v, out, depth)
     return out
 
 
@@ -269,7 +350,8 @@ def census(rows):
                     except Exception:
                         sub = None
                 if sub is None:
-                    sub = {"?" + k: {shape(v)}}
+                    sub = {}
+                    _leaf("?" + k, v, sub, 0)
                 for pth, shapes in sub.items():
                     e = h["qpaths"].setdefault(pth, {"n": 0, "shapes": set()})
                     e["n"] += 1
@@ -339,6 +421,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ledgers", nargs="*")
     ap.add_argument("--host", help="census one host in full")
+    ap.add_argument("--decode", action="store_true",
+                    help="open one layer inside opaque values (base64, then gzip/zlib) and "
+                         "census what is in there, marked `~b64`. Still shapes, never "
+                         "values. Off by default: a decoded field is a different claim about "
+                         "what the exchange sent than one sent in the clear")
     ap.add_argument("--paths", action="store_true",
                     help="print every key path, unbucketed, with its value shapes")
     ap.add_argument("--min-req", type=int, default=1,
@@ -346,6 +433,8 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
+    if args.decode:
+        globals()["DECODE"] = True
     if args.test:
         return selftest()
     if not args.ledgers:
@@ -529,6 +618,46 @@ def selftest():
                     "req_body_truncated": True}])
     checks.append(("a truncated body is counted as truncated",
                    per2["t.example"]["n_truncated"] == 1))
+
+    # --- --decode: one layer inside an opaque value ------------------------------------
+    import base64 as _b64
+    _payload = _b64.b64encode(
+        b'[{"bidderName":"betweendigital","user":{"buyeruid":"REAL-PERSON"}}]').decode()
+    _num = _b64.b64encode(b"1787239337664887042").decode()
+    globals()["DECODE"] = False
+    _off = flatten({"bids": _payload})
+    globals()["DECODE"] = True
+    _on = flatten({"bids": _payload, "duid": _num, "grab": "x" * 40})
+    globals()["DECODE"] = False
+    checks += [
+        ("decoding is OFF by default — a census is a plain reading unless asked",
+         DECODE_DEFAULT is False),
+        ("with decoding off an opaque value stays opaque",
+         list(_off) == ["bids"] and any(x.startswith("opaque:") for x in _off["bids"])),
+        ("with --decode the layer inside is censused",
+         "bids~b64[].bidderName" in _on),
+        # The mark is the point: a field only a base64 round-trip revealed is not a field the
+        # exchange sent in the clear, and an unmarked merge would state the stronger claim.
+        ("a decoded path is MARKED `~b64`, never merged into the parent",
+         all(k.startswith("bids~b64") for k in _on if k.startswith("bids") and k != "bids")),
+        ("the decoded value is still reported as a shape",
+         _on.get("bids~b64[].user.buyeruid") == {"str:11"}),
+        ("no decoded value leaks into the output",
+         "REAL-PERSON" not in json.dumps({k: sorted(v) for k, v in _on.items()})),
+        # base64 of a decimal is a decode, not a failure — a 19-digit id minted from a clock
+        # is a finding about what kind of identifier it is.
+        ("base64 of a decimal opens, and its length is on the row",
+         _on.get("duid~b64._decimal") == {"digits:19"}),
+        # AND THE REFUSAL: a value that does not open stays opaque and says so.
+        # THE REFUSAL, asserted on `unwrap` itself: a mutant that turned a failed decode into
+        # `{}` left the path census unchanged (an empty dict contributes no paths), so the
+        # path-level check below passes either way and is not the gate. This one is.
+        ("an undecodable value returns None from unwrap, never an empty structure",
+         unwrap("x" * 40) is None and unwrap(_b64.b64encode(b"\x00\x01\x02" * 20).decode())
+         is None),
+        ("and it stays opaque in the census, with no phantom child path",
+         [k for k in _on if k.startswith("grab")] == ["grab"]),
+    ]
 
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
