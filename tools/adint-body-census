@@ -70,14 +70,40 @@ LEAF = {
     "device": {
         "ua", "sua", "devicetype", "make", "model", "os", "osv", "hwv", "language", "langb",
         "carrier", "mccmnc", "connectiontype", "js", "h", "w", "ppi", "pxratio", "flashver",
+        # The GET exchanges state the viewport in their own vocabulary, not OpenRTB's.
+        "screenw", "screenh", "screen_width", "screen_height", "sw", "sh", "dpr", "cd",
+        "winw", "winh", "vpw", "vph",
     },
     "content": {
         "cat", "sectioncat", "pagecat", "cattax", "domain", "page", "ref", "referer",
         "referrer", "targetref", "title", "keywords_page",
     },
 }
+# LEAF FAMILIES. An exact-name set is a copy of the world that rots: the first live sweep
+# through a GET exchange (ssp01.rambler.ru, 2026-08-20) carried `adtech_uid` as a UUID,
+# `publisher_uid`, `rq_sess`, `top100_session_id.<siteid>` and six `puidN` targeting params —
+# and the exact-name taxonomy above bucketed NOT ONE of them, so the census printed the
+# richest identity payload in the sweep as carrying no audience data. These families are the
+# repair. They are still NAME matching, i.e. still a lead: `pad_id` and `block_id` on that
+# same request are placement ids, which is why a bare `_id$` rule is deliberately absent.
+LEAF_RX = [
+    # `…_uid`, `uid`, `uuid` — an identifier for the person, whoever minted it.
+    ("identity", re.compile(r"(^|_)u?uid$")),
+    # A session identifier is an identifier that expires, not a non-identifier.
+    ("identity", re.compile(r"(^|_)(sess|session)(_?id)?$")),
+    ("identity", re.compile(r"session_?id")),
+    # Adfox/Rambler `puid1..puid63`: publisher-declared USER TARGETING parameters. The name
+    # says "user id" and the role is a segment — bucketed by role, flagged here because the
+    # name would send a reader the other way.
+    ("segments", re.compile(r"^puid\d+$")),
+    ("identity", re.compile(r"^(fp|fingerprint)(_?key|_?id)?$")),
+]
+
 # Whole-path rules, applied when the leaf did not decide. Ordered: first match wins.
 PATH = [
+    # `top100_session_id.<site id>` — the leaf is the publisher's numeric site id, so no leaf
+    # rule can see this one. The identifier is in the PARENT key.
+    ("identity", re.compile(r"sess(ion)?_?id", re.I)),
     ("identity", re.compile(r"(^|\.)user\.(ext\.)?(id|eids)", re.I)),
     ("segments", re.compile(r"(^|\.)user\.(data|ext\.data)", re.I)),
     ("geo", re.compile(r"(^|\.)(user|device)\.geo(\.|$)", re.I)),
@@ -89,9 +115,15 @@ BUCKETS = ["identity", "segments", "geo", "consent", "device", "content"]
 
 
 def bucket(path):
-    leaf = path.rsplit(".", 1)[-1].replace("[]", "").lower()
+    # The `?` marks a query-string path. Stripped HERE rather than at each call site: a caller
+    # that forgets sends `?screenw` through as a leaf nothing matches, and the field silently
+    # buckets as nothing — which is this tool's whole failure mode.
+    leaf = path.lstrip("?").rsplit(".", 1)[-1].replace("[]", "").lower()
     for name, names in LEAF.items():
         if leaf in names:
+            return name
+    for name, rx in LEAF_RX:
+        if rx.search(leaf):
             return name
     for name, rx in PATH:
         if rx.search(path):
@@ -279,7 +311,7 @@ def buckets_of(h, half="both"):
     if half in ("both", "url"):
         src += sorted(h["qpaths"])
     for p in src:
-        b = bucket(p.lstrip("?"))
+        b = bucket(p)
         if b:
             out[b].append(p)
     return out
@@ -463,6 +495,27 @@ def selftest():
     checks.append(("device.ip is geo, not content", bucket("device.ip") == "geo"))
     checks.append(("regs.ext.gdpr is consent", bucket("regs.ext.gdpr") == "consent"))
     checks.append(("site.page is content, never audience", bucket("site.page") == "content"))
+
+    # THE FAMILIES, each pinned to the live field that defeated the exact-name taxonomy on
+    # 2026-08-20. Mutant: drop LEAF_RX and the session-id PATH rule, and ssp01.rambler.ru's
+    # two identifiers, its session id and its six targeting params all bucket as nothing —
+    # the census then prints the richest identity payload in the sweep as carrying none.
+    checks.append(("`adtech_uid` is identity — an exact-name set never listed it",
+                   bucket("?adtech_uid") == "identity"))
+    checks.append(("`publisher_uid` is identity", bucket("?publisher_uid") == "identity"))
+    checks.append(("`rq_sess` is identity — a session id is an id that expires",
+                   bucket("?rq_sess") == "identity"))
+    # The leaf here is the publisher's numeric site id, so only a whole-path rule can see it.
+    checks.append(("`top100_session_id.<siteid>` is identity, though its leaf is a number",
+                   bucket("?top100_session_id.7731951") == "identity"))
+    # Named "publisher USER ID", carries a publisher-declared audience attribute.
+    checks.append(("`puidN` buckets by its ROLE (segments), not by its name",
+                   bucket("?jparams.puid6") == "segments"))
+    # And the discipline that keeps the families honest: a placement id is not a person.
+    checks.append(("`block_id` and `pad_id` on that same request stay unbucketed",
+                   bucket("?block_id") is None and bucket("?pad_id") is None))
+    checks.append(("`screenw` is device, in the GET exchanges' own vocabulary",
+                   bucket("?screenw") == "device"))
 
     # urlencoded is a real wire format, and a JSON value inside it is unwrapped.
     fmt, flat2 = parse_body('sid=99&data={"user":{"segment":["a","b"]}}')
