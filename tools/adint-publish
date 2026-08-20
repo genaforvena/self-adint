@@ -50,6 +50,7 @@ def _load(name):
 
 
 SB = _load("adint-frame-stageb")
+BC = _load("adint-body-census")
 
 # ── the allowlists, per ledger kind ───────────────────────────────────────────────────
 # Read these as the dataset's schema: what is published IS this list.
@@ -121,7 +122,23 @@ NESTED = {"detail": ["prices", "currency", "at", "seatbids", "bids", "reason",
                      "has_seatbid", "has_bids_key", "seatbid", "bytes", "net_fault",
                      "location"]}
 
-KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS}
+# The census: what each exchange ASKS ABOUT THE PERSON, as key-path shapes and counts.
+# This ledger is publishable for the same reason the one it was read from is not — every
+# field below is a name, a count or a shape CLASS, and there is no field that could carry a
+# value. `adint-body-census` is built that way; this list re-asserts it on the way out rather
+# than trusting it, which is the whole point of an allowlist. In particular `shapes` crosses
+# and nothing resembling `req_body`, `req_url_full` or a raw parameter value does.
+CENSUS_FIELDS = [
+    "census_schema", "source", "host", "state", "half", "path", "bucket", "shapes",
+    "n_req", "n_loads", "distinct_values", "distinct_values_saturated",
+    # `empty_slot` is the finding-bearing state — a field asked for on every request and
+    # never answered is neither an absent field nor a carried one — so it must survive.
+    "empty_slot",
+    "host_n_req", "host_n_read", "host_n_candidate", "host_n_unclassified",
+    "host_n_url_maybe_cut", "host_n_loads",
+]
+
+KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS, "census": CENSUS_FIELDS}
 
 HEADER = """# {name}
 #
@@ -151,7 +168,8 @@ def main():
     if args.test:
         return selftest()
     if not args.source or not args.kind:
-        print("usage: adint-publish --kind {frame,paired} <data/…jsonl>", file=sys.stderr)
+        print("usage: adint-publish --kind {frame,paired,census} <data/…jsonl>",
+              file=sys.stderr)
         return 2
 
     return publish(args.source, args.kind, args.out, args.rule)
@@ -267,6 +285,85 @@ def selftest():
           sorted(kept_p), ["bidder", "outcome"])
     check("no published field's VALUE carries the payload either",
           any("REAL-PERSON" in str(v) for v in kept_p.values()), False)
+
+    # THE CENSUS ALLOWLIST. It exists to publish "which fields does this exchange ask for",
+    # and it must not become a way to publish what was in them.
+    for bad in ("req_body", "req_body_bytes", "req_url_full", "req_url_bytes",
+                "value", "values", "raw", "sample"):
+        check("the census allowlist has no `%s`" % bad, bad in CENSUS_FIELDS, False)
+    census_row = {"host": "ssp.example", "path": "user.buyeruid", "shapes": ["hex:32"],
+                  "bucket": "identity", "n_loads": 23, "distinct_values": 3,
+                  "empty_slot": False,
+                  "req_body": '{"user":{"buyeruid":"REAL-PERSON"}}',
+                  "req_url_full": "https://ssp.example/rtb?uid=REAL-PERSON",
+                  "value": "REAL-PERSON", "a_column_invented_next_month": "REAL-PERSON"}
+    kept_c = {k: census_row[k] for k in CENSUS_FIELDS if k in census_row}
+    check("a census row publishes the shape and the counts, never the payload",
+          sorted(kept_c), ["bucket", "distinct_values", "empty_slot", "host", "n_loads",
+                           "path", "shapes"])
+    check("no published census field's VALUE carries the payload either",
+          any("REAL-PERSON" in str(v) for v in kept_c.values()), False)
+    # The state that carries the finding must survive the boundary, or the dataset says less
+    # than the printout it came from.
+    check("`empty_slot` crosses", "empty_slot" in CENSUS_FIELDS, True)
+
+    # THE LEAK CHECK, AS A GATE. Every check above asserts a FIELD NAME, and the leak that
+    # actually happened was in the CONTENT of an allowed field: the census publishes key
+    # paths and hostnames, and both can embed an identifier. So this one takes the tokens
+    # that were on the wire and asserts none of them survive into the export — the same
+    # diff that found 349 of them in the first published census, run every time.
+    import re as _re
+    import urllib.parse as _up
+
+    def _wire_values(body, url):
+        """Every VALUE the wire carried, and every id-shaped segment of the hostname.
+
+        Not every token: a census publishes key NAMES on purpose, so asserting that no wire
+        token survives would fail on `top100_session_id` — the very field the study reports.
+        The rule the export actually has to keep is narrower and is the one that was broken:
+        nothing that appeared as a VALUE, and no identifier hiding inside a name.
+        """
+        vals = set()
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    # A KEY can be an identifier. Names are fine to publish; ids are not,
+                    # wherever they sit.
+                    if _re.fullmatch(r"[0-9a-f]{12,}|[0-9]{12,}", str(k), _re.I):
+                        vals.add(str(k))
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+            elif isinstance(o, str) and len(o) >= 12:
+                vals.add(o)
+        try:
+            walk(json.loads(body))
+        except Exception:
+            pass
+        parts = _up.urlsplit(url)
+        for _k, v in _up.parse_qsl(parts.query, keep_blank_values=True):
+            if len(v) >= 12:
+                vals.add(v)
+        for seg in _re.split(r"[.-]", parts.hostname or ""):
+            if _re.fullmatch(r"[0-9a-f]{12,}|[0-9]{12,}", seg, _re.I):
+                vals.add(seg)
+        return vals
+
+    _wire_body = ('{"top100_session_id":{"1914484777455681117":"x"},'
+                  '"user":{"buyeruid":"8f14e45fceea167a5a36dedd4bea2543"}}')
+    _wire_url = "https://2-6a871d048f403bcd46b18008.id.example/rtb?uid=REALPERSONTOKEN123"
+    _census_rows = list(BC.emit_rows(BC.census([
+        {"kind": "request", "load_id": "L1", "host": "2-6a871d048f403bcd46b18008.id.example",
+         "req_body": _wire_body, "req_url_full": _wire_url}]), "x.jsonl"))
+    _exported = json.dumps([{k: r[k] for k in CENSUS_FIELDS if k in r}
+                            for r in _census_rows])
+    _wv = _wire_values(_wire_body, _wire_url)
+    check("the leak check has values to look for (an empty needle asserts nothing)",
+          len(_wv) >= 4, True)
+    check("no VALUE from the wire, and no id inside a name, survives into the census",
+          sorted(t for t in _wv if t in _exported), [])
 
     check("an advertising id is not on the frame allowlist",
           "device_ifa" in FRAME_FIELDS, False)

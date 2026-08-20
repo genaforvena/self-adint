@@ -113,6 +113,18 @@ LEAF_RX = [
 PATH = [
     # `top100_session_id.<site id>` — the leaf is the publisher's numeric site id, so no leaf
     # rule can see this one. The identifier is in the PARENT key.
+    # Metrica `userParams` (`__ymu`) and the publisher-declared visitor labels that ride
+    # beside them. FOURTH taxonomy miss, and the one that mattered most: this is an audience
+    # profile written in plain language as KEY NAMES — `Пользователь.Подозрительный`
+    # ("User: Suspicious"), `Пользователь.Лояльность.Disloyal`, `.Комментатор`,
+    # `.Достижения`, `.Авторизация` — and a name-matching taxonomy in English scored every
+    # one of them as nothing. A taxonomy is a copy of the world in ONE LANGUAGE.
+    # Order matters here: PATH is first-match-wins, and `__ymu.pgUserName` is an identity
+    # slot sitting inside the segments block. The narrower rule has to come first or the
+    # username buckets as a segment.
+    ("identity", re.compile(r"(^|\.)__ymu\.pgUser(ID|Name)$", re.I)),
+    ("segments", re.compile(r"(^|\.)__ymu(\.|$)", re.I)),
+    ("segments", re.compile(r"(^|\.)(Пользователь|userParams)(\.|$)", re.I)),
     ("identity", re.compile(r"fp_?uids?\[\]", re.I)),
     ("identity", re.compile(r"sess(ion)?_?id", re.I)),
     ("identity", re.compile(r"(^|\.)user\.(ext\.)?(id|eids)", re.I)),
@@ -558,6 +570,73 @@ def arm_diff(a, b, host, min_loads=1):
     return only_a, only_b, changed, filled, counts, stab
 
 
+ID_SEG = re.compile(r"^(?:[0-9a-f]{12,}|[0-9]{12,}|[A-Za-z0-9+/=_-]{20,}"
+                    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.I)
+
+
+def redact_ids(text, seps=".-"):
+    """Replace identifier-looking SEGMENTS of a name with their shape.
+
+    A KEY CAN BE AN IDENTIFIER, and the census publishes key paths. The design assumed keys
+    are schema and values are data; that is false for a map keyed by an id — which is exactly
+    the `top100_session_id.<site id>` shape the study reports as a finding. Measured on the
+    first emit of the 2026-08-20 paired ledger: 349 tokens of 12+ characters that had been on
+    the wire also appeared in the published file, among them a 24-hex identifier embedded in
+    a SYNC HOSTNAME (`2-6a871d048f403bcd46b18008.id.…`). Field-name allowlisting cannot see
+    that, because the leak is in the content of an allowed field.
+
+    Short segments survive, and that is deliberate: a 7-digit publisher site id is not a
+    person, and keeping it is what lets "2 distinct site ids cold, 7 warm" remain readable.
+    The threshold is on LENGTH and alphabet, so it errs toward redacting.
+    """
+    out = []
+    for seg in re.split("([" + re.escape(seps) + r"\[\]?~])", text):
+        if seg and ID_SEG.match(seg):
+            out.append("<%s>" % shape(seg))
+        else:
+            out.append(seg)
+    return "".join(out)
+
+
+def emit_rows(per, source):
+    """One publishable row per (host, key path). Shapes and counts only, by construction.
+
+    This is the census as a DATASET rather than a printout — the point of the whole
+    shape-not-value discipline is that this file can be published while the ledger it was
+    read from cannot. Every field here is a count, a name, or a shape class; there is no
+    field that could carry a value, and `adint-publish`'s allowlist re-asserts that on the
+    way out rather than trusting this function.
+    """
+    for host in sorted(per):
+        h = per[host]
+        emp, fil = slots(h)
+        empset = set(emp)
+        for half, src in (("body", h["paths"]), ("url", h["qpaths"])):
+            for path in sorted(src):
+                e = src[path]
+                yield {
+                    "census_schema": SCHEMA, "source": os.path.basename(source),
+                    "host": redact_ids(host), "state": h["state"], "half": half,
+                    "path": redact_ids(path),
+                    # Bucketed from the ORIGINAL path: redaction changes the name and must
+                    # not silently change the classification with it.
+                    "bucket": bucket(path),
+                    "shapes": sorted(e["shapes"]),
+                    "n_req": e["n"], "n_loads": len(e["loads"]),
+                    "distinct_values": len(e["vals"]),
+                    "distinct_values_saturated": bool(e.get("vals_saturated")),
+                    # `empty_slot` is the finding-bearing state and must survive export: a
+                    # field asked for on every request and never answered is neither an
+                    # absent field nor a carried one.
+                    "empty_slot": path in empset,
+                    "host_n_req": h["n_req"], "host_n_read": h["n_read"],
+                    "host_n_candidate": h["n_candidate"],
+                    "host_n_unclassified": h["n_unclassified"],
+                    "host_n_url_maybe_cut": h["n_url_maybe_cut"],
+                    "host_n_loads": len(h["loads"]),
+                }
+
+
 def load(paths):
     rows, schemas = [], collections.Counter()
     for path in paths:
@@ -591,6 +670,9 @@ def main():
     ap.add_argument("--audience-only", action="store_true",
                     help="with --by-arm, show only differences in fields that make a claim "
                          "ABOUT THE PERSON (identity / segments / consent)")
+    ap.add_argument("--emit", metavar="FILE",
+                    help="write the census as JSONL, one row per (host, key path). Shapes "
+                         "and counts only — publishable, unlike the ledger it reads")
     ap.add_argument("--decode", action="store_true",
                     help="open one layer inside opaque values (base64, then gzip/zlib) and "
                          "census what is in there, marked `~b64`. Still shapes, never "
@@ -649,6 +731,15 @@ def main():
               % old)
         print("     Their silence about a profile is not evidence the request carried none.")
         print()
+
+    if args.emit:
+        n = 0
+        with open(args.emit, "w", encoding="utf-8") as fh:
+            for row in emit_rows(per, args.ledgers[0]):
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                n += 1
+        print("wrote %d census row(s) to %s" % (n, args.emit))
+        return 0
 
     if args.by_arm:
         base, other = args.by_arm
@@ -915,6 +1006,59 @@ def selftest():
          arm_diff(_arms["cold"], _arms["warm"], "only-warm.example") is None),
     ]
 
+    # THE EMIT IS THE PUBLISHABLE ARTEFACT, so it is gated on the thing that makes it
+    # publishable: no field may carry a value, ever.
+    _em = census([
+        {"kind": "request", "host": "e.example", "load_id": "L1", "is_bid_candidate": True,
+         "req_body": '{"user":{"buyeruid":"REAL-PERSON-8f14e45f","eids":[]}}',
+         "req_url_full": "https://e.example/rtb?uid=REAL-PERSON-8f14e45f"},
+    ])
+    _rows = list(emit_rows(_em, "data/secret-ledger.jsonl"))
+    _blob = json.dumps(_rows)
+    checks += [
+        ("the emit carries one row per (host, key path), both halves",
+         {(r["half"], r["path"]) for r in _rows} ==
+         {("body", "user.buyeruid"), ("body", "user.eids[]"), ("url", "?uid")}),
+        # THE GATE THAT MATTERS. Every other property of this file is a convenience.
+        ("NO emitted field carries the value, from either half",
+         "REAL-PERSON" not in _blob),
+        ("the shape crosses instead", any(r["path"] == "user.buyeruid"
+                                          and r["shapes"] == ["str:20"] for r in _rows)),
+        # The finding-bearing state must survive export, or the dataset says less than the
+        # printout it came from.
+        ("`empty_slot` survives the export",
+         any(r["path"] == "user.eids[]" and r["empty_slot"] for r in _rows)),
+        ("the source is named by BASENAME, so no local path is published",
+         all(r["source"] == "secret-ledger.jsonl" for r in _rows)),
+    ]
+
+    # A KEY CAN BE AN IDENTIFIER, and the census publishes key paths. Field-name allowlisting
+    # is blind to this: the leak is in the CONTENT of an allowed field. Found by diffing the
+    # first published emit against every 12+ character token that had been on the wire —
+    # 349 of them matched, including a 24-hex id inside a sync HOSTNAME.
+    _idrows = list(emit_rows(census([
+        {"kind": "request", "load_id": "L1",
+         "host": "2-6a871d048f403bcd46b18008.id.adhigh.net",
+         "req_body": '{"top100_session_id":{"7731951":"a","1914484777455681117":"b"}}'},
+    ]), "x.jsonl"))
+    _idblob = json.dumps(_idrows)
+    checks += [
+        ("an identifier embedded in a HOSTNAME is redacted to its shape",
+         "6a871d048f403bcd46b18008" not in _idblob
+         and any(r["host"] == "2-<hex:24>.id.adhigh.net" for r in _idrows)),
+        ("an identifier used as a JSON KEY is redacted to its shape",
+         "1914484777455681117" not in _idblob),
+        # And the discipline that keeps redaction from eating the finding: a 7-digit
+        # publisher site id is not a person, and keeping it is what lets "2 distinct site ids
+        # when cold, 7 when warm" stay readable.
+        ("a short publisher site id survives, so the cross-site result stays readable",
+         any(r["path"] == "top100_session_id.7731951" for r in _idrows)),
+        # Redaction renames; it must not reclassify.
+        ("the bucket is computed from the ORIGINAL path, not the redacted one",
+         all(r["bucket"] == "identity" for r in _idrows
+             if "top100_session_id" in r["path"])),
+    ]
+
     # PRESENT-AND-EMPTY. The state a bucket count hides, and the one that carries the finding.
     _sl = census([
         # sape's real shape: an eids-style graph, asked for on every request, empty on this
@@ -945,6 +1089,27 @@ def selftest():
         # And the boundary: a placement id is not a slot for a person.
         ("a non-audience field is not a slot at all",
          "places[].targetRef" not in _emp + _fil),
+    ]
+
+    # A TAXONOMY IS A COPY OF THE WORLD IN ONE LANGUAGE. The publisher-declared visitor
+    # labels on this market's dominant analytics path are written in Russian, as KEY NAMES,
+    # and an English name-matching taxonomy scored every one of them as nothing.
+    checks += [
+        ("a Russian-language visitor label is a segment, not nothing",
+         bucket("?site-info.Пользователь.Подозрительный") == "segments"
+         and bucket("?site-info.Пользователь.Лояльность.Disloyal") == "segments"),
+        ("Metrica userParams (`__ymu`) is a segment block",
+         bucket("?site-info.__ymu.authStat") == "segments"),
+        # First-match-wins, and the username sits INSIDE the segments block: the narrower
+        # rule has to be reached first or an identity slot buckets as a segment.
+        ("`__ymu.pgUserName` is identity, though it is nested in the segments block",
+         bucket("?site-info.__ymu.pgUserName") == "identity"
+         and bucket("?site-info.__ymu.pgUserID") == "identity"),
+        # And the boundary: the same `site-info` map carries the publisher's UI taxonomy,
+        # which is not a claim about the person.
+        ("a page-section key in the same map is not an audience field",
+         bucket("?site-info.gazeta_desktop.main.do_not_miss") is None
+         and bucket("?site-info.block") is None),
     ]
 
     # THE CANDIDATE VERDICT IS READ, NEVER RE-DECIDED. Three states, because a row that
