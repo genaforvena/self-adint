@@ -169,3 +169,61 @@ already dedups against and the same one that inflated the coverage percentage be
    at capture time, `curl` the same URL from inside the vantage's namespace and record the
    result beside the load. That separates "this link could not finish this page" from "this
    host was unreachable" per row, instead of by hand afterwards for one site.
+
+---
+
+## 7. The foreign arm is not one vantage, and the filename does not say which
+
+Found 2026-08-21 while mining the exploratory half, and it changes how every pooled
+foreign-arm number in this project must be read.
+
+**The `.nl.jsonl` suffix names a SLOT, not a vantage.** `tools/adint-paired-run` writes
+the non-domestic arm to `<prefix>.nl.jsonl` whatever exit that arm actually used, and the
+vantage lives in the row's own `arm` field. Across the 14 published cells:
+
+| file suffix | `arm` on the load rows | cells |
+|---|---|---:|
+| `.nl.jsonl` | `nl-direct` | 8 |
+| `.nl.jsonl` | **`us-exit`** | **6** |
+| `.ru.jsonl` | `ru-mobile` | 14 |
+
+So **6 of 14 cells in the "NL" file are not NL**. Anyone globbing `*.nl.jsonl` and calling
+it the NL arm is wrong for 43 % of the foreign corpus — and nothing in the filename, the
+header or the README said so. The row is authoritative; the filename is a slot. This is
+the same shape as *organ labels are not sources when two read one device*: two names for
+one thing, only one of which tracks reality.
+
+**The consequence is not cosmetic.** The foreign vantage CHANGED identity mid-corpus, from
+a US exit to a Dutch one. A statistic pooled over "the foreign arm" therefore averages two
+different countries, two different ASNs and two different weeks, and no single number over
+that mixture answers a question anyone asked. `tools/adint-holdout` now reports **one 2×2
+per foreign arm** and refuses to pool them; the first cut picked whichever arm sorted first
+alphabetically, which silently dropped a whole arm and made the headline depend on an
+alphabet.
+
+**And it bears directly on the pilot's headline.** `docs/step0f-adfox-cards-2026-08-21.md`
+reports zero priced entries on the US arm. On the exploratory half, `us-exit` carries
+**one** — `adwile` via `ssp.24smi.net`, matched by placement id, protocol-strength
+evidence. One entry is not a refutation of eleven-versus-zero, and it is not being
+presented as one: it is on the exploratory half, so it is **interesting and unconfirmed**,
+and the holdout has not been read. But "zero" and "one" are different claims, and the
+difference is exactly the kind that a pooled arm label hides.
+
+### What this cost, and the rule that comes out of it
+
+The find arrived through a bug. `tools/adint-holdout`'s first analysis set joined request
+rows on `pair_id` — which **no request row carries**; they carry `load_id`, and only the
+load row names a pair. All 13 466 request rows were excluded as `unpaired`, and the report
+rendered as a tidy object with `priced_total: 0` and a null test. That is a broken join
+wearing the face of a clean negative result.
+
+Two things caught it and both were built for it. The **exclusion counts** are printed
+rather than dropped, so one category holding the entire corpus was visible at a glance.
+And the fix added the rule the report now enforces: **an empty analysis set is a FAULT,
+not a result** — a report with nothing in it says so, instead of publishing zeroes that
+read like a finding of nothing.
+
+The gate that should have caught it earlier could not: the selftest fixture gave request
+rows a `pair_id` they never have in life. **A fixture that does not have the data's shape
+cannot catch a miswired reader** — it certifies the reader against a world that does not
+exist. The fixture now carries `load_id` and the join itself is asserted.

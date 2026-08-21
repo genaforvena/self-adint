@@ -149,13 +149,26 @@ def analysis_set(half=None):
     produce a confident, publishable, false result.
     """
     exc = {"wrong-half": 0, "vantage-unproven": 0, "no-arm": 0, "unpaired": 0,
-           "not-a-request": 0}
-    rendered = {}
+           "no-load": 0, "not-a-request": 0}
+    # THE JOIN IS request -> load_id -> load -> pair_id, and it is NOT request -> pair_id.
+    # A request row carries `load_id` and no pair key at all; only the load row knows which
+    # pair it belongs to. The first cut read `pair_id` straight off the request row, found
+    # None on every one of 13 466 of them, and filed them all as `unpaired` — an empty
+    # analysis set that rendered as a tidy report with priced_total 0 and a null test.
+    # It was the EXCLUSION COUNT that exposed it, which is the argument for counting
+    # exclusions instead of dropping them quietly.
+    rendered, pair_of, arm_of = {}, {}, {}
     for base, arm, r in cell_rows():
-        if r.get("kind") != "load" or not r.get("pair_id"):
+        if r.get("kind") != "load":
+            continue
+        lid, pid = r.get("load_id"), r.get("pair_id")
+        if not pid:
             continue
         ok = r.get("http_status") is not None and bool(r.get("vantage_verified"))
-        rendered.setdefault(r["pair_id"], {})[arm] = ok
+        rendered.setdefault(pid, {})[arm] = ok
+        if lid:
+            pair_of[lid] = pid
+            arm_of[lid] = arm
     good = {p for p, arms in rendered.items() if len(arms) > 1 and all(arms.values())}
     keep = []
     for base, arm, r in cell_rows():
@@ -167,14 +180,21 @@ def analysis_set(half=None):
         if half and half_of(run_of(base)) != half:
             exc["wrong-half"] += 1
             continue
-        if not arm:
+        lid = r.get("load_id")
+        # The arm is taken from the row where it is authoritative — the LOAD — falling back
+        # to the request's own copy. Two writers of one field is how they come apart.
+        a = arm_of.get(lid) or arm
+        if not a:
             exc["no-arm"] += 1
             continue
-        pid = r.get("pair_id")
+        pid = pair_of.get(lid)
+        if pid is None:
+            exc["no-load"] += 1
+            continue
         if pid not in good:
             exc["vantage-unproven" if pid in rendered else "unpaired"] += 1
             continue
-        keep.append((arm, r))
+        keep.append((a, dict(r, pair_id=pid)))
     return keep, exc, good
 
 
@@ -318,14 +338,39 @@ def cmd_split(args):
 def _report(keep, cov, ru, seed, n):
     perm = paired_permutation(keep, ru, seed, n)
     out = {"coverage": cov, "paired_permutation": perm}
+    # AN EMPTY ANALYSIS SET IS A FAULT, NOT A RESULT. Without this the report renders as a
+    # tidy object with priced_total 0 and a null test, which reads exactly like "we looked
+    # and there was nothing" — the shape a broken join wears. Measured: a wrong join key
+    # produced precisely that.
+    if not keep:
+        out["FAULT"] = ("the analysis set is EMPTY — every row was excluded. This is not "
+                        "a finding of nothing; it is a report with nothing in it. Read the "
+                        "exclusion counts: whichever one holds the whole corpus is the bug.")
+    elif not perm:
+        out["FAULT"] = ("rows survived but NO COMPLETE PAIR did, so there is nothing to "
+                        "contrast. Read the exclusions before reading anything else.")
     arms = cov["arms"]
-    fo = [a for a in arms if a != ru]
-    if ru in arms and fo:
-        f = fo[0]
+    others = sorted(a for a in arms if a != ru)
+    # ONE ROW PER FOREIGN ARM, never "the" foreign arm. The corpus carries more than two
+    # arms across its generations (nl-direct and a retired us-exit), and the first cut
+    # picked whichever sorted first — so the headline 2x2 silently dropped a whole arm and
+    # its result depended on an alphabet. If the effect is about "not Russia" the arms
+    # agree; if it tracks one country or ASN it is a different effect with a different
+    # name, and folding them makes that undecidable.
+    out["arms_compared"] = {"domestic": ru, "foreign": others}
+    if len(others) > 1:
+        out["NOTE_MULTI_ARM"] = (
+            f"{len(others)} foreign arms in this set ({', '.join(others)}). They are "
+            "reported SEPARATELY and never pooled: pooling would average arms captured in "
+            "different weeks under different exits, and no single p over that mixture "
+            "answers a question anyone asked.")
+    if ru in arms:
+        out["fisher_one_sided"] = {}
         a, b = arms[ru]["priced"], arms[ru]["entries"] - arms[ru]["priced"]
-        c, d = arms[f]["priced"], arms[f]["entries"] - arms[f]["priced"]
-        out["fisher_one_sided"] = {"table": [a, b, c, d],
-                                   "p": fisher_one_sided(a, b, c, d)}
+        for f in others:
+            c, d = arms[f]["priced"], arms[f]["entries"] - arms[f]["priced"]
+            out["fisher_one_sided"][f] = {"table": [a, b, c, d],
+                                          "p": fisher_one_sided(a, b, c, d)}
     return out
 
 
@@ -470,12 +515,19 @@ def selftest():
           "2026-08-21-morning-2026082104")
 
     # ── THE ANALYSIS SET ── the vantage rule is exercised, not merely described.
+    # THE FIXTURE MUST HAVE THE REAL LEDGER'S SHAPE. The first cut gave request rows a
+    # `pair_id`, which no real request row carries — they carry `load_id` and nothing else
+    # that names a pair. So the fixture passed a reader that joined on the wrong key, and
+    # against the live corpus that reader excluded all 13 466 request rows as `unpaired`
+    # and rendered a tidy report with priced_total 0. A fixture that does not have the
+    # data's shape cannot catch a miswired reader.
     def load(pid, arm, status, verified):
-        return {"kind": "load", "pair_id": pid, "arm": arm, "http_status": status,
-                "vantage_verified": verified, "url": "https://s.ru/"}
+        return {"kind": "load", "pair_id": pid, "load_id": f"L-{pid}-{arm}", "arm": arm,
+                "http_status": status, "vantage_verified": verified,
+                "url": "https://s.ru/"}
     def req(pid, arm, outcome):
-        return {"kind": "request", "pair_id": pid, "arm": arm, "outcome": outcome,
-                "bidder": "roxot"}
+        return {"kind": "request", "load_id": f"L-{pid}-{arm}", "arm": arm,
+                "outcome": outcome, "bidder": "roxot"}
     # Two cells, deliberately chosen so one lands in each half.
     cells = {}
     for i in range(200):
@@ -509,23 +561,59 @@ def selftest():
     check("the other half's rows are excluded and counted, not silently dropped",
           exc_e["wrong-half"] > 0, True)
     cov = coverage("exploratory")
-    check("the priced entries land on the RU arm",
-          (cov["arms"]["ru-mobile"]["priced"], cov["arms"]["nl-direct"]["priced"]), (8, 0))
+    # Miss-tolerant: a mutant that empties the analysis set leaves no arm keys, and
+    # subscripting them raises — the red gate that hides every gate after it. Third time
+    # this pattern has bitten in this file; read through an accessor by default.
+    def pr(a):
+        return (cov["arms"].get(a) or {}).get("priced")
+    check("the priced entries land on the RU arm", (pr("ru-mobile"), pr("nl-direct")),
+          (8, 0))
+    # A request row names no pair; only its load does. Assert the JOIN, not the presence of
+    # a key — this is the exact wiring the fixture used to be blind to.
+    check("a request is joined to its pair through load_id, not through a pair key",
+          all(a and r.get("pair_id") for a, r in ke), True)
+    check("...and a request whose load is missing is counted, not silently kept",
+          "no-load" in exc_e, True)
 
     # ── THE TEST ── within pairs, and shown both to fire and NOT to fire.
-    perm = paired_permutation(ke, "ru-mobile", seed=1, n=2000)
-    check("the permutation uses every complete pair of its half", perm["pairs_used"], 8)
-    check("a one-sided effect gives a small p", perm["p"] < 0.05, True)
-    check("the p is floor-censored at 1/(n+1), never 0", perm["p"] >= 1 / 2001, True)
+    perm = paired_permutation(ke, "ru-mobile", seed=1, n=2000) or {}
+    check("the permutation uses every complete pair of its half", perm.get("pairs_used"), 8)
+    check("a one-sided effect gives a small p", perm.get("p", 1) < 0.05, True)
+    check("the p is floor-censored at 1/(n+1), never 0", perm.get("p", 0) >= 1 / 2001, True)
     # Nothing else distinguishes a within-pair permutation from a global reshuffle on a
     # fixture this clean: both give a small p, and pairs_used counts pairs either way.
     # Their null SPACES differ — k pairs admit exactly 2**k arrangements, so a within-pair
     # p can never beat 1/2**k, while a global shuffle runs to the resampling floor.
     check("the permutation is WITHIN pairs, so p cannot beat 1/2**pairs",
-          perm["p"] >= 1 / 2 ** perm["pairs_used"], True)
+          perm.get("p", 0) >= 1 / 2 ** perm.get("pairs_used", 0), True)
     flat = [(arm, dict(r, outcome="priced")) for arm, r in ke]
     check("an effect-free corpus does NOT produce a small p",
-          paired_permutation(flat, "ru-mobile", seed=1, n=2000)["p"] > 0.05, True)
+          (paired_permutation(flat, "ru-mobile", seed=1, n=2000) or {}).get("p", 0) > 0.05,
+          True)
+
+    # ── MORE THAN TWO ARMS ── The `.nl.jsonl` slot carries `us-exit` rows in 6 of the
+    # corpus's 14 cells: the FILE names a slot, the ROW names the vantage. So "the foreign
+    # arm" is not one thing, and picking the first one alphabetically makes the headline
+    # depend on an alphabet while dropping a whole arm.
+    with open(os.path.join(PUB, f"hb-paired-{expl}.us-exit.jsonl"), "w") as fh:
+        for i in range(1, 9):
+            fh.write(json.dumps(load(f"{expl}-p{i}", "us-exit", 200, True)) + "\n")
+            fh.write(json.dumps(req(f"{expl}-p{i}", "us-exit", "no-bid")) + "\n")
+    c3 = coverage("exploratory")
+    check("a third arm is seen rather than folded into the second",
+          sorted(c3["arms"]), ["nl-direct", "ru-mobile", "us-exit"])
+    r3 = _report(analysis_set("exploratory")[0], c3, "ru-mobile", 1, 500)
+    check("every foreign arm gets its own 2x2, none is dropped",
+          sorted(r3.get("fisher_one_sided") or {}), ["nl-direct", "us-exit"])
+    check("...and the report says out loud that there is more than one",
+          "reported SEPARATELY and never pooled" in r3.get("NOTE_MULTI_ARM", ""), True)
+    os.remove(os.path.join(PUB, f"hb-paired-{expl}.us-exit.jsonl"))
+
+    # ── AN EMPTY ANALYSIS SET IS A FAULT, NOT A RESULT ──
+    empty = _report([], {"arms": {}, "exclusions": {}, "priced_total": 0}, "ru-mobile",
+                    1, 100)
+    check("a report with nothing in it says so instead of rendering zeroes",
+          "EMPTY" in empty.get("FAULT", ""), True)
 
     # ── THE LANGUAGE ── stamped by the tool, not left to whoever writes the sentence.
     import io as _io, contextlib
