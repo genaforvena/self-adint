@@ -30,6 +30,7 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -458,9 +459,103 @@ def cmd_split(args):
     return 0
 
 
-def _report(keep, cov, ru, seed, n):
+def _site(load_row):
+    return str(load_row.get("site") or load_row.get("url") or "?")
+
+
+def access_contrast(half, domestic):
+    """Who the SITES refuse — the study's other finding, which the pair gate discards.
+
+    A refusal is not a failed observation. `pair-gate:refused` is the right exclusion for
+    the PRICE contrast (there is no auction to compare on a page one arm never saw), and
+    for a while that was the only thing the bucket was read as. But the refusal is itself
+    the measurement this study exists to make, and it has two properties the price contrast
+    does not: it is recorded on EVERY load rather than on the rare occasions a bidder
+    answers with a number, and it is nearly noise-free.
+
+    TWO UNITS, BOTH REPORTED, BECAUSE THEY DISAGREE. Per LOAD the asymmetry is enormous and
+    the p is tiny — and the loads are NOT independent: the same fourteen sites are drawn
+    again every replicate, within a cell, often within one browser generation. A p computed
+    over them treats correlated draws as fresh evidence and will always look decisive. Per
+    SITE the same data is a sign test over discordant sites, which is what the design can
+    actually support, and it is far weaker. The load-level figure is published with its
+    inflation named rather than dropped, because dropping it would hide how the site-level
+    count was arrived at; the SITE level is the one to quote.
+    """
+    tot, ref = {}, {}
+    per_site = {}
+    for base, arm, r in cell_rows(half):
+        if r.get("kind") != "load" or not r.get("pair_id"):
+            continue
+        v = render_verdict(r)
+        if v not in (GATE_OK, GATE_REFUSED):
+            continue          # a load our own link never made says nothing about the site
+        site = _site(r)
+        tot[arm] = tot.get(arm, 0) + 1
+        d = per_site.setdefault(site, {}).setdefault(arm, {"served": 0, "refused": 0})
+        if v == GATE_REFUSED:
+            ref[arm] = ref.get(arm, 0) + 1
+            d["refused"] += 1
+        else:
+            d["served"] += 1
+
+    by_arm = {a: {"attempted": tot[a], "refused": ref.get(a, 0),
+                  "rate": round(ref.get(a, 0) / tot[a], 4)} for a in tot}
+
+    # THE SITE-LEVEL TEST. A site is discordant when it refuses one class of vantage and
+    # serves the other; concordant sites carry no information about the contrast, exactly
+    # as in McNemar. With every discordant site falling the same way the one-sided exact
+    # p is 2**-k, and with k this small that is a number worth being sober about.
+    dom, k_foreign, k_domestic, disc = None, 0, 0, []
+    for site, arms in per_site.items():
+        f_ref = any(v["refused"] for a, v in arms.items() if a != domestic)
+        d_ref = any(v["refused"] for a, v in arms.items() if a == domestic)
+        if f_ref and not d_ref:
+            k_foreign += 1
+            disc.append({"site": site, "refused": "foreign-only"})
+        elif d_ref and not f_ref:
+            k_domestic += 1
+            disc.append({"site": site, "refused": "domestic-only"})
+    k = k_foreign + k_domestic
+    if k:
+        lo = min(k_foreign, k_domestic)
+        p_site = sum(math.comb(k, i) for i in range(lo + 1)) / (2 ** k)
+    else:
+        p_site = None
+
+    return {
+        "UNIT_WARNING": (
+            "The per-load figures below treat repeated draws of the same fourteen sites, "
+            "within a cell and often within one browser generation, as independent. They "
+            "are not. Quote the site level."),
+        "per_load": by_arm,
+        "per_site": per_site,
+        "site_level": {
+            "sites": len(per_site),
+            "discordant": k,
+            "foreign_refused_only": k_foreign,
+            "domestic_refused_only": k_domestic,
+            "discordant_sites": sorted(disc, key=lambda x: x["site"]),
+            "p_one_sided_exact": p_site,
+            "note": ("Sign test over discordant sites; concordant sites carry no "
+                     "information about the contrast. p = 2**-k when all k fall one way, "
+                     "so a handful of sites cannot reach a small p however total the "
+                     "asymmetry looks."),
+        },
+    }
+
+
+def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
+    if half is _MUST_SAY:
+        raise TypeError(
+            "_report() needs an explicit half. Making cell_rows() strict achieved nothing "
+            "while this defaulted to None, because None means BOTH halves one layer down: "
+            "access_contrast straddled the split on the very commit that hardened the "
+            "accessor (ref/HOLDOUT-LEAKS.jsonl, second entry). A permissive default in a "
+            "CALLER re-opens a door the callee just locked.")
     perm = paired_permutation(keep, ru, seed, n)
-    out = {"coverage": cov, "paired_permutation": perm}
+    out = {"coverage": cov, "paired_permutation": perm,
+           "access_contrast": access_contrast(half, ru)}
     # AN EMPTY ANALYSIS SET IS A FAULT, NOT A RESULT. Without this the report renders as a
     # tidy object with priced_total 0 and a null test, which reads exactly like "we looked
     # and there was nothing" — the shape a broken join wears. Measured: a wrong join key
@@ -502,7 +597,7 @@ def cmd_explore(args):
     keep, exc, _p = analysis_set("exploratory")
     cov = coverage("exploratory")
     out = _report(keep, cov, args.ru_arm, args.seed or SEED,
-                  args.permutations or PERMUTATIONS)
+                  args.permutations or PERMUTATIONS, half="exploratory")
     # THE LABEL IS PART OF THE OUTPUT, not part of whoever writes the sentence later. An
     # effect living only on this half is interesting and unconfirmed; it is never
     # significant, and no p here is presented as one.
@@ -530,7 +625,7 @@ def cmd_confirm(args):
     keep, exc, _p = analysis_set("holdout")
     cov = coverage("holdout")
     out = _report(keep, cov, args.ru_arm, args.seed or SEED,
-                  args.permutations or PERMUTATIONS)
+                  args.permutations or PERMUTATIONS, half="holdout")
     out["half"] = "holdout"
     out["claim"] = args.claim
     out["prior_reads"] = prior
@@ -721,6 +816,23 @@ def selftest():
     check("...and None still sees both, for the callers that must count the other half",
           {run_of(b) for b, _a, _r in cell_rows(None)}, ex_runs | ho_runs)
 
+    # AND THE CALLER MUST BE STRICT TOO. cell_rows() refusing a bare call bought nothing
+    # while _report defaulted half=None, because None means BOTH halves — access_contrast
+    # straddled the split on the very commit that hardened the accessor. Assert the
+    # refusal AND assert the resulting numbers are actually half-sized.
+    try:
+        _report([], {"arms": {}, "exclusions": {}, "priced_total": 0}, "ru-mobile", 1, 10)
+        check("_report() with no half REFUSES, so the accessor's strictness survives its "
+              "callers", False, True)
+    except TypeError as e:
+        check("_report() with no half REFUSES, so the accessor's strictness survives its "
+              "callers", "explicit half" in str(e), True)
+    ac_e = access_contrast("exploratory", "ru-mobile")
+    ac_b = access_contrast(None, "ru-mobile")
+    check("a half-scoped access contrast counts fewer loads than the straddling one",
+          all(ac_e["per_load"][a]["attempted"] < ac_b["per_load"][a]["attempted"]
+              for a in ac_e["per_load"]), True)
+
     sib = _sibling_rendered()
     if sib is None:
         check("adint-status is READABLE, so the two render rules can be compared", False,
@@ -783,7 +895,8 @@ def selftest():
     c3 = coverage("exploratory")
     check("a third arm is seen rather than folded into the second",
           sorted(c3["arms"]), ["nl-direct", "ru-mobile", "us-exit"])
-    r3 = _report(analysis_set("exploratory")[0], c3, "ru-mobile", 1, 500)
+    r3 = _report(analysis_set("exploratory")[0], c3, "ru-mobile", 1, 500,
+                 half="exploratory")
     check("every foreign arm gets its own 2x2, none is dropped",
           sorted(r3.get("fisher_one_sided") or {}), ["nl-direct", "us-exit"])
     check("...and the report says out loud that there is more than one",
@@ -792,7 +905,7 @@ def selftest():
 
     # ── AN EMPTY ANALYSIS SET IS A FAULT, NOT A RESULT ──
     empty = _report([], {"arms": {}, "exclusions": {}, "priced_total": 0}, "ru-mobile",
-                    1, 100)
+                    1, 100, half="exploratory")
     check("a report with nothing in it says so instead of rendering zeroes",
           "EMPTY" in empty.get("FAULT", ""), True)
 
