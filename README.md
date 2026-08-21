@@ -35,7 +35,7 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-21 05:27 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-21 06:58 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
@@ -101,39 +101,51 @@ Three counts, because they are three different facts. `this arm` is what this ar
 | `2026-08-21-morning-2026082103` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 27 | **14** | 45 s | 3,4 | 28/28 |
 | `2026-08-21-morning-2026082104` | `nl-direct` | 28 | 4 | 0 | 14 | 28 | 28 | **17** | 45 s | 4,5 | 28/28 |
 | `2026-08-21-morning-2026082104` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **17** | 45 s | 4,5 | 28/28 |
+| `2026-08-21-morning-2026082106` | `nl-direct` | 28 | 5 | 0 | 14 | 28 | 28 | **16** | 45 s | 6 | 28/28 |
+| `2026-08-21-morning-2026082106` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **16** | 45 s | 6 | 28/28 |
 | `2026-08-21-night-2026082100` | `us-exit` | 28 | 5 | 1 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
 | `2026-08-21-night-2026082100` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
 | `2026-08-21-night-2026082102` | `nl-direct` | 28 | 5 | 0 | 14 | 28 | 28 | **15** | 45 s | 2,3 | 28/28 |
 | `2026-08-21-night-2026082102` | `ru-mobile` | 28 | 0 | 11 | 14 | 28 | 28 | **15** | 45 s | 2,3 | 27/28 |
 
-**Coverage against the design:** 178 of 4480 readable pairs (4.0 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. That is the study's own unit: a pair is readable only when BOTH arms saw the page, and only such a pair carries a contrast. Measured in loads attempted the same work reads 702 of 8960 (7.8 %) — the larger figure is what we have SPENT, the smaller is what we can USE, and the gap is the systematic per-site blindness named in the table above, not noise. Everything measured so far is a pilot of that design, not a sample of the Russian market.
+**Coverage against the design:** 194 of 4480 readable pairs (4.3 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. That is the study's own unit: a pair is readable only when BOTH arms saw the page, and only such a pair carries a contrast. Measured in loads attempted the same work reads 758 of 8960 (8.5 %) — the larger figure is what we have SPENT, the smaller is what we can USE, and the gap is the systematic per-site blindness named in the table above, not noise. Everything measured so far is a pilot of that design, not a sample of the Russian market.
 
 ### Per-site yield — the denominator under every per-site claim
 
-Worst-seen first. **`readable` is the n any statement about that site rests on**, and it is not the same number for any two sites: it runs 0 % to 80 % across the frame. So every aggregate over readable pairs above is a **site-weighted** average, weighted by nothing anyone chose — a site the instrument cannot see drops out of it silently, contributing no row and no warning. `attempted` counts pair ids seen in ANY arm, which is the honest denominator for how much of a site the instrument can reach. The loss column keeps the two kinds apart BY ARM, because they are different claims: a `refused` is the publisher's server declining that vantage, a `no answer` is our own link failing to fetch the page. Not shown to correlate with anything about the site's wrapper, and not ruled out either.
+Worst-seen first. **`readable` is the n any statement about that site rests on**, and it is not the same number for any two sites: it runs 0 % to 81 % across the frame. So every aggregate over readable pairs above is a **site-weighted** average, weighted by nothing anyone chose — a site the instrument cannot see drops out of it silently, contributing no row and no warning. `attempted` counts pair ids seen in ANY arm, which is the honest denominator for how much of a site the instrument can reach. The loss column keeps the two kinds apart BY ARM, because they are different claims: a `refused` is the publisher's server declining that vantage, a `no answer` is our own link failing to fetch the page. Not shown to correlate with anything about the site's wrapper, and not ruled out either.
 
 | site | attempted | complete | **readable** | yield | lost, by arm and kind |
 |---|---:|---:|---:|---:|---|
-| `rbc.ru` | 26 | 25 | **0** | 0 % | ru-mobile no-answer 20, nl-direct refused 16, us-exit refused 10 |
-| `aif.ru` | 25 | 24 | **4** | 16 % | ru-mobile no-answer 20 |
-| `magnit.ru` | 28 | 24 | **8** | 29 % | ru-mobile no-answer 16 |
-| `matchtv.ru` | 27 | 24 | **8** | 30 % | ru-mobile no-answer 16 |
-| `iz.ru` | 26 | 23 | **8** | 31 % | us-exit refused 8, nl-direct refused 6, ru-mobile no-answer 3 |
-| `pikabu.ru` | 28 | 27 | **11** | 39 % | ru-mobile no-answer 16, nl-direct refused 1 |
-| `gismeteo.ru` | 27 | 25 | **15** | 56 % | nl-direct refused 10, ru-mobile no-answer 6 |
-| `mk.ru` | 27 | 24 | **15** | 56 % | nl-direct no-answer 7, ru-mobile no-answer 5 |
-| `kp.ru` | 26 | 23 | **15** | 58 % | nl-direct no-answer 6, ru-mobile no-answer 6 |
-| `hh.ru` | 26 | 22 | **16** | 62 % | ru-mobile no-answer 4, us-exit no-answer 3, nl-direct refused 2, us-exit refused 1 |
-| `aviasales.ru` | 25 | 24 | **19** | 76 % | ru-mobile no-answer 5 |
-| `sports.ru` | 26 | 25 | **20** | 77 % | ru-mobile no-answer 4, us-exit no-answer 1 |
-| `interfax.ru` | 24 | 23 | **19** | 79 % | ru-mobile no-answer 3, us-exit no-answer 1 |
-| `ria.ru` | 25 | 23 | **20** | 80 % | ru-mobile no-answer 3 |
+| `rbc.ru` | 28 | 27 | **0** | 0 % | ru-mobile no-answer 22, nl-direct refused 18, us-exit refused 10 |
+| `aif.ru` | 27 | 26 | **4** | 15 % | ru-mobile no-answer 22 |
+| `magnit.ru` | 30 | 26 | **8** | 27 % | ru-mobile no-answer 18 |
+| `matchtv.ru` | 29 | 26 | **8** | 28 % | ru-mobile no-answer 18 |
+| `iz.ru` | 28 | 25 | **8** | 29 % | nl-direct refused 8, us-exit refused 8, ru-mobile no-answer 3 |
+| `pikabu.ru` | 30 | 29 | **11** | 37 % | ru-mobile no-answer 18, nl-direct refused 2 |
+| `gismeteo.ru` | 29 | 27 | **17** | 59 % | nl-direct refused 10, ru-mobile no-answer 6 |
+| `mk.ru` | 29 | 26 | **17** | 59 % | nl-direct no-answer 7, ru-mobile no-answer 5 |
+| `kp.ru` | 28 | 25 | **17** | 61 % | nl-direct no-answer 6, ru-mobile no-answer 6 |
+| `hh.ru` | 28 | 24 | **18** | 64 % | ru-mobile no-answer 4, us-exit no-answer 3, nl-direct refused 2, us-exit refused 1 |
+| `aviasales.ru` | 27 | 26 | **21** | 78 % | ru-mobile no-answer 5 |
+| `sports.ru` | 28 | 27 | **22** | 79 % | ru-mobile no-answer 4, us-exit no-answer 1 |
+| `interfax.ru` | 26 | 25 | **21** | 81 % | ru-mobile no-answer 3, us-exit no-answer 1 |
+| `ria.ru` | 27 | 25 | **22** | 81 % | ru-mobile no-answer 3 |
 
-These 178 readable pairs are the same 178 the coverage line counts — the table is a decomposition of that figure, not a second measurement of it. A row whose `complete` is high and whose `readable` is zero is the shape to watch: both arms wrote a load, so the pair looks complete, and one arm never saw the page, so there is no contrast inside it.
+These 194 readable pairs are the same 194 the coverage line counts — the table is a decomposition of that figure, not a second measurement of it. A row whose `complete` is high and whose `readable` is zero is the shape to watch: both arms wrote a load, so the pair looks complete, and one arm never saw the page, so there is no contrast inside it.
 
-> **Structural zeroes — sites in the frame that can yield no readable pair.** `rbc.ru` (26 attempted, 20 ru-mobile no-answer, 16 nl-direct refused, 10 us-exit refused). A site here costs loads every replicate and returns no contrast, and it is absent from every aggregate above without appearing in any of them. Keeping or dropping it is a decision about the study, recorded in `ref/CANONICAL-FRAME` where the frame is declared — never made here, and never made by quietly dropping it, since a frame that sheds what the instrument cannot see becomes a frame defined by the instrument and then reports full coverage of itself.
+> **Structural zeroes — sites in the frame that can yield no readable pair.** `rbc.ru` (28 attempted, 22 ru-mobile no-answer, 18 nl-direct refused, 10 us-exit refused). A site here costs loads every replicate and returns no contrast, and it is absent from every aggregate above without appearing in any of them. Keeping or dropping it is a decision about the study, recorded in `ref/CANONICAL-FRAME` where the frame is declared — never made here, and never made by quietly dropping it, since a frame that sheds what the instrument cannot see becomes a frame defined by the instrument and then reports full coverage of itself.
 
 > Declared in `ref/CANONICAL-FRAME`: `rbc.ru`. This list is recomputed from the corpus on every run, so a site whose refusal breaks leaves it here on its own — check the declaration still describes a site that is on this list.
+
+### What a `no answer` was, where a control was taken
+
+A load with no HTTP status says the navigation never returned a response — our own link, never the publisher's refusal. But that is still two facts under one word. After each pair, the same URL is fetched with plain `curl` from inside the SAME vantage (`tools/adint-paired-run --control-curl`, on by default): if that answers, the host was reachable and the full page did not finish inside the nav budget — a budget we chose. If it does not, the host was unreachable from that vantage at that moment — a hole in the frame. **`unattributed` is loads captured before the control existed**, kept in the table because a split computed over only the rows that happen to carry a control would read as a fact about the corpus while being a fact about when the control was wired. The control runs AFTER the pair, never beside it — a second fetch racing the first would compete for the very link under measurement — so each control row publishes its own `after_s` gap.
+
+| arm | no answer | host reachable (page did not finish) | host unreachable | unattributed |
+|---|---:|---:|---:|---:|
+| `nl-direct` | 13 | 0 | 0 | 13 |
+| `ru-mobile` | 137 | 4 | 6 | 127 |
+| `us-exit` | 5 | 0 | 0 | 5 |
 
 > **Some cells carry loads outside the daypart they are named for.** `2026-08-19-day-2026081914` is named `day` but 1 evening load(s) of 24 fall outside it; `2026-08-20-evening-2026082020` is named `evening` but 5 night load(s) of 29 fall outside it; `2026-08-21-night-2026082102` is named `night` but 18 morning load(s) of 56 fall outside it. A cell takes its name from the daypart it STARTED in and keeps it for the whole run, so a long cell crosses the boundary. The design in §2.3 stratifies by daypart, so these loads are filed under a daypart they were not sampled in. They are named here rather than re-bucketed — which stratum they belong to is a decision about the study, not about this table.
 

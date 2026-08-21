@@ -66,18 +66,41 @@ def record(outcome, reason, **extra):
     return rec
 
 
+PROBE_FAILED = "probe-failed"
+
+
 def running_pid():
-    """The pid of a live cell driver, or None.
+    """The pid of a live cell driver, `None` if there is none, or `PROBE_FAILED`.
 
     Reads the process table rather than trusting a lock file: a lock file outlives the
     process that wrote it, and a stale lock would silence the collection for the rest of
     the window — a fourteen-day outage caused by the guard meant to protect it.
+
+    IT ASKS BY UID, NOT BY $USER, AND CRON IS WHY. This selected on
+    `os.environ.get("USER", "")`, and **cron does not set USER** — measured on this node
+    from the environ of a live cron child: it sets HOME, LOGNAME, PATH, SHELL, LANG, and
+    no USER. So under cron the call became `ps -u "" -o pid=,args=`, which exits 1 with
+    `error: list of users must follow -u` and prints nothing. The returncode was never
+    read, the empty output was iterated, and the guard answered "no cell is running" —
+    every single tick, for as long as the fortnight ran.
+
+    It passed every test, because a test is run from a shell and a shell sets USER. The
+    gate was green in the only place it was ever exercised and inert in the only place it
+    mattered. `os.getuid()` needs no environment to be true.
+
+    AND A FAILED PROBE IS NOT AN ANSWER. Returning None on exception meant "I could not
+    look" and "I looked and found nobody" were the same value — a silent fallback turning
+    a total failure into the one reply that lets the caller proceed. They are now
+    different, and the caller must decide; it skips. A skipped tick is recoverable and
+    writes itself down. Two cells interleaving two vantages on one tether is neither.
     """
     try:
-        out = subprocess.run(["/usr/bin/ps", "-u", os.environ.get("USER", ""), "-o",
-                              "pid=,args="], capture_output=True, timeout=20)
+        out = subprocess.run(["/usr/bin/ps", "-u", str(os.getuid()), "-o", "pid=,args="],
+                             capture_output=True, timeout=20)
     except Exception:
-        return None
+        return PROBE_FAILED
+    if out.returncode != 0:
+        return PROBE_FAILED
     for line in (out.stdout or b"").decode("utf-8", "replace").splitlines():
         line = line.strip()
         if "adint-paired-run" in line and "--test" not in line:
@@ -158,6 +181,11 @@ def main():
     before = corpus_bytes()
 
     pid = running_pid()
+    if pid == PROBE_FAILED:
+        record("skipped", "the process table could not be read, so single-writer cannot "
+                          "be established — skipping is the recoverable direction; two "
+                          "cells interleaving two vantages on one tether is not")
+        return 0
     if pid:
         record("skipped", f"a cell is already running (pid {pid}) — the RU netns and its "
                           "tether are one resource and two cells would interleave two "
@@ -314,11 +342,67 @@ def selftest():
     check("the guard stops firing once the cell exits, so it cannot wedge the fortnight",
           running_pid(), None)
     # A --test invocation must never look like a running cell, or the suite would block
-    # every real tick for as long as it runs.
-    check("a --test process is not mistaken for a cell",
-          "\"--test\" not in line" in open(os.path.abspath(__file__),
-                                            encoding="utf-8").read().replace("'", '"'),
-          True)
+    # every real tick for as long as it runs. DRIVEN, like the checks above: the previous
+    # cut asserted this by searching this file for the literal `"--test" not in line` —
+    # and the searching line CONTAINS that literal, so it matched its own text and could
+    # not fail. Two lines under a comment warning about exactly that.
+    selftester = subprocess.Popen(
+        ["/bin/bash", "-c",
+         "exec -a 'python3 tools/adint-paired-run --frame f --test' sleep 30"])
+    try:
+        time.sleep(0.4)
+        check("a --test process is not mistaken for a cell", running_pid(), None)
+    finally:
+        selftester.kill()
+        selftester.wait()
+
+    # THE ENVIRONMENT CRON ACTUALLY HANDS US. Measured from a live cron child on this
+    # node: HOME, LOGNAME, PATH, SHELL, LANG — and no USER. The guard used to select on
+    # $USER, so under cron it ran `ps -u ""`, which exits 1 and prints nothing, and the
+    # guard reported an empty process table on every tick of the fortnight. It was green
+    # here the whole time, because a test runs from a shell and a shell sets USER. So the
+    # test now runs the guard in cron's environment, not in its own.
+    cron_env = {k: v for k, v in os.environ.items()
+                if k in ("HOME", "LOGNAME", "PATH", "SHELL", "LANG")}
+    check("the fixture is the real thing — cron's environment has no USER",
+          "USER" in cron_env, False)
+    saved = dict(os.environ)
+    fake2 = subprocess.Popen(["/bin/bash", "-c",
+                              "exec -a 'python3 tools/adint-paired-run --frame f' sleep 30"])
+    try:
+        os.environ.clear()
+        os.environ.update(cron_env)
+        seen2 = None
+        for _ in range(40):
+            seen2 = running_pid()
+            if seen2:
+                break
+            time.sleep(0.05)
+        check("the guard still finds a live cell with USER unset, as cron runs it",
+              seen2, fake2.pid)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        fake2.kill()
+        fake2.wait()
+
+    # A PROBE THAT COULD NOT LOOK IS NOT A PROBE THAT FOUND NOBODY. Point the guard at a
+    # `ps` that always fails and assert it says so, instead of returning the one answer
+    # that lets a second cell start.
+    import tempfile as _tf
+    d = _tf.mkdtemp()
+    bad = os.path.join(d, "ps")
+    with open(bad, "w") as fh:
+        fh.write("#!/bin/sh\nexit 1\n")
+    os.chmod(bad, 0o755)
+    real_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kw: real_run([bad] + list(cmd)[1:], **kw)
+        check("a probe that cannot read the process table says PROBE_FAILED, not None",
+              running_pid(), PROBE_FAILED)
+    finally:
+        subprocess.run = real_run
+
 
     DATA, LOG, REPO = keep
     print("selftest: " + ("ok" if ok else "FAIL"))
