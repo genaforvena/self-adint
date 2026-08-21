@@ -107,3 +107,8 @@ The three collection rules stand exactly as they were:
 
 *Amendments after the window opens are recorded as dated amendments and must never
 silently alter §2. `--verify` reports a hash mismatch, which is the point.*
+
+
+---
+
+**2026-08-21 — the holdout leaked before it was ever read.** An ad-hoc tally over an unfiltered `cell_rows()` exposed the holdout's per-arm priced totals by subtraction. The holdout is not spent (`ref/HOLDOUT-READS.jsonl` is empty) but it is partially compromised: see `docs/holdout-leak-2026-08-21.md` and `ref/HOLDOUT-LEAKS.jsonl`. Any confirmation must be reported carrying that record.

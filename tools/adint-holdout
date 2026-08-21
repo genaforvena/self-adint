@@ -94,9 +94,32 @@ def parse_ts(s):
         return None
 
 
-def cell_rows(include_private=True):
-    """[(run, arm, row)] over every paired ledger. Both trees by default: the analysis set
-    is about what was COLLECTED, and a cell not yet published is collected."""
+_MUST_SAY = object()
+
+
+def cell_rows(half=_MUST_SAY, include_private=True):
+    """[(run, arm, row)] over the paired ledgers of ONE half. Both trees: the analysis set
+    is about what was COLLECTED, and a cell not yet published is collected.
+
+    `half` HAS NO DEFAULT, on purpose. It used to iterate every cell on disk unasked, and
+    on 2026-08-21 an ad-hoc script tallied priced rows over that unfiltered stream — a
+    single table straddling both halves. Subtracting the exploratory counts from it handed
+    the reader the holdout's own priced totals per arm, which is directional information
+    about the exact contrast the holdout exists to confirm. Nothing refused, nothing was
+    recorded, and `ref/HOLDOUT-READS.jsonl` stayed empty while the holdout leaked; the
+    incident is written down in `ref/HOLDOUT-LEAKS.jsonl`.
+
+    The guard was on the DOOR (`--confirm` demands a `--claim` and writes a ledger row)
+    while the corpus underneath it was an open field. A protocol enforced only at the
+    entrance a careful person uses is enforced against care, not against accident. So the
+    default is gone: pass `"exploratory"`, `"holdout"`, or an explicit `None` that says in
+    the source that straddling both halves is what you meant.
+    """
+    if half is _MUST_SAY:
+        raise TypeError(
+            "cell_rows() needs an explicit half: 'exploratory', 'holdout', or None for "
+            "both. There is no default — an unfiltered read is how the holdout leaked "
+            "(see ref/HOLDOUT-LEAKS.jsonl). Say which half you meant.")
     pats = [os.path.join(PUB, "hb-paired-*.jsonl")]
     if include_private:
         pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
@@ -108,6 +131,8 @@ def cell_rows(include_private=True):
         if base in seen:            # published copy already read
             continue
         seen.add(base)
+        if half is not None and half_of(run_of(base)) != half:
+            continue
         for r in read_jsonl(p):
             out.append((base, r.get("arm"), r))
     return out
@@ -134,7 +159,7 @@ def run_of(basename):
 def split_table():
     """{run_id: half} over every cell on disk."""
     return {run_of(b): half_of(run_of(b))
-            for b, _arm, _r in cell_rows()}
+            for b, _arm, _r in cell_rows(None)}
 
 
 # The four ways an arm can fail to be a usable half of a pair, kept APART because they
@@ -221,10 +246,8 @@ def render_gate_table(half=None):
     travel WITH the numbers computed over it.
     """
     seen = {}
-    for base, arm, r in cell_rows():
+    for base, arm, r in cell_rows(half):
         if r.get("kind") != "load" or not r.get("pair_id"):
-            continue
-        if half and half_of(run_of(base)) != half:
             continue
         d = seen.setdefault(arm, {"rendered": 0, GATE_OK: 0, GATE_NO_LOAD: 0,
                                   GATE_REFUSED: 0, GATE_UNPROVEN: 0})
@@ -257,7 +280,7 @@ def analysis_set(half=None):
     # It was the EXCLUSION COUNT that exposed it, which is the argument for counting
     # exclusions instead of dropping them quietly.
     rendered, pair_of, arm_of = {}, {}, {}
-    for base, arm, r in cell_rows():
+    for base, arm, r in cell_rows(None):
         if r.get("kind") != "load":
             continue
         lid, pid = r.get("load_id"), r.get("pair_id")
@@ -270,7 +293,7 @@ def analysis_set(half=None):
     good = {p for p, arms in rendered.items()
             if len(arms) > 1 and all(v == "ok" for v in arms.values())}
     keep = []
-    for base, arm, r in cell_rows():
+    for base, arm, r in cell_rows(None):
         if r.get("kind") == "load":
             continue
         if r.get("outcome") is None:
@@ -682,6 +705,22 @@ def selftest():
     # yield table and the statistical analysis set disagreed about which pairs exist for
     # weeks. Two trees, one filing, no gate between them. This is that gate: it fails if
     # either side moves, and it re-derives the comparison instead of restating it.
+    # THE CORPUS ITSELF REFUSES A STRADDLING READ. The protocol used to live entirely on
+    # the --confirm door; the corpus under it was an open field, and that is how the
+    # holdout leaked to an ad-hoc tally (ref/HOLDOUT-LEAKS.jsonl).
+    try:
+        cell_rows()
+        check("cell_rows() with no half REFUSES instead of straddling", False, True)
+    except TypeError as e:
+        check("cell_rows() with no half REFUSES instead of straddling",
+              "explicit half" in str(e), True)
+    ex_runs = {run_of(b) for b, _a, _r in cell_rows("exploratory")}
+    ho_runs = {run_of(b) for b, _a, _r in cell_rows("holdout")}
+    check("a half-scoped read returns that half and nothing else",
+          (bool(ex_runs), bool(ho_runs), ex_runs & ho_runs), (True, True, set()))
+    check("...and None still sees both, for the callers that must count the other half",
+          {run_of(b) for b, _a, _r in cell_rows(None)}, ex_runs | ho_runs)
+
     sib = _sibling_rendered()
     if sib is None:
         check("adint-status is READABLE, so the two render rules can be compared", False,
