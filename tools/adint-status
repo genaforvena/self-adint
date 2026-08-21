@@ -744,6 +744,23 @@ def selftest():
         else:
             print(f"ok   {name}")
 
+    # A DOCUMENT NOBODY CAN FIND IS NOT PUBLISHED. `docs/INDEX.md` is what the README calls
+    # the map, so a document missing from it is invisible however good it is. The index had
+    # said, in its own prose, that no gate enforced this — and by 2026-08-21 six documents
+    # had drifted off it, including every one written that day. This is that gate. It names
+    # the missing files rather than only counting them, because "3 documents unindexed" is
+    # not something anyone can act on.
+    missing = sorted(
+        os.path.basename(f) for f in glob.glob(os.path.join(REPO, "docs", "*.md"))
+        if os.path.basename(f) != "INDEX.md"
+        and os.path.basename(f) not in open(
+            os.path.join(REPO, "docs", "INDEX.md"), encoding="utf-8").read())
+    check("every document in docs/ is named in docs/INDEX.md", missing, [])
+    # ...and the gate must be able to notice one, or it is a check on an empty set.
+    idx = open(os.path.join(REPO, "docs", "INDEX.md"), encoding="utf-8").read()
+    check("...and the index is a roster, not an empty file the check passes vacuously",
+          idx.count("](") + idx.count("`.md`") + idx.count(".md`") > 10, True)
+
     # The failure this tool exists to prevent: yesterday's numbers standing after the data is
     # gone. An empty tree must SAY it is empty, never render nothing and leave the old text.
     import tempfile
