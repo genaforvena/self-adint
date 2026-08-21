@@ -495,7 +495,14 @@ def echo_hosts(echo=None):
         parts = list(raw)
     else:
         parts = str(raw).split(",")
-    return [h.strip() for h in parts if h and h.strip()] or [IP_ECHO]
+    hosts = [h.strip() for h in parts if h and h.strip()]
+    # An empty/blank override falls back to the DEFAULT, and the default is itself a list, so it
+    # has to be split too. `or [IP_ECHO]` was correct only while IP_ECHO was one URL; with a
+    # comma-joined default it would hand back the whole joined string AS a single URL — one
+    # unreachable host wearing the shape of a working fallback.
+    if hosts:
+        return hosts
+    return [h.strip() for h in str(IP_ECHO).split(",") if h.strip()]
 
 
 def echo_ip(txt):
@@ -558,7 +565,26 @@ def egress_ips(timeout=15):
 # chromium both fail while every .ru host resolves identically. Choosing between "use the
 # subscriber's resolver" and "prove the vantage" is a false choice: keep the resolver, move the
 # echo. --ip-echo does that; it must return a bare IP and nothing else.
-IP_ECHO = "https://api.ipify.org"
+# The DEFAULT is a LIST, because a single default is what made the multi-host machinery above
+# unreachable: `echo_hosts()` has rotated across attempts since 2026-08-18, but IP_ECHO stayed one
+# URL, so every cell that did not pass --ip-echo still hammered api.ipify.org three times and the
+# remedy sat in the code unused. A fix that is implemented and not wired into the default is not a
+# fix. Measured from the RU MTS vantage 2026-08-21T02:1xZ, and it is TWO failure modes, not one:
+#   - POISONED NAME: api.ipify.org -> 8.47.69.0, example.com -> 8.6.112.0 (MTS resolvers
+#     212.188.31.154/155, real /24s with the last octet zeroed); nothing listens, curl hangs.
+#   - RESOLVED AND STILL DEAD: icanhazip.com -> 104.16.184.241 and ifconfig.co -> 104.21.54.91
+#     are the CORRECT Cloudflare addresses and both time out at 20s, as do 1.1.1.1 and
+#     cdn.jsdelivr.net. So the older note here ("keep the resolver, move the echo") is only half
+#     the story: moving to a correctly-resolved FOREIGN echo would have failed too. On that
+#     vantage in that hour the only echo that answered was the in-country one (0.3s), while
+#     aif.ru/ria.ru/mail.ru/vk.com all loaded normally -- the link was fine, the reach was not.
+# Hence the order: an in-country echo first (the only one verified readable from BOTH arms:
+# 0.3s RU, 1.4s NL), then two foreign ones so the list cannot become a single-vendor dependency.
+# It is an IP echo, not a measurement surface, so the first host being Yandex does not touch the
+# roster the run is here to record.
+IP_ECHO = ("https://ipv4.internet.yandex.net/api/v0/ip,"
+           "https://api.ipify.org,"
+           "https://icanhazip.com")
 
 
 # How long the browser is given to read the IP echo. 12s was tuned on a fibre vantage and is
@@ -1584,6 +1610,9 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
     flaky_3try = echo_read(_FlakyEcho(2), timeout_ms=1, tries=3, pause_s=0)
     dead_3try = echo_read(_FlakyEcho(99), timeout_ms=1, tries=3, pause_s=0)
     clean_3try = echo_read(_FlakyEcho(0), timeout_ms=1, tries=3, pause_s=0)
+    # Derived from IP_ECHO, never a literal copy of it: a hand-written expectation here would be
+    # a test of the copy and would stay green while the default drifted underneath it.
+    _default_hosts = [h.strip() for h in str(IP_ECHO).split(",") if h.strip()]
 
     checks = [
         # ── the echo retry ──
@@ -1628,10 +1657,19 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
         # A single echo must behave exactly as it always has.
         ("one host is still asked on every attempt, and still refuses",
          one_read == (None, 3) and one_host.visited == ["A", "A", "A"]),
+        # The default is read here, not spelled here: a literal copy of IP_ECHO would make this
+        # a test of the copy, green on a default that had drifted underneath it.
         ("the host list drops blanks and keeps order",
          echo_hosts("a, b ,,") == ["a", "b"] and echo_hosts(["x", "y"]) == ["x", "y"]),
-        ("no host given falls back to the module default",
-         echo_hosts() == [IP_ECHO] and echo_hosts("") == [IP_ECHO]),
+        # This assertion used to read `echo_hosts() == [IP_ECHO]`, which PINNED the default at one
+        # host — the rotation above was tested, the default it protects was tested to stay a
+        # single point of failure, and the two green lines together read as coverage. Assert the
+        # shape the rotation needs instead: the default is SPLIT, and it is plural.
+        ("no host given falls back to the module default, split and plural",
+         echo_hosts() == _default_hosts and echo_hosts("") == _default_hosts
+         and len(_default_hosts) > 1),
+        ("a blank override does not hand back the joined default as one url",
+         all("," not in h for h in echo_hosts(" , "))),
         # ── the pair key (step0c §2.4) ──
         # Reconstructing pairs by timestamp is what this replaces, so the assertion is that
         # two SEPARATE capture() calls — different load_ids, different arms — carry the same

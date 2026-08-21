@@ -28,7 +28,35 @@ adb_(){ timeout 25 adb -s "$SERIAL" "$@" 2>/dev/null; }
 
 adb_ get-state >/dev/null 2>&1 || { echo "n/a: adb device $SERIAL unreachable" >&2; exit 2; }
 
-egress_ok(){
+# The echo proves the vantage's IDENTITY. It does not prove its REACH, and on 2026-08-21T02:1xZ
+# those came apart completely: this gate logged `ok egress=91.78.x` every 5 minutes for the whole
+# hour while, from inside the same netns, api.ipify.org / icanhazip.com / ifconfig.co / 1.1.1.1 /
+# cdn.jsdelivr.net / securepubads.g.doubleclick.net / google.com / pikabu.ru / rbc.ru ALL timed out
+# at 20s. The one address still answering was the echo's own host. So the gate had swapped one
+# proxy for a NARROWER one: the header below is right that "wifi is off" is not the claim, but
+# "Yandex answers" is not the claim either — and being the last thing reachable is exactly what
+# makes a host a bad liveness probe. Meanwhile the capture cell refused all 28 pairs and blamed
+# the vantage, because its own echo was one of the dead names.
+# So: GATE on in-country reach to the sites a cell actually loads (identity AND reach, both), and
+# OBSERVE foreign reach without gating on it — a foreign blackhole must not stop an RU-side cell,
+# but it must never again be invisible, because it is the thing that can quietly empty a roster.
+REACH_URLS="${ADINT_REACH_URLS:-https://ria.ru/ https://aif.ru/ https://mail.ru/}"
+FOREIGN_URL="${ADINT_FOREIGN_URL:-https://icanhazip.com}"
+
+ns_curl(){ timeout "$2" sudo -n ip netns exec "$NS" curl -s -o /dev/null -m "$3" -w '%{http_code}' "$1" 2>/dev/null; }
+
+# Which capture-frame hosts answer. Several, because one site being down is not the vantage
+# failing — the claim is "some in-country site loads", and a single target cannot say that.
+reach_ok(){
+  local u code
+  for u in $REACH_URLS; do
+    code=$(ns_curl "$u" 25 15)
+    case "$code" in 2*|3*) printf '%s' "${u}=${code}"; return 0 ;; esac
+  done
+  return 1
+}
+
+echo_ok(){
   local out
   out=$(timeout 40 sudo -n ip netns exec "$NS" curl -s -m 25 "$ECHO_URL" 2>/dev/null) || return 1
   [ -n "$out" ] || return 1
@@ -36,21 +64,63 @@ egress_ok(){
   printf '%s' "$out" | tr -d '"'
 }
 
+# Reported, never gated. Rendered as a word, so "we did not look" can never wear "reachable".
+foreign_state(){
+  local code; code=$(ns_curl "$FOREIGN_URL" 25 15)
+  case "$code" in 2*|3*) echo "reachable" ;; *) echo "BLACKHOLED" ;; esac
+}
+
+# Both facts travel out through STDOUT as `ip|reach`, because the caller reads this in a command
+# substitution and a variable assigned in that subshell is discarded — the first cut of this gate
+# set LAST_REACH inside here and every line printed `reach=unmeasured`, a green-looking word for
+# a value that never crossed the process boundary.
+# Two distinct rcs, because "the vantage is DOWN" and "the vantage is WALLED" are different
+# faults with different remedies and the whole point of adding the reach leg was to tell them
+# apart. Collapsing both to rc=1 would have re-buried the distinction one line below the fix,
+# and left the reach-specific branch in --test permanently unreachable — a gate that cannot fail.
+#   rc=1  no echo      -> the PDP is gone; re-raising wifi is the right move
+#   rc=3  echo, no reach -> the session is up and walled; re-raising wifi will not help
+egress_ok(){
+  local ip r
+  ip=$(echo_ok) || return 1
+  r=$(reach_ok) || { printf '%s|none' "$ip"; return 3; }
+  printf '%s|%s' "$ip" "$r"
+}
+
 if [ "$TEST_MODE" = 1 ]; then
   wifi=$(adb_ shell "su -c 'settings get global wifi_on'" | tr -d '\r\n')
   rm0=$(adb_ shell "su -c 'ip addr show rmnet0'" | grep -c 'inet ')
-  ip=$(egress_ok) && st="ok:$ip" || st="unreachable"
-  say "--test wifi_on=$wifi rmnet0_inet=$rm0 egress=$st"
-  # Assert the REAL read, not the offline branch: the vantage must actually answer.
+  got=$(egress_ok); rc=$?
+  case "$rc" in
+    0) st="ok:${got%%|*}"; reach="${got#*|}" ;;
+    3) st="walled:${got%%|*}"; reach="none" ;;
+    *) st="unreachable"; reach="none" ;;
+  esac
+  fs=$(foreign_state)
+  say "--test wifi_on=$wifi rmnet0_inet=$rm0 egress=$st reach=$reach foreign=$fs"
+  # Assert the REAL read, not the offline branch: the vantage must actually answer — and answer
+  # on BOTH legs, since an echo-only pass is the exact failure this gate was rewritten for.
   if [ "$st" = "unreachable" ]; then
-    echo "--test: FAIL — vantage has no egress (wifi_on=$wifi rmnet0_inet=$rm0)" >&2; exit 1
+    echo "--test: FAIL — vantage has no egress (wifi_on=$wifi rmnet0_inet=$rm0 reach=$reach)" >&2; exit 1
   fi
+  case "$st" in walled:*)
+    echo "--test: FAIL — the echo answered from ${st#walled:} but no capture-frame site did:" >&2
+    echo "  the vantage is UP and WALLED, not down — re-raising wifi will not fix this." >&2
+    exit 1 ;;
+  esac
   echo "--test: ok"; exit 0
 fi
 
-if ip=$(egress_ok); then
-  say "ok egress=$ip"
+got=$(egress_ok); rc=$?
+if [ "$rc" = 0 ]; then
+  say "ok egress=${got%%|*} reach=${got#*|} foreign=$(foreign_state)"
   exit 0
+fi
+if [ "$rc" = 3 ]; then
+  # Up and walled. The wifi remedy below addresses a DROPPED PDP; applying it here would be a
+  # remedy aimed at a fault that is not present, and its success would be logged as a heal.
+  say "WALLED egress=${got%%|*} — echo answers, no capture-frame site does; foreign=$(foreign_state)"
+  exit 1
 fi
 
 wifi=$(adb_ shell "su -c 'settings get global wifi_on'" | tr -d '\r\n')
@@ -59,8 +129,8 @@ adb_ shell "su -c 'svc wifi disable'" >/dev/null
 adb_ shell "su -c 'settings put global wifi_on 0'" >/dev/null
 adb_ shell "su -c 'settings put global wifi_scan_always_enabled 0'" >/dev/null
 sleep 25
-if ip=$(egress_ok); then
-  say "RAISED egress=$ip"
+if got=$(egress_ok); then
+  say "RAISED egress=${got%%|*} reach=${got#*|} foreign=$(foreign_state)"
   exit 0
 fi
 say "STILL DOWN after re-raise (wifi_on was $wifi)"
