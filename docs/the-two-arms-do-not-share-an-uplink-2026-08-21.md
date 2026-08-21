@@ -45,3 +45,36 @@ caveat: the analysis set is still conditioned on both fragile links having been 
 same moment, and that conditioning is still eight times stronger on one side. What it
 retires is one specific alternative explanation — *the instrument's own network produced the
 asymmetry* — which is now ruled out by the topology rather than argued away.
+
+---
+
+## A live case, the same day: a tailscale outage took one arm and not the other
+
+The claim above stopped being theoretical within hours. Timeline, from the journal and the
+cell's own run log:
+
+| time (UTC) | event |
+|---|---|
+| 11:40:45 | `tailscaled` loses the control plane — `PollNetMap: use of closed network connection`, then continuous `all connection attempts failed` to `controlplane.tailscale.com` |
+| 12:01–12:47 | `nl-direct` refuses **23 consecutive loads**: `preflight vantage: via=direct exit=None echo_attempts=3/3` |
+| 12:47:39 | `linkChange: in state Running; updating LAN routes`; `logtail: upload succeeded after 62 failures` |
+| 12:48 | `nl-direct` returns `rc0` |
+
+This node's egress **is** phaedra's tailscale exit node, so while tailscale could not reach
+its control plane the foreign arm could not read an echo and correctly refused to record a
+load it could not place. The domestic arm, on the Note 3 tether and outside tailscale
+entirely, ran **28 / 28** through the whole window. The cell ended `ru: 28, nl: 5`.
+
+Two things worth taking from it.
+
+**The independence is real and it cuts both ways.** It is why a link fault cannot fake a
+refusal — and also why one arm can lose 47 minutes while the other notices nothing. A
+single-uplink design would have lost the cell entirely and made the outage obvious; this
+one loses half a cell quietly.
+
+**The loss is CONTIGUOUS, which is worse than random.** An outage removes a solid block of
+wall-clock from one arm, not a scatter of loads. If anything this study measures varies by
+time of day — and a bidder's willingness to price plainly might — then losing 12:01–12:47
+from the foreign arm is not the same as losing 23 loads spread evenly. It is a small
+time-of-day hole in one arm only. The exclusion counts show the magnitude; they do not show
+that shape, and no aggregate over surviving pairs will reveal it either.
