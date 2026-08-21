@@ -138,7 +138,25 @@ CENSUS_FIELDS = [
     "host_n_url_maybe_cut", "host_n_loads",
 ]
 
-KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS, "census": CENSUS_FIELDS}
+# THE CONTROL. A plain-curl fetch of the same URL from inside the same vantage, taken
+# after the pair, whose only job is to split an arm's `no answer` into "this link could
+# not carry this page" and "this host was unreachable". Its own allowlist, deliberately
+# small: the control is an instrument reading, and everything it may say about the world
+# is a status code, a duration, and the address it reached.
+#
+# `after_s` and `ua_from_browser` are on the list ON PURPOSE — they are the control's
+# LIMITATIONS, not its results. The control is taken after the load, not during it, and
+# publishing the gap is what stops a reader treating it as simultaneous; the UA flag says
+# whether the control asked the same question the browser did. A published instrument that
+# hides its own error bars is worse than an unpublished one.
+CONTROL_FIELDS = [
+    "kind", "pair_id", "run", "arm", "url", "ts",
+    "http_code", "seconds", "remote_ip", "rc", "error",
+    "after_s", "max_time_s", "ua_from_browser",
+]
+
+KINDS = {"frame": FRAME_FIELDS, "paired": PAIRED_FIELDS, "census": CENSUS_FIELDS,
+         "control": CONTROL_FIELDS}
 
 HEADER = """# {name}
 #
@@ -168,7 +186,7 @@ def main():
     if args.test:
         return selftest()
     if not args.source or not args.kind:
-        print("usage: adint-publish --kind {frame,paired,census} <data/…jsonl>",
+        print("usage: adint-publish --kind {frame,paired,census,control} <data/…jsonl>",
               file=sys.stderr)
         return 2
 
@@ -220,7 +238,8 @@ def publish(source, kind, out=None, rule="see docs/step0c-hb-ru-market-study-202
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(HEADER.format(
             name=os.path.basename(out), src=os.path.basename(source),
-            tool="tools/adint-frame-stageb" if kind == "frame" else "tools/adint-hb-capture",
+            tool={"frame": "tools/adint-frame-stageb",
+                  "control": "tools/adint-paired-run"}.get(kind, "tools/adint-hb-capture"),
             rule=rule, nkept=len(keep)))
         fh.write(f"# ROWS       {n}\n")
         if redone:

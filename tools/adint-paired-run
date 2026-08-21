@@ -109,6 +109,50 @@ def read_frame(path):
     return out
 
 
+# The control must ask the publisher the SAME question the load did, and the biggest part
+# of that question is the user-agent. tools/adint-hb-capture overrides nothing, so the load
+# arrives as headless Chromium's own default — measured on this node 2026-08-21:
+# `...HeadlessChrome/149.0.7827.55...`, which announces itself as headless, a thing sites
+# are known to act on. Fetching the control as `curl/8.x` would make it a different request
+# and any disagreement with the load would be unattributable.
+#
+# So it is READ from the browser once per run rather than written down here: a UA string
+# pinned in source carries a version number that rots at the next playwright upgrade, and
+# it would rot silently, since a stale UA still fetches fine. The constant below is only
+# the last resort, and when it is used the control rows say so — `ua_from_browser: false`
+# marks every row whose control asked a question we could not confirm matched.
+CONTROL_UA_FALLBACK = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like "
+                       "Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36")
+
+
+def control_pair_id(pair_prefix):
+    """The pair_id the capture will stamp on this pair's loads, so the control joins to it.
+
+    paired-run hands each capture a ONE-url list, so the capture's positional key lands at
+    index 1. That `-001` is a contract between two files and nothing at runtime checks it:
+    a control keyed differently from the load joins to nothing, and an empty join renders
+    as "no control was taken" rather than as a broken key. The selftest asserts this
+    against `tools/adint-hb-capture`'s own `pair_key`, so the two cannot drift apart
+    quietly.
+    """
+    return f"{pair_prefix}-001"
+
+
+def browser_ua():
+    """The UA the capture's own browser sends, read from the browser. None if unreadable."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            b = pw.chromium.launch(headless=True)
+            try:
+                return b.new_context(viewport={"width": 1366, "height": 900}) \
+                        .new_page().evaluate("navigator.userAgent")
+            finally:
+                b.close()
+    except Exception:
+        return None
+
+
 def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tries=None,
             ip_echo=None, nav_tries=None):
     # nav_timeout is per-ARM by the caller's choice (see --ru-nav-timeout). It is NOT the
@@ -141,6 +185,70 @@ def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tr
                 "--", "env", f"HOME={os.path.expanduser('~')}",
                 f"PATH={os.environ.get('PATH','')}"] + inner
     return inner
+
+
+def control_cmd(url, netns, max_time, ua):
+    """A plain HTTP fetch of the SAME url from inside the SAME vantage, as the control for
+    an arm's `no answer`.
+
+    A load with no `http_status` is a navigation that never returned a response, and that
+    is a claim about OUR LINK, not about the publisher. But "our link" covers two very
+    different facts and nothing in the load distinguishes them: the host may be
+    unreachable from this vantage at this moment, or it may be perfectly reachable and the
+    full page — a browser fetching every subresource over a mobile tether — may simply not
+    complete inside the nav budget. Across the corpus the RU arm loses whole sites this
+    way, and the one time it was checked by hand (aif.ru, 2026-08-21) plain curl answered
+    200 in 1.8 s from inside the namespace while the browser timed out. One site, by hand,
+    after the fact. This makes it a column.
+
+    Deliberately NOT run concurrently with the browser. The tether is the bottleneck the
+    control is trying to characterise, and a second fetch racing the first would compete
+    for exactly the resource under measurement — the control would contaminate its own
+    subject. It runs after the pair completes, and the record carries `after_s` so a
+    reader can see how far from the load's moment the control was taken. That gap is the
+    control's own limitation and it is published rather than assumed small.
+
+    Run on BOTH arms. A control on the flaky arm only cannot say whether a failure is
+    peculiar to it: the NL arm carries no-answers too (mk.ru, 7 of them), and an
+    asymmetric instrument makes an arm difference that is not the treatment — the same
+    reason the echo budget and the nav-retry allowance are handed to both.
+    """
+    curl = ["curl", "-sS", "-o", "/dev/null", "-A", ua,
+            "-w", "%{http_code} %{time_total} %{remote_ip}",
+            "--max-time", str(max_time), url]
+    if not netns:
+        return curl
+    return ["sudo", "ip", "netns", "exec", netns] + curl
+
+
+def run_control(url, netns, max_time, ua, ua_from_browser):
+    """{http_code, seconds, remote_ip, rc, error} — never raises, never blocks past max_time.
+
+    A control that can fail the run it is controlling is worse than no control: this is an
+    extra observation, and the pair is the study. Any breakage renders as a recorded rc
+    with an error string, so a control that stopped working is visible as a column of rcs
+    rather than as an absence that reads like a clean measurement.
+    """
+    try:
+        pr = subprocess.run(control_cmd(url, netns, max_time, ua), capture_output=True,
+                            timeout=max_time + 15)
+    except Exception as e:  # timeout, missing curl, sudo refusal
+        return {"rc": None, "ua_from_browser": ua_from_browser,
+                "error": f"{type(e).__name__}: {e}"[:200]}
+    out = (pr.stdout or b"").decode("utf-8", "replace").strip().split()
+    rec = {"rc": pr.returncode, "ua_from_browser": ua_from_browser}
+    if pr.returncode != 0:
+        rec["error"] = (pr.stderr or b"").decode("utf-8", "replace").strip()[:200]
+    if len(out) >= 3:
+        # 000 is curl's "no response at all" — keep it as null rather than as a status,
+        # so a reader never sums it into an http code distribution.
+        rec["http_code"] = int(out[0]) if out[0].isdigit() and out[0] != "000" else None
+        try:
+            rec["seconds"] = round(float(out[1]), 2)
+        except ValueError:
+            pass
+        rec["remote_ip"] = out[2] or None
+    return rec
 
 
 def main():
@@ -186,6 +294,17 @@ def main():
                          "2026-08-19). Identical for both arms, on purpose")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--sites", type=int, default=0, help="cap the site count (0 = the frame)")
+    ap.add_argument("--control-curl", dest="control_curl", action="store_true", default=True,
+                    help="after each pair, fetch the same URL with plain curl from inside "
+                         "each arm's vantage, as the control that separates 'this link "
+                         "could not carry this page' from 'this host was unreachable'. "
+                         "On by default: a control nobody remembers to enable is a control "
+                         "that exists only in the runs that did not need it")
+    ap.add_argument("--no-control-curl", dest="control_curl", action="store_false")
+    ap.add_argument("--control-max-time", type=int, default=20,
+                    help="seconds curl may spend on one control fetch (default 20). Well "
+                         "under the nav budget on purpose — the control asks whether the "
+                         "host answers AT ALL, not whether it answers as slowly as a page")
     ap.add_argument("--ru-netns", default="ruvantage")
     ap.add_argument("--ru-arm", default="ru-mobile")
     ap.add_argument("--nl-arm", default="nl-direct")
@@ -244,6 +363,23 @@ def main():
     skews = []
     attempts = []
     zone_drifted = []
+    # The control lands in its OWN file, never appended to an arm's jsonl. Those are written
+    # by tools/adint-hb-capture, and a second process appending to a durable artifact its
+    # owner is still writing is the one-writer rule broken — the exact shape this mesh has
+    # already paid for twice. One writer, one file, joined on `pair_id` downstream.
+    ctlp = f"{prefix}.control.jsonl"
+    ctl = None
+    ua, ua_from_browser = CONTROL_UA_FALLBACK, False
+    if args.control_curl:
+        got = browser_ua()
+        if got:
+            ua, ua_from_browser = got, True
+        else:
+            say("WARNING control-curl: the browser UA could not be read; controls fall back "
+                f"to a pinned string and every row is marked ua_from_browser=false")
+        ctl = open(ctlp, "a", encoding="utf-8")
+        say(f"control-curl on · max-time={args.control_max_time}s · ua_from_browser="
+            f"{str(ua_from_browser).lower()} · out={os.path.basename(ctlp)}")
     for rep in range(1, args.replicates + 1):
         for idx, domain in enumerate(order, 1):
             url = f"https://{domain}/"
@@ -284,6 +420,29 @@ def main():
                 if rc != 0 and err.strip():
                     say(f"    {a} stderr: {err.strip()[:200]}")
 
+            # THE CONTROL. Sequential, after both arms are done, so it never competes with
+            # the browser for the tether it is characterising. Every row, not only the
+            # failures: a control taken only where the load failed has no comparison arm
+            # and cannot tell a bad moment from a bad host.
+            if ctl is not None:
+                for a, ns in ((args.nl_arm, None), (args.ru_arm, args.ru_netns)):
+                    t_ctl = time.time()
+                    rec = run_control(url, ns, args.control_max_time, ua, ua_from_browser)
+                    rec.update({"kind": "control", "pair_id": control_pair_id(pp), "arm": a,
+                                "url": url, "run": run_id,
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                # How far after the load this control was taken. The gap is
+                                # the control's own limitation; published, not assumed small.
+                                "after_s": round(t_ctl - t0, 1),
+                                "max_time_s": args.control_max_time})
+                    ctl.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    ctl.flush()
+                    code = rec.get("http_code")
+                    say(f"    control {a}: "
+                        + (f"{code} in {rec.get('seconds')}s" if code
+                           else f"no answer (rc={rec.get('rc')})")
+                        + f" +{rec['after_s']}s")
+
     attempted, complete, causes = tally_pairs(attempts)
     cause_s = (" · " + " ".join(f"{k}={v}" for k, v in sorted(causes.items()))) if causes else ""
     say(f"done · attempted={attempted} · complete={complete} · median arm-duration gap="
@@ -291,6 +450,9 @@ def main():
     if zone_drifted:
         say(f"WARNING zone drift: {len(zone_drifted)} of {attempted} pair(s) finished outside "
             f"the run's `{zone}` window — {','.join(zone_drifted)}")
+    if ctl is not None:
+        ctl.close()
+        say(f"control out={os.path.basename(ctlp)}")
     say(f"out ru={out_ru} nl={out_nl}")
     log.close()
     return 0
@@ -328,6 +490,45 @@ def selftest():
     # The RU arm must actually be namespaced. A command that merely CARRIES the label while
     # running in the root namespace is the exact failure §2.5 records for the 418-load set.
     ru = arm_cmd("ru-mobile", "https://x.ru/", "/tmp/o", 45, 120, "p", netns="ruvantage")
+    # ── THE PER-ROW CONTROL ──
+    # The control's whole job is to split an arm's `no answer` into "this link could not
+    # carry this page" and "this host was unreachable". It can only do that if it asks the
+    # same question from the same place and joins to the right row.
+    c_ru = control_cmd("https://x.ru/", "ruvantage", 20, "UA/1")
+    check("the control runs inside the SAME namespace as the arm it controls",
+          c_ru[:5], ["sudo", "ip", "netns", "exec", "ruvantage"])
+    check("the NL control is not namespaced, like the NL arm",
+          "netns" in control_cmd("https://x.ru/", None, 20, "UA/1"), False)
+    check("the control sends the browser's UA, not curl's",
+          "-A" in c_ru and c_ru[c_ru.index("-A") + 1], "UA/1")
+    check("the control is bounded, so it can never outlive the run",
+          c_ru[c_ru.index("--max-time") + 1], "20")
+    check("the control fetches the SAME url the load did", c_ru[-1], "https://x.ru/")
+    # THE JOIN. `-001` is a contract with tools/adint-hb-capture and nothing at runtime
+    # checks it — a control keyed differently joins to nothing, and an empty join reads as
+    # "no control was taken" rather than as a broken key. Assert it against capture's own
+    # function, so the two files cannot drift apart in silence.
+    import importlib.machinery as _m, importlib.util as _u
+    _l = _m.SourceFileLoader("cap", CAPTURE)
+    _sp = _u.spec_from_loader("cap", _l)
+    _cap = _u.module_from_spec(_sp)
+    try:
+        _l.exec_module(_cap)
+        check("the control's pair key is the one the capture actually stamps",
+              control_pair_id("run-r1-s001"), _cap.pair_key("run-r1-s001", 1))
+    except Exception as e:
+        # An import failure must READ as a failure. A try/except that swallows it would
+        # turn the one gate holding this contract into a green no-op.
+        check("the capture module can be read to check the pair key", str(e), "")
+    # A control must never be able to fail the run it is controlling: it is an extra
+    # observation, and the pair is the study. A breakage renders as a recorded rc, so a
+    # control that stopped working is a visible column rather than a clean-looking absence.
+    broke = run_control("https://x.ru/", None, 20, "UA/1", True)
+    check("a control that cannot run records its failure instead of raising",
+          isinstance(broke, dict) and "rc" in broke, True)
+    check("a control row always says whether its UA came from the browser",
+          broke.get("ua_from_browser"), True)
+
     check("the RU arm is executed inside the netns",
           ru[:5], ["sudo", "ip", "netns", "exec", "ruvantage"])
     check("the RU arm carries HOME into the namespace",

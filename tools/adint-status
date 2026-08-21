@@ -325,6 +325,56 @@ def site_yield(include_private):
                                       -r["attempted"], r["site"]))
 
 
+def controls(include_private):
+    """{(pair_id, arm): control_row} — the per-row curl control, if any cell recorded one."""
+    pats = [os.path.join(PUB, "hb-paired-*.control.jsonl")]
+    if include_private:
+        pats.append(os.path.join(PRIV, "hb-paired-*.control.jsonl"))
+    out = {}
+    for p in sorted(set(sum([glob.glob(x) for x in pats], []))):
+        for r in read_jsonl(p):
+            if r.get("kind") == "control" and r.get("pair_id") and r.get("arm"):
+                out[(r["pair_id"], r["arm"])] = r
+    return out
+
+
+def attribute_no_answer(include_private):
+    """Split each arm's `no answer` into reachable-but-unfinished vs unreachable.
+
+    A load with no `http_status` says only that the navigation never returned a response,
+    and this project has been careful never to file that as the publisher's refusal. But
+    "our link" is still two facts wearing one word: the host may be unreachable from this
+    vantage at that moment, or perfectly reachable while a full page — a browser pulling
+    every subresource over a mobile tether — fails to complete inside the nav budget. Those
+    have different consequences. The first is a hole in the frame from this vantage; the
+    second is a budget we chose.
+
+    The control answers it per row instead of by hand afterwards for one site. Checked once
+    by hand before this existed: aif.ru answered curl 200 in 1.8 s from inside the namespace
+    while the browser timed out — one site, one moment, after the fact.
+
+    `unattributed` is reported rather than hidden. Cells captured before the control existed
+    carry none, and a split computed over only the rows that happen to have one would read as
+    a property of the corpus while being a property of when the control was wired.
+    """
+    ctl = controls(include_private)
+    if not ctl:
+        return None
+    out = {}
+    for run, arm, r in _cell_loads(include_private):
+        if unseen_cause(r) != "no-answer":
+            continue
+        d = out.setdefault(arm, {"reachable": 0, "unreachable": 0, "unattributed": 0})
+        c = ctl.get((r.get("pair_id"), arm))
+        if c is None:
+            d["unattributed"] += 1
+        elif c.get("http_code"):
+            d["reachable"] += 1
+        else:
+            d["unreachable"] += 1
+    return out
+
+
 def cells(include_private):
     """One paired run = one cell of the schedule."""
     out = []
@@ -578,6 +628,35 @@ def block(include_private):
                       + ", ".join(f"`{r['site']}`" for r in unnamed)
                       + ".** These are holes nobody has decided about. An undeclared hole "
                       "reads exactly like one nobody noticed.", ""]
+
+    # WHAT AN ARM'S `no answer` ACTUALLY WAS, where a control exists to say.
+    an = attribute_no_answer(include_private)
+    if an:
+        rows = []
+        for arm in sorted(an):
+            d = an[arm]
+            tot = d["reachable"] + d["unreachable"] + d["unattributed"]
+            if tot:
+                rows.append(f"| `{arm}` | {tot} | {d['reachable']} | {d['unreachable']} | "
+                            f"{d['unattributed']} |")
+        if rows:
+            L += ["### What a `no answer` was, where a control was taken", "",
+                  "A load with no HTTP status says the navigation never returned a response — "
+                  "our own link, never the publisher's refusal. But that is still two facts "
+                  "under one word. After each pair, the same URL is fetched with plain `curl` "
+                  "from inside the SAME vantage (`tools/adint-paired-run --control-curl`, on "
+                  "by default): if that answers, the host was reachable and the full page did "
+                  "not finish inside the nav budget — a budget we chose. If it does not, the "
+                  "host was unreachable from that vantage at that moment — a hole in the "
+                  "frame. **`unattributed` is loads captured before the control existed**, "
+                  "kept in the table because a split computed over only the rows that happen "
+                  "to carry a control would read as a fact about the corpus while being a "
+                  "fact about when the control was wired. The control runs AFTER the pair, "
+                  "never beside it — a second fetch racing the first would compete for the "
+                  "very link under measurement — so each control row publishes its own "
+                  "`after_s` gap.", "",
+                  "| arm | no answer | host reachable (page did not finish) | host "
+                  "unreachable | unattributed |", "|---|---:|---:|---:|---:|"] + rows + [""]
 
     # ZONE DRIFT. A cell is named for the daypart it STARTED in and keeps that name for its
     # whole length, so a long run crosses the boundary and files the overflow under the wrong
@@ -855,6 +934,62 @@ def selftest():
     # into a list of the whole frame and stops meaning anything.
     check("a site with readable pairs is not called a structural zero",
           "`alpha.ru` (2 attempted" in bsy, False)
+
+    # ── THE PER-ROW CONTROL: what an arm's `no answer` actually was ──
+    # `cellB`'s us-exit arm has one no-answer (beta.ru / b2). With no control on disk the
+    # split must not render at all — a table of zeroes would read as "we checked and found
+    # nothing", which is the opposite of "nobody checked".
+    check("no control on disk renders no attribution table",
+          "What a `no answer` was" in block(False), False)
+    check("...and the attribution returns nothing rather than an empty split",
+          attribute_no_answer(False), None)
+    with open(os.path.join(PUB, "hb-paired-cellB.control.jsonl"), "w") as fh:
+        fh.write(json.dumps({"kind": "control", "pair_id": "cellB-b2", "arm": "us-exit",
+                             "url": "https://www.beta.ru/", "http_code": 200,
+                             "seconds": 1.8, "after_s": 3.0,
+                             "ua_from_browser": True, "rc": 0}) + "\n")
+    an = attribute_no_answer(False)
+    check("a no-answer whose control ANSWERED is the page not finishing, not the host",
+          an.get("us-exit"), {"reachable": 1, "unreachable": 0, "unattributed": 0})
+    # The control must join on BOTH pair_id and arm. Keyed on pair_id alone, one arm's
+    # control would attribute the OTHER arm's failure — and since the arms fail for
+    # different reasons, that is the one join error that flips the finding.
+    with open(os.path.join(PUB, "hb-paired-cellB.control.jsonl"), "a") as fh:
+        fh.write(json.dumps({"kind": "control", "pair_id": "cellB-b2", "arm": "nl-direct",
+                             "url": "https://www.beta.ru/", "http_code": None,
+                             "rc": 28, "error": "timeout", "after_s": 3.0,
+                             "ua_from_browser": True}) + "\n")
+    an = attribute_no_answer(False)
+    check("the other arm's control does not attribute this arm's no-answer",
+          an.get("us-exit"), {"reachable": 1, "unreachable": 0, "unattributed": 0})
+    # And a control that itself got nothing means the host was unreachable from there.
+    with open(os.path.join(PUB, "hb-paired-cellB.control.jsonl"), "w") as fh:
+        fh.write(json.dumps({"kind": "control", "pair_id": "cellB-b2", "arm": "us-exit",
+                             "url": "https://www.beta.ru/", "http_code": None,
+                             "rc": 28, "error": "timeout", "after_s": 3.0,
+                             "ua_from_browser": True}) + "\n")
+    check("a no-answer whose control ALSO got nothing is an unreachable host",
+          attribute_no_answer(False).get("us-exit"),
+          {"reachable": 0, "unreachable": 1, "unattributed": 0})
+    # Loads captured before the control existed must be COUNTED as unattributed, never
+    # dropped: a split over only the rows that happen to carry a control reads as a fact
+    # about the corpus while being a fact about when the control was wired.
+    with open(os.path.join(PUB, "hb-paired-cellC.ru-mobile.jsonl"), "w") as fh:
+        fh.write(json.dumps({"kind": "load", "arm": "ru-mobile", "window_s": 45,
+                             "hour_utc": 9, "url": "https://www.alpha.ru/",
+                             "egress_ip": "1.2.3.4", "vantage_verified": True,
+                             "http_status": None, "pair_id": "cellC-x1"}) + "\n")
+    check("a no-answer with no control is counted as unattributed, not dropped",
+          attribute_no_answer(False).get("ru-mobile"),
+          {"reachable": 0, "unreachable": 0, "unattributed": 1})
+    bctl = block(False)
+    check("the attribution table renders once a control exists",
+          "What a `no answer` was" in bctl, True)
+    check("the unattributed column is published, not hidden",
+          "unattributed |" in bctl, True)
+    for f in glob.glob(os.path.join(PUB, "hb-paired-cell*.control.jsonl")) + \
+             glob.glob(os.path.join(PUB, "hb-paired-cellC.*.jsonl")):
+        os.remove(f)
     for f in glob.glob(os.path.join(PUB, "hb-paired-*.jsonl")):
         os.remove(f)
     # Restore the cells the later checks read.
