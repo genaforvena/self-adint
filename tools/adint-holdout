@@ -645,6 +645,74 @@ def access_contrast(half, domestic):
         },
     }
 
+def time_coverage(half):
+    """Per cell and arm: how much of the cell's WALL-CLOCK the arm actually covered.
+
+    WHY A COUNT IS NOT ENOUGH. `render_gate` says an arm lost N loads; it cannot say
+    whether it lost them in a scatter or in one block, and the two are different faults
+    with different consequences. A scatter is closer to random missingness. A block removes
+    a contiguous slice of the day from ONE arm, so if anything measured here varies by time
+    of day the loss is a small time-of-day hole rather than noise — and no aggregate over
+    surviving pairs will show it.
+
+    A FAILED LOAD WRITES NO ROW, so the loss cannot be read directly; it is read from the
+    SHAPE of what survived. The first attempt looked for a long gap BETWEEN consecutive
+    surviving loads and found none, because the outage sat at the edge: the arm's five
+    surviving loads were consecutive and tightly spaced at the very end. What separates the
+    cases is span COVERAGE plus how late the arm started. Measured 2026-08-21:
+
+      cell …112  foreign covers  12.0 % of the span, starts +47.8 min   <- tailscale block
+      cell …110  foreign covers 100.0 % of the span, max interior gap 8.1 min  <- transient
+      cell …108  both arms ~100 %, max interior gap ~2.7 min            <- healthy
+
+    Three shapes, one measure, and the prose caveat becomes a column.
+    """
+    per = {}
+    for base, arm, r in cell_rows(half):
+        if r.get("kind") != "load" or not r.get("ts"):
+            continue
+        try:
+            t = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        per.setdefault(run_of(base), {}).setdefault(arm, []).append(t)
+
+    out, blocked = {}, []
+    for run, arms in sorted(per.items()):
+        stamps = {a: sorted(v) for a, v in arms.items() if v}
+        if len(stamps) < 2:
+            continue
+        lo = min(v[0] for v in stamps.values())
+        hi = max(v[-1] for v in stamps.values())
+        span = (hi - lo).total_seconds()
+        if span <= 0:
+            continue
+        cell = {}
+        for a, v in stamps.items():
+            gaps = [(b - x).total_seconds() for x, b in zip(v, v[1:])] or [0.0]
+            cov = (v[-1] - v[0]).total_seconds() / span
+            late = (v[0] - lo).total_seconds()
+            cell[a] = {"loads": len(v), "span_coverage": round(cov, 4),
+                       "starts_late_s": round(late, 1),
+                       "ends_early_s": round((hi - v[-1]).total_seconds(), 1),
+                       "max_interior_gap_s": round(max(gaps), 1)}
+            # A block is named by BOTH its size and its position; a low coverage with no
+            # lateness is a truncated tail, which is a different story from a late start.
+            if cov < 0.9:
+                blocked.append({"cell": run, "arm": a, "span_coverage": round(cov, 4),
+                                "starts_late_s": round(late, 1),
+                                "loads": len(v), "cell_span_s": round(span, 1)})
+        out[run] = cell
+    return {
+        "WHAT_THIS_ADDS": (
+            "render_gate counts what an arm lost; this says whether it lost it in a "
+            "scatter or in one contiguous block. A block is a time-of-day hole in one arm "
+            "and no aggregate over surviving pairs reveals it."),
+        "per_cell": out,
+        "blocked": sorted(blocked, key=lambda b: b["span_coverage"]),
+    }
+
+
 def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
     if half is _MUST_SAY:
         raise TypeError(
@@ -655,7 +723,8 @@ def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
             "CALLER re-opens a door the callee just locked.")
     perm = paired_permutation(keep, ru, seed, n)
     out = {"coverage": cov, "paired_permutation": perm,
-           "access_contrast": access_contrast(half, ru)}
+           "access_contrast": access_contrast(half, ru),
+           "time_coverage": time_coverage(half)}
     # AN EMPTY ANALYSIS SET IS A FAULT, NOT A RESULT. Without this the report renders as a
     # tidy object with priced_total 0 and a null test, which reads exactly like "we looked
     # and there was nothing" — the shape a broken join wears. Measured: a wrong join key
@@ -1024,6 +1093,40 @@ def selftest():
           (flip_site["refuse_foreign"], flip_site["refuse_domestic_only"]), (0, 2))
     check("...and its p reflects that direction rather than reporting the smaller tail",
           flip_site["p_one_sided_exact"], 1.0)
+
+    # TIME COVERAGE: a scatter and a block are different faults and must not read alike.
+    # Driven with a synthetic cell whose arms fail in the two shapes the live corpus shows —
+    # one starting late (blocked then recovered) and one ending early (died and stayed
+    # dead) — because a measure that only catches a late start would have missed the RU
+    # tether's truncations entirely.
+    def _stamped(rows):
+        def _f(half=None, include_private=True):
+            return [(f"hb-paired-{c}", a, {"kind": "load", "pair_id": f"{c}-{i}",
+                                           "ts": t, "http_status": 200,
+                                           "vantage_verified": True})
+                    for i, (c, a, t) in enumerate(rows)]
+        return _f
+    base_t = "2026-08-21T12:%02d:00+00:00"
+    rows = ([("c0", "ru-mobile", base_t % m) for m in (0, 10, 20, 30, 40, 50)]
+            + [("c0", "nl-direct", base_t % m) for m in (40, 45, 50)]      # starts late
+            + [("c1", "ru-mobile", base_t % m) for m in (0, 5, 10)]        # ends early
+            + [("c1", "nl-direct", base_t % m) for m in (0, 10, 20, 30, 40, 50)])
+    saved2 = cell_rows
+    globals()["cell_rows"] = _stamped(rows)
+    try:
+        tc = time_coverage("exploratory")
+    finally:
+        globals()["cell_rows"] = saved2
+    by = {(b["cell"], b["arm"]): b for b in tc["blocked"]}
+    check("an arm that starts late is flagged blocked, and its lateness is measured",
+          (("c0", "nl-direct") in by, by.get(("c0", "nl-direct"), {}).get("starts_late_s")),
+          (True, 2400.0))
+    check("an arm that ENDS EARLY is flagged too — a truncation is a block at the other "
+          "edge", ("c1", "ru-mobile") in by, True)
+    check("...and it is not mistaken for a late start",
+          by.get(("c1", "ru-mobile"), {}).get("starts_late_s"), 0.0)
+    check("a fully-covering arm is not flagged",
+          ("c0", "ru-mobile") in by or ("c1", "nl-direct") in by, False)
 
     ac_e = access_contrast("exploratory", "ru-mobile")
     pol = ac_e["site_level"]["policies"]

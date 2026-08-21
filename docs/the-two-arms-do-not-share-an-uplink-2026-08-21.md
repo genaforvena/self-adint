@@ -78,3 +78,32 @@ time of day — and a bidder's willingness to price plainly might — then losin
 from the foreign arm is not the same as losing 23 loads spread evenly. It is a small
 time-of-day hole in one arm only. The exclusion counts show the magnitude; they do not show
 that shape, and no aggregate over surviving pairs will reveal it either.
+
+
+---
+
+## Correction: contiguous loss is not a foreign-arm story
+
+The tailscale incident above invites the reading that contiguous loss is what happens to the
+*foreign* arm while the domestic one plods along. Measuring it says otherwise. `time_coverage`
+in `adint-holdout` reports, per cell and arm, how much of the cell's wall-clock the arm
+actually covered — read from the shape of what survived, since a failed load writes no row:
+
+| cell | arm | span coverage | shape |
+|---|---|---|---|
+| …2026082112 | nl-direct | 12.0 % | **starts 47.8 min late** — blocked, then recovered |
+| …2026082020 | ru-mobile | 31.5 % | **ends 41.8 min early** — died and stayed dead |
+| …2026082021 | ru-mobile | 51.2 % | **ends 25.0 min early** |
+
+**Three of nine exploratory cells have an arm with a contiguous block, and two of the three
+are the domestic arm.** The shapes differ characteristically: the foreign arm is *blocked
+then restored* (an outage with an end), the RU tether *truncates* (it dies partway through a
+cell and does not come back inside it). Both are contiguous, and both are the time-of-day
+hole the caveat above describes.
+
+A note on how the measure was arrived at, because the first version was wrong. Looking for a
+long gap *between consecutive surviving loads* found nothing on the worst cell — the five
+surviving foreign loads were consecutive and tightly spaced, because the outage sat at the
+edge rather than in the middle. Span coverage plus start-lateness separates all three shapes;
+interior gap alone separates none of them. The gate drives both edges, since a measure that
+only caught a late start would have missed the RU truncations entirely.
