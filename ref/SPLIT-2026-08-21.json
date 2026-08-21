@@ -1,0 +1,9 @@
+{
+  "declared_ts": "2026-08-21T05:47:05.414419+00:00",
+  "document": "docs/split-exploratory-holdout-2026-08-21.md",
+  "permutations": 100000,
+  "rule": "sha256(salt + run_id)[0] even -> holdout",
+  "salt": "adint-split-2026-08-21|",
+  "seed": 20260821,
+  "sha256": "71ac564b58a6a2adb50126c489bc2f1d41de71f1e1207aa30dda9187dba0968d"
+}

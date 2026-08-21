@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""Keep the corpus split in two, and make spending the holdout an event you cannot hide.
+
+`docs/split-exploratory-holdout-2026-08-21.md` declares a split rule before anyone looks
+at the data. Nothing is predicted; the exploratory half is free to mine any way at all.
+The discipline is entirely at the other end: whatever the mining suggests is checked
+against a holdout that has NOT been looked at, and that check happens exactly once.
+
+  --declare    record the document's hash and the split rule, in a committed file, so
+               "declared before the analysis" is checkable rather than a date in a header
+               that a later edit could move.
+  --verify     recompute the hash. A mismatch is not a bug to fix by re-declaring — it is
+               the tool reporting that the split rule changed, which is what it is for.
+  --split      show the assignment: which cells are exploratory, which are holdout.
+  --explore    compute freely on the EXPLORATORY half. No limit, no correction, no plan.
+               Every figure is stamped EXPLORATORY — not confirmed.
+  --confirm    read the HOLDOUT. Appends to an append-only read ledger and reports the
+               holdout as SPENT afterwards.
+
+Why the read ledger and not a promise: a holdout is worth exactly one look, a second look
+turns it into more exploration, and "we only glanced" is unfalsifiable after the fact. So
+a glance writes a row. This mesh already owns the underlying failure — a null computed
+inside the selection window is not a holdout.
+
+`orphan-ok`: driven by hand at the analysis edges. The COLLECTION carries the cadence
+(tools/adint-collect-cell); the analysis is not a reflex.
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import random
+import sys
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUB = os.path.join(REPO, "public-data")
+PRIV = os.path.join(REPO, "data")
+DOC = os.path.join(REPO, "docs", "split-exploratory-holdout-2026-08-21.md")
+REG = os.path.join(REPO, "ref", "SPLIT-2026-08-21.json")
+READS = os.path.join(REPO, "ref", "HOLDOUT-READS.jsonl")
+SPLIT_SALT = "adint-split-2026-08-21|"
+SEED = 20260821
+PERMUTATIONS = 100_000
+PRICED_OUTCOMES = ("priced",)
+
+
+def doc_hash(path=None):
+    """sha256 of the preregistration document, or None if it is not there.
+
+    A missing document must not hash to a fixed string — an absent file that produces a
+    stable digest would VERIFY, and the tool would certify a preregistration that no
+    longer exists.
+    """
+    p = path or DOC
+    if not os.path.exists(p):
+        return None
+    with open(p, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def read_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def load_reg():
+    if not os.path.exists(REG):
+        return None
+    try:
+        return json.load(open(REG, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def cell_rows(include_private=True):
+    """[(run, arm, row)] over every paired ledger. Both trees by default: the analysis set
+    is about what was COLLECTED, and a cell not yet published is collected."""
+    pats = [os.path.join(PUB, "hb-paired-*.jsonl")]
+    if include_private:
+        pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
+    seen, out = set(), []
+    for p in sorted(set(sum([glob.glob(x) for x in pats], []))):
+        if p.endswith(".control.jsonl"):
+            continue
+        base = os.path.basename(p)
+        if base in seen:            # published copy already read
+            continue
+        seen.add(base)
+        for r in read_jsonl(p):
+            out.append((base, r.get("arm"), r))
+    return out
+
+
+def half_of(run_id):
+    """`holdout` or `exploratory`, from the run id alone — §2.1's declared rule.
+
+    A function of the id and nothing else, so a cell's half cannot change as the corpus
+    grows and cannot be nudged by rerunning anything. The WHOLE CELL moves: the two arms
+    of a pair are one observation, and splitting a pair would leak the holdout into the
+    exploratory half through the pairing itself.
+    """
+    h = hashlib.sha256((SPLIT_SALT + str(run_id)).encode("utf-8")).digest()
+    return "holdout" if h[0] % 2 == 0 else "exploratory"
+
+
+def run_of(basename):
+    """`hb-paired-<run_id>.<arm>.jsonl` -> run_id."""
+    b = basename[len("hb-paired-"):] if basename.startswith("hb-paired-") else basename
+    return b.split(".")[0]
+
+
+def split_table():
+    """{run_id: half} over every cell on disk."""
+    return {run_of(b): half_of(run_of(b))
+            for b, _arm, _r in cell_rows()}
+
+
+def analysis_set(half=None):
+    """The rows usable for a contrast, and the exclusion counts that go with them.
+
+    `half` selects `exploratory`, `holdout`, or None for everything. Exclusions are
+    COUNTED and returned, never silently dropped: an exclusion count is a bias term.
+
+    THE RULE THAT MATTERS MOST IS HERE. A load whose arm could not prove where it stood is
+    EXCLUDED, and it is never folded into a bid outcome. The RU arm rides one fragile
+    tether; a fortnight that recorded our own blindness as the market's silence would
+    produce a confident, publishable, false result.
+    """
+    exc = {"wrong-half": 0, "vantage-unproven": 0, "no-arm": 0, "unpaired": 0,
+           "not-a-request": 0}
+    rendered = {}
+    for base, arm, r in cell_rows():
+        if r.get("kind") != "load" or not r.get("pair_id"):
+            continue
+        ok = r.get("http_status") is not None and bool(r.get("vantage_verified"))
+        rendered.setdefault(r["pair_id"], {})[arm] = ok
+    good = {p for p, arms in rendered.items() if len(arms) > 1 and all(arms.values())}
+    keep = []
+    for base, arm, r in cell_rows():
+        if r.get("kind") == "load":
+            continue
+        if r.get("outcome") is None:
+            exc["not-a-request"] += 1
+            continue
+        if half and half_of(run_of(base)) != half:
+            exc["wrong-half"] += 1
+            continue
+        if not arm:
+            exc["no-arm"] += 1
+            continue
+        pid = r.get("pair_id")
+        if pid not in good:
+            exc["vantage-unproven" if pid in rendered else "unpaired"] += 1
+            continue
+        keep.append((arm, r))
+    return keep, exc, good
+
+
+def coverage(half=None):
+    keep, exc, pairs = analysis_set(half)
+    by_arm = {}
+    for arm, r in keep:
+        d = by_arm.setdefault(arm, {"entries": 0, "priced": 0})
+        d["entries"] += 1
+        if r.get("outcome") in PRICED_OUTCOMES:
+            d["priced"] += 1
+    return {"arms": by_arm, "exclusions": exc, "pairs_all_halves": len(pairs),
+            "priced_total": sum(d["priced"] for d in by_arm.values())}
+
+
+def holdout_reads():
+    """Every read of the holdout, ever. Append-only; a read is an event, not a state."""
+    return read_jsonl(READS)
+
+
+def spent():
+    return len(holdout_reads()) > 0
+
+def paired_permutation(keep, ru_arm, seed=SEED, n=PERMUTATIONS):
+    """§3's primary test: permute the arm label WITHIN each pair.
+
+    Exchangeability under H0 is a within-pair claim, and that is the only thing the
+    pairing buys. Permuting across pairs would destroy the site/hour/frame-position
+    matching the design exists to hold fixed and would answer a question nobody asked.
+    Entries nested in loads nested in sites are NOT independent draws; a test that treats
+    them as such (Fisher, §3's secondary) overstates the evidence, which is why it is the
+    secondary.
+    """
+    pairs = {}
+    for arm, r in keep:
+        pid = r.get("pair_id")
+        if not pid:
+            continue
+        d = pairs.setdefault(pid, {})
+        a = d.setdefault(arm, {"n": 0, "k": 0})
+        a["n"] += 1
+        if r.get("outcome") in PRICED_OUTCOMES:
+            a["k"] += 1
+    usable = [d for d in pairs.values() if len(d) == 2]
+    if not usable:
+        return None
+
+    def stat(flip):
+        rn = rk = fn = fk = 0
+        for i, d in enumerate(usable):
+            arms = sorted(d)
+            ru = ru_arm if ru_arm in d else arms[0]
+            fo = [a for a in arms if a != ru][0]
+            a, b = (d[fo], d[ru]) if flip and flip[i] else (d[ru], d[fo])
+            rn += a["n"]; rk += a["k"]; fn += b["n"]; fk += b["k"]
+        return (rk / rn if rn else 0.0) - (fk / fn if fn else 0.0)
+
+    obs = stat(None)
+    rng = random.Random(seed)
+    ge = 0
+    for _ in range(n):
+        ge += stat([rng.random() < 0.5 for _ in usable]) >= obs
+    # +1/+1: a permutation p can never be 0 — with n resamples the smallest honest
+    # statement is 1/(n+1), and printing 0.0 would claim more than the resampling can say.
+    return {"observed_diff": round(obs, 6), "p": (ge + 1) / (n + 1),
+            "pairs_used": len(usable), "permutations": n, "seed": seed}
+
+
+def fisher_one_sided(a, b, c, d):
+    """P(X >= a) for the 2x2 [[a,b],[c,d]] under the hypergeometric null. §3's SECONDARY."""
+    from math import comb
+    n1, n2, t = a + b, c + d, a + c
+    tot = n1 + n2
+    den = comb(tot, t)
+    if den == 0:
+        return None
+    return sum(comb(n1, i) * comb(n2, t - i) for i in range(a, min(n1, t) + 1)) / den
+
+
+
+def cmd_declare(args):
+    h = doc_hash()
+    if h is None:
+        print(f"adint-holdout: {DOC} does not exist — nothing to declare", file=sys.stderr)
+        return 2
+    if load_reg() and not args.force:
+        print("adint-holdout: already declared. Re-declaring would change the split rule "
+              "after the data exists, which is exactly the fitting this file prevents — "
+              "pass --force only to record a declared AMENDMENT.", file=sys.stderr)
+        return 2
+    rec = {"document": os.path.relpath(DOC, REPO), "sha256": h,
+           "declared_ts": datetime.now(timezone.utc).isoformat(),
+           "salt": SPLIT_SALT, "rule": "sha256(salt + run_id)[0] even -> holdout",
+           "seed": SEED, "permutations": PERMUTATIONS}
+    os.makedirs(os.path.dirname(REG), exist_ok=True)
+    json.dump(rec, open(REG, "w", encoding="utf-8"), indent=2, sort_keys=True)
+    print(f"declared {rec['document']}\n  sha256 {h}\n  rule   {rec['rule']}\n"
+          f"  at     {rec['declared_ts']}")
+    return 0
+
+
+def cmd_verify(args):
+    reg = load_reg()
+    if not reg:
+        print("adint-holdout: NOT DECLARED — the split binds nothing", file=sys.stderr)
+        return 2
+    h = doc_hash()
+    if h is None:
+        print("adint-holdout: the declared document is GONE", file=sys.stderr)
+        return 1
+    if h != reg.get("sha256"):
+        print("adint-holdout: HASH MISMATCH — the split declaration changed since it was "
+              f"declared\n  declared {reg.get('sha256')}\n  on disk  {h}\n"
+              "  Not a bug to fix by re-declaring. Record a dated amendment, and never "
+              "let it touch the split rule.", file=sys.stderr)
+        return 1
+    print(f"ok  declaration unchanged ({h[:16]}…)")
+    return 0
+
+
+def cmd_split(args):
+    t = split_table()
+    if not t:
+        print("no cells on disk")
+        return 0
+    for half in ("exploratory", "holdout"):
+        runs = sorted(r for r, hh in t.items() if hh == half)
+        print(f"{half} ({len(runs)}):")
+        for r in runs:
+            print(f"  {r}")
+    n = len(t)
+    ho = sum(1 for v in t.values() if v == "holdout")
+    # An imbalance is reported, never corrected. Rebalancing after seeing the data is the
+    # split becoming the place the fitting happens, which §2.1 exists to prevent.
+    print(f"\n{ho}/{n} holdout ({100.0*ho/n:.0f} %) — reported, never rebalanced: moving a "
+          f"cell after the fact would make the split the place the fitting happens")
+    print(f"holdout status: {'SPENT — ' + str(len(holdout_reads())) + ' read(s)' if spent() else 'unread'}")
+    return 0
+
+
+def _report(keep, cov, ru, seed, n):
+    perm = paired_permutation(keep, ru, seed, n)
+    out = {"coverage": cov, "paired_permutation": perm}
+    arms = cov["arms"]
+    fo = [a for a in arms if a != ru]
+    if ru in arms and fo:
+        f = fo[0]
+        a, b = arms[ru]["priced"], arms[ru]["entries"] - arms[ru]["priced"]
+        c, d = arms[f]["priced"], arms[f]["entries"] - arms[f]["priced"]
+        out["fisher_one_sided"] = {"table": [a, b, c, d],
+                                   "p": fisher_one_sided(a, b, c, d)}
+    return out
+
+
+def cmd_explore(args):
+    """The exploratory half. No limit, no correction, no plan — and every figure stamped."""
+    keep, exc, _p = analysis_set("exploratory")
+    cov = coverage("exploratory")
+    out = _report(keep, cov, args.ru_arm, args.seed or SEED,
+                  args.permutations or PERMUTATIONS)
+    # THE LABEL IS PART OF THE OUTPUT, not part of whoever writes the sentence later. An
+    # effect living only on this half is interesting and unconfirmed; it is never
+    # significant, and no p here is presented as one.
+    out["label"] = ("EXPLORATORY — not confirmed. This half may be mined without limit, "
+                    "so any p here measures the breadth of the search as much as the "
+                    "market. Check it on the holdout before calling it anything.")
+    out["half"] = "exploratory"
+    print(json.dumps(out, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+def cmd_confirm(args):
+    """The holdout. One look, and the look is recorded."""
+    if cmd_verify(argparse.Namespace()) != 0:
+        print("adint-holdout: refusing to read the holdout against a changed declaration",
+              file=sys.stderr)
+        return 1
+    if not args.claim:
+        print("adint-holdout: --claim is required — a holdout read must name what it is "
+              "checking, or the read cannot be told apart from a fishing trip",
+              file=sys.stderr)
+        return 2
+    was_spent = spent()
+    prior = len(holdout_reads())
+    keep, exc, _p = analysis_set("holdout")
+    cov = coverage("holdout")
+    out = _report(keep, cov, args.ru_arm, args.seed or SEED,
+                  args.permutations or PERMUTATIONS)
+    out["half"] = "holdout"
+    out["claim"] = args.claim
+    out["prior_reads"] = prior
+    # THE READ IS WRITTEN BEFORE IT IS REPORTED. A read recorded only on the way out could
+    # be dropped by a crash, an interrupt, or a pipe closing, and the holdout would be
+    # spent with nothing saying so.
+    os.makedirs(os.path.dirname(READS), exist_ok=True)
+    with open(READS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": "holdout-read",
+                             "ts": datetime.now(timezone.utc).isoformat(),
+                             "claim": args.claim, "prior_reads": prior,
+                             "pairs": out["paired_permutation"]["pairs_used"]
+                             if out.get("paired_permutation") else 0}, ensure_ascii=False)
+                 + "\n")
+    out["label"] = ("CONFIRMATORY — first and only read of the holdout."
+                    if not was_spent else
+                    f"NOT A CONFIRMATION — the holdout was already read {prior} time(s). "
+                    "This read is EXPLORATORY: a second look at a holdout is more "
+                    "exploration wearing a holdout's name. Recorded as such.")
+    out["holdout_spent"] = True
+    print(json.dumps(out, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--declare", action="store_true")
+    ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--split", action="store_true")
+    ap.add_argument("--explore", action="store_true")
+    ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--claim", default=None,
+                    help="what this holdout read is checking. Required by --confirm")
+    ap.add_argument("--force", action="store_true", help="re-declare a dated amendment")
+    ap.add_argument("--ru-arm", default="ru-mobile")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--permutations", type=int, default=0)
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+    if a.declare:
+        return cmd_declare(a)
+    if a.verify:
+        return cmd_verify(a)
+    if a.split:
+        return cmd_split(a)
+    if a.explore:
+        return cmd_explore(a)
+    if a.confirm:
+        return cmd_confirm(a)
+    ap.print_help()
+    return 0
+
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    import tempfile
+    global DOC, REG, READS, PUB, PRIV
+    keep_globals = (DOC, REG, READS, PUB, PRIV)
+    d = tempfile.mkdtemp()
+    DOC = os.path.join(d, "split.md")
+    REG = os.path.join(d, "split.json")
+    READS = os.path.join(d, "reads.jsonl")
+    PUB, PRIV = os.path.join(d, "pub"), os.path.join(d, "priv")
+    os.makedirs(PUB); os.makedirs(PRIV)
+
+    # An absent document must not hash to anything: a stable digest for a missing file
+    # would VERIFY, certifying a split rule that no longer exists.
+    check("an absent document has no hash", doc_hash(), None)
+    open(DOC, "w").write("split by run id.\n")
+    check("not declared is not a pass", cmd_verify(argparse.Namespace()), 2)
+    check("declaring succeeds", cmd_declare(argparse.Namespace(force=False)), 0)
+    check("verify passes on the declared text", cmd_verify(argparse.Namespace()), 0)
+    open(DOC, "a").write("\nactually, split however suits the result.\n")
+    check("an edited split rule fails verification", cmd_verify(argparse.Namespace()), 1)
+    open(DOC, "w").write("split by run id.\n")
+    check("restoring the text restores verification", cmd_verify(argparse.Namespace()), 0)
+    check("re-declaring over a declaration is refused",
+          cmd_declare(argparse.Namespace(force=False)), 2)
+
+    # ── THE SPLIT ── deterministic, stable, and whole-cell.
+    # Twenty repeats, not two: a split that had become random would agree with itself
+    # half the time and pass a single comparison on a coin flip.
+    check("the same run id always lands in the same half",
+          len({half_of("2026-08-21-morning-x") for _ in range(20)}), 1)
+    check("the halves are the only two answers",
+          {half_of(f"r{i}") for i in range(60)}, {"exploratory", "holdout"})
+    # Roughly balanced over many ids. Not asserted tightly — a hash is not a shuffler and
+    # a tight bound here would be a gate on luck.
+    n = sum(half_of(f"run-{i}") == "holdout" for i in range(400))
+    check("the split is not lopsided over many cells", 150 <= n <= 250, True)
+    check("the run id is taken from the ledger name, not the arm",
+          run_of("hb-paired-2026-08-21-morning-2026082104.ru.jsonl"),
+          "2026-08-21-morning-2026082104")
+
+    # ── THE ANALYSIS SET ── the vantage rule is exercised, not merely described.
+    def load(pid, arm, status, verified):
+        return {"kind": "load", "pair_id": pid, "arm": arm, "http_status": status,
+                "vantage_verified": verified, "url": "https://s.ru/"}
+    def req(pid, arm, outcome):
+        return {"kind": "request", "pair_id": pid, "arm": arm, "outcome": outcome,
+                "bidder": "roxot"}
+    # Two cells, deliberately chosen so one lands in each half.
+    cells = {}
+    for i in range(200):
+        r = f"cell{i}"
+        cells.setdefault(half_of(r), r)
+        if len(cells) == 2:
+            break
+    expl, hold = cells["exploratory"], cells["holdout"]
+    for run, priced in ((expl, 8), (hold, 8)):
+        rows = {"ru-mobile": [], "nl-direct": []}
+        for i in range(1, 9):
+            for arm in rows:
+                rows[arm].append(load(f"{run}-p{i}", arm, 200, True))
+                rows[arm].append(req(f"{run}-p{i}", arm,
+                                     "priced" if arm == "ru-mobile" else "no-bid"))
+        # One pair per cell whose RU arm could not prove its vantage.
+        rows["ru-mobile"].append(load(f"{run}-p9", "ru-mobile", 200, False))
+        rows["ru-mobile"].append(req(f"{run}-p9", "ru-mobile", "no-bid"))
+        rows["nl-direct"].append(load(f"{run}-p9", "nl-direct", 200, True))
+        rows["nl-direct"].append(req(f"{run}-p9", "nl-direct", "no-bid"))
+        for arm, rr in rows.items():
+            with open(os.path.join(PUB, f"hb-paired-{run}.{arm}.jsonl"), "w") as fh:
+                for r in rr:
+                    fh.write(json.dumps(r) + "\n")
+
+    ke, exc_e, _ = analysis_set("exploratory")
+    kh, exc_h, _ = analysis_set("holdout")
+    check("each half sees only its own cells", (len(ke), len(kh)), (16, 16))
+    check("an unproven arm's rows are EXCLUDED, never counted as no-bid",
+          exc_e["vantage-unproven"], 2)
+    check("the other half's rows are excluded and counted, not silently dropped",
+          exc_e["wrong-half"] > 0, True)
+    cov = coverage("exploratory")
+    check("the priced entries land on the RU arm",
+          (cov["arms"]["ru-mobile"]["priced"], cov["arms"]["nl-direct"]["priced"]), (8, 0))
+
+    # ── THE TEST ── within pairs, and shown both to fire and NOT to fire.
+    perm = paired_permutation(ke, "ru-mobile", seed=1, n=2000)
+    check("the permutation uses every complete pair of its half", perm["pairs_used"], 8)
+    check("a one-sided effect gives a small p", perm["p"] < 0.05, True)
+    check("the p is floor-censored at 1/(n+1), never 0", perm["p"] >= 1 / 2001, True)
+    # Nothing else distinguishes a within-pair permutation from a global reshuffle on a
+    # fixture this clean: both give a small p, and pairs_used counts pairs either way.
+    # Their null SPACES differ — k pairs admit exactly 2**k arrangements, so a within-pair
+    # p can never beat 1/2**k, while a global shuffle runs to the resampling floor.
+    check("the permutation is WITHIN pairs, so p cannot beat 1/2**pairs",
+          perm["p"] >= 1 / 2 ** perm["pairs_used"], True)
+    flat = [(arm, dict(r, outcome="priced")) for arm, r in ke]
+    check("an effect-free corpus does NOT produce a small p",
+          paired_permutation(flat, "ru-mobile", seed=1, n=2000)["p"] > 0.05, True)
+
+    # ── THE LANGUAGE ── stamped by the tool, not left to whoever writes the sentence.
+    import io as _io, contextlib
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_explore(argparse.Namespace(ru_arm="ru-mobile", seed=1, permutations=500))
+    check("an exploratory figure is stamped EXPLORATORY",
+          "EXPLORATORY — not confirmed" in buf.getvalue(), True)
+    # Under the `label` key specifically. The stamp is the report's contract with its
+    # reader, and a stamp moved to some other field still prints while every consumer that
+    # looks for the label sees an unlabelled figure.
+    check("...on the report's `label` field, where a consumer looks for it",
+          json.loads(buf.getvalue()).get("label", "").startswith("EXPLORATORY"), True)
+    # The stamp must survive PRINTING, not merely exist in the dict: json.dumps escapes
+    # a non-ASCII dash to \u2014 by default, so the label a reader sees was not the label
+    # the tool wrote — the first cut of this gate caught exactly that.
+    check("the stamp survives being printed, dash and all",
+          "EXPLORATORY " + chr(0x2014) + " not confirmed" in buf.getvalue(), True)
+    check("...and is not left as an escape a reader has to decode",
+          chr(92) + "u2014" in buf.getvalue(), False)
+    check("an exploratory report never calls its own number significant",
+          "significant" in buf.getvalue().lower(), False)
+
+    # ── THE HOLDOUT ── one look, and the look is recorded.
+    check("a holdout read must name what it checks",
+          cmd_confirm(argparse.Namespace(ru_arm="ru-mobile", seed=1, permutations=500,
+                                         claim=None)), 2)
+    check("the holdout starts unread", spent(), False)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_confirm(argparse.Namespace(ru_arm="ru-mobile", seed=1, permutations=500,
+                                       claim="prices only on the RU arm"))
+    first = buf.getvalue()
+    check("the first read is a confirmation", "CONFIRMATORY" in first, True)
+    check("the read is recorded", len(holdout_reads()), 1)
+    # Read through a miss-tolerant accessor: subscripting a ledger a mutant has just
+    # emptied raises, and a raise ends the suite — the red gate that hides every later one.
+    check("the recorded read names the claim, so it cannot pass as a fishing trip",
+          (holdout_reads() or [{}])[0].get("claim"), "prices only on the RU arm")
+    check("the holdout reports itself SPENT afterwards", spent(), True)
+    # THE FAILURE THAT IS EASY TO MAKE BY ACCIDENT: a second look is not a confirmation,
+    # and must SAY so rather than quietly printing the same numbers again.
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_confirm(argparse.Namespace(ru_arm="ru-mobile", seed=1, permutations=500,
+                                       claim="just checking"))
+    second = buf.getvalue()
+    check("a SECOND read refuses the word confirmation",
+          "NOT A CONFIRMATION" in second and "CONFIRMATORY —" not in second, True)
+    check("...and names itself exploration", "EXPLORATORY" in second, True)
+    check("every read is appended, so the ledger counts glances", len(holdout_reads()), 2)
+
+    DOC, REG, READS, PUB, PRIV = keep_globals
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

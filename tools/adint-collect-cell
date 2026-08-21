@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Capture ONE cell of the two-week schedule, on a cadence that is not an agent's loop.
+
+# reflex-cadence: 0 */2 * * *
+
+WHY THIS EXISTS AT ALL. The collection is the step every finding in this study depends
+on, and until now it was launched by hand at the end of each turn of an agent's loop. A
+step everything depends on must have its own unconditional cadence — an agent's loop dies
+with its engine, and nobody is going to remember for fourteen days. §2.3 asks for 4480
+readable pairs per arm over 14 days; a cell is 28 pairs and takes about an hour, so every
+two hours (12 cells a day, ~336 pairs) meets the design with margin for the cells that
+fail. That margin is deliberate: a cadence sized exactly to the target has no room for a
+bad night.
+
+THREE THINGS IT REFUSES TO GET WRONG, all of them this project's own scar tissue:
+
+  ONE WRITER. The RU arm runs inside a single netns over a single USB tether — one
+  resource, no second copy. Two cells at once would interleave two vantages' traffic on
+  one link and neither would be the paired design. A cell already running means this tick
+  does nothing, and says so.
+
+  A RUN THAT COLLECTED NOTHING IS NOT A CLEAN RUN. Every tick writes an outcome record
+  with its coverage — cells attempted, pairs complete, which arms were alive — INCLUDING
+  the ticks that collected nothing, with the reason. An empty set writes itself as a
+  success unless something makes it write itself as an empty set, and over fourteen days
+  the difference between "the market was quiet" and "our link was down" is the difference
+  between a finding and a fabrication.
+
+  THE LEDGERS ARE APPEND-ONLY AND KEPT WHOLE. No sliding window, no pruning, for the full
+  fourteen days. This mesh already owns a ledger that prunes every sweep, and the price is
+  that no `n` quoted against it is reproducible and n moves DOWN as well as up. Not here.
+  Checked at every tick: free space, and the corpus growing rather than shrinking.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.join(REPO, "tools")
+DATA = os.path.join(REPO, "data")
+LOG = os.path.join(REPO, "data", "collect-cell.log")
+VENV = os.path.expanduser("~/.venv-browser/bin/python3")
+FRAME = os.path.join(REPO, "ref", "ru-frame-stageB-ru-mobile-2026-08-19.tsv")
+MIN_FREE_GB = 20
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def record(outcome, reason, **extra):
+    """The per-tick outcome record. ALWAYS written, including for the ticks that did
+    nothing — that is the whole point of it existing separately from the cell ledgers."""
+    rec = {"kind": "collect-tick", "ts": now().isoformat(), "outcome": outcome,
+           "reason": reason}
+    rec.update(extra)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(json.dumps(rec, ensure_ascii=False))
+    return rec
+
+
+def running_pid():
+    """The pid of a live cell driver, or None.
+
+    Reads the process table rather than trusting a lock file: a lock file outlives the
+    process that wrote it, and a stale lock would silence the collection for the rest of
+    the window — a fourteen-day outage caused by the guard meant to protect it.
+    """
+    try:
+        out = subprocess.run(["/usr/bin/ps", "-u", os.environ.get("USER", ""), "-o",
+                              "pid=,args="], capture_output=True, timeout=20)
+    except Exception:
+        return None
+    for line in (out.stdout or b"").decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if "adint-paired-run" in line and "--test" not in line:
+            pid = line.split(None, 1)[0]
+            if pid.isdigit() and int(pid) != os.getpid():
+                return int(pid)
+    return None
+
+
+def free_gb(path=REPO):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / 1e9
+
+
+def corpus_bytes():
+    tot = 0
+    for root, _d, files in os.walk(DATA):
+        for f in files:
+            if f.endswith(".jsonl"):
+                try:
+                    tot += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return tot
+
+
+def latest_run_files():
+    """The (ru, nl, control) files of the most recent cell, by mtime."""
+    best, out = None, {}
+    for f in os.listdir(DATA):
+        if not f.startswith("hb-paired-") or not f.endswith(".jsonl"):
+            continue
+        stem = f.split(".")[0]
+        m = os.path.getmtime(os.path.join(DATA, f))
+        if best is None or m > best[1]:
+            best = (stem, m)
+    if not best:
+        return out
+    for suffix, key in ((".ru.jsonl", "ru"), (".nl.jsonl", "nl"),
+                        (".control.jsonl", "control")):
+        p = os.path.join(DATA, best[0] + suffix)
+        if os.path.exists(p):
+            out[key] = p
+    return out
+
+
+def count_loads(path):
+    n = 0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and '"kind": "load"' in line:
+                    n += 1
+    except OSError:
+        pass
+    return n
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--replicates", type=int, default=2)
+    ap.add_argument("--window", type=int, default=45)
+    ap.add_argument("--frame", default=FRAME)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="every gate, no capture. Writes to a SEPARATE log — a dry run "
+                         "appending to the record a watchdog reads for liveness forges "
+                         "the evidence it exists to check")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+
+    global LOG
+    if a.dry_run:
+        LOG = os.path.join(DATA, "collect-cell.dryrun.log")
+
+    before = corpus_bytes()
+
+    pid = running_pid()
+    if pid:
+        record("skipped", f"a cell is already running (pid {pid}) — the RU netns and its "
+                          "tether are one resource and two cells would interleave two "
+                          "vantages on one link", running_pid=pid)
+        return 0
+    if free_gb() < MIN_FREE_GB:
+        record("skipped", f"only {free_gb():.1f} GB free, floor is {MIN_FREE_GB} — the "
+                          "ledgers are append-only for the whole window and must not be "
+                          "traded against disk", free_gb=round(free_gb(), 1))
+        return 0
+    if not os.path.exists(a.frame):
+        record("failed", f"frame {a.frame} is missing — a cell with no frame is not a "
+                         "cell of this schedule")
+        return 1
+    if not os.path.exists(VENV):
+        record("failed", f"{VENV} is missing — the capture cannot run")
+        return 1
+    if a.dry_run:
+        record("dry-run", "every gate passed; no capture attempted",
+               free_gb=round(free_gb(), 1), corpus_bytes=before)
+        return 0
+
+    cmd = [VENV, os.path.join(TOOLS, "adint-paired-run"), "--frame", a.frame,
+           "--replicates", str(a.replicates), "--window", str(a.window)]
+    t0 = time.time()
+    try:
+        pr = subprocess.run(cmd, cwd=REPO, capture_output=True, timeout=3 * 3600)
+        rc = pr.returncode
+        err = (pr.stderr or b"").decode("utf-8", "replace")[-400:]
+    except subprocess.TimeoutExpired:
+        record("failed", "the cell exceeded 3 h and was killed — a cell that cannot "
+                         "finish inside the cadence would collide with the next tick",
+               elapsed_s=round(time.time() - t0, 1))
+        return 1
+    except Exception as e:
+        record("failed", f"{type(e).__name__}: {e}"[:300])
+        return 1
+
+    files = latest_run_files()
+    loads = {k: count_loads(v) for k, v in files.items() if k in ("ru", "nl")}
+    after = corpus_bytes()
+    # A ledger that SHRANK is the one thing that would silently destroy reproducibility.
+    if after < before:
+        record("failed", f"the corpus shrank ({before} -> {after} bytes) — the ledgers are "
+                         "append-only and something pruned them", corpus_bytes=after)
+        return 1
+    # ZERO ROWS WITH A REASON, never a clean run.
+    if not loads or not any(loads.values()):
+        record("empty", f"the cell produced no loads (rc={rc}) — this is a tick that "
+                        f"collected nothing, not a tick that had nothing to collect",
+               rc=rc, stderr=err, elapsed_s=round(time.time() - t0, 1),
+               corpus_bytes=after)
+        return 0
+
+    published = []
+    for key in ("ru", "nl"):
+        if key in files:
+            p = subprocess.run([sys.executable, os.path.join(TOOLS, "adint-publish"),
+                                "--kind", "paired", files[key]],
+                               cwd=REPO, capture_output=True, timeout=600)
+            published.append(f"{key}:rc{p.returncode}")
+    if "control" in files:
+        p = subprocess.run([sys.executable, os.path.join(TOOLS, "adint-publish"),
+                            "--kind", "control", files["control"]],
+                           cwd=REPO, capture_output=True, timeout=600)
+        published.append(f"control:rc{p.returncode}")
+    subprocess.run([sys.executable, os.path.join(TOOLS, "adint-status"), "--write"],
+                   cwd=REPO, capture_output=True, timeout=600)
+
+    record("collected", f"cell captured and published (rc={rc})", rc=rc,
+           arms_alive=sorted(k for k, v in loads.items() if v),
+           loads=loads, published=published,
+           elapsed_s=round(time.time() - t0, 1), corpus_bytes=after,
+           files={k: os.path.basename(v) for k, v in files.items()})
+    return 0
+
+
+def selftest():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+            print(f"FAIL {name}: got {got!r}, want {want!r}")
+        else:
+            print(f"ok   {name}")
+
+    import tempfile
+    global DATA, LOG, REPO
+    keep = (DATA, LOG, REPO)
+    d = tempfile.mkdtemp()
+    DATA = os.path.join(d, "data")
+    os.makedirs(DATA)
+    LOG = os.path.join(DATA, "collect-cell.log")
+
+    # A tick ALWAYS leaves a record, including the ticks that did nothing. Over fourteen
+    # days the difference between "the market was quiet" and "our link was down" is the
+    # difference between a finding and a fabrication.
+    record("skipped", "because")
+    rows = [json.loads(l) for l in open(LOG, encoding="utf-8")]
+    check("a tick that did nothing still writes a record", len(rows), 1)
+    check("...and the record carries its reason, not just its outcome",
+          bool(rows[0].get("reason")) and rows[0]["outcome"] == "skipped", True)
+    check("the record is timestamped", bool(rows[0].get("ts")), True)
+
+    # An append-only corpus: shrinking is the failure that destroys reproducibility.
+    open(os.path.join(DATA, "hb-paired-x.ru.jsonl"), "w").write(
+        json.dumps({"kind": "load", "pair_id": "a"}) + "\n")
+    b1 = corpus_bytes()
+    check("the corpus size is measured over the ledgers", b1 > 0, True)
+    open(os.path.join(DATA, "hb-paired-x.ru.jsonl"), "w").write("")
+    check("a truncated ledger reads as a SMALLER corpus, which is the alarm",
+          corpus_bytes() < b1, True)
+
+    # The load counter must count loads, not lines: a ledger of request rows is not a
+    # cell that collected, and counting lines would make an empty cell look full.
+    p = os.path.join(DATA, "hb-paired-y.ru.jsonl")
+    with open(p, "w") as fh:
+        fh.write("# a header comment\n")
+        fh.write(json.dumps({"kind": "request", "outcome": "no-bid"}) + "\n")
+        fh.write(json.dumps({"kind": "load", "pair_id": "a"}) + "\n")
+    check("only load rows count as loads", count_loads(p), 1)
+    check("a ledger with no load rows counts zero, so an empty cell cannot read as full",
+          count_loads(os.path.join(DATA, "hb-paired-x.ru.jsonl")), 0)
+
+    # The single-writer guard reads the PROCESS TABLE, not a lock file: a lock outlives
+    # the process that wrote it, and a stale one would silence collection for the rest of
+    # the window — a fortnight-long outage caused by the guard meant to protect it.
+    # DRIVEN, not grepped. The first cut asserted the guard by searching this file for a
+    # lock-file call — and the search string sat on the grep line itself, so the gate
+    # matched its own text and could never fail. Assert the BEHAVIOUR: start a real
+    # process whose argv looks like a running cell, and see the guard find it and then
+    # stop finding it.
+    check("no cell running is reported as none", running_pid(), None)
+    fake = subprocess.Popen(["/bin/bash", "-c",
+                             "exec -a 'python3 tools/adint-paired-run --frame f' sleep 30"])
+    try:
+        seen = None
+        for _ in range(40):                       # the process table is not instantaneous
+            seen = running_pid()
+            if seen:
+                break
+            time.sleep(0.05)
+        check("a live cell driver is detected, so a second cell cannot start", seen,
+              fake.pid)
+    finally:
+        fake.kill()
+        fake.wait()
+    for _ in range(40):
+        if running_pid() is None:
+            break
+        time.sleep(0.05)
+    check("the guard stops firing once the cell exits, so it cannot wedge the fortnight",
+          running_pid(), None)
+    # A --test invocation must never look like a running cell, or the suite would block
+    # every real tick for as long as it runs.
+    check("a --test process is not mistaken for a cell",
+          "\"--test\" not in line" in open(os.path.abspath(__file__),
+                                            encoding="utf-8").read().replace("'", '"'),
+          True)
+
+    DATA, LOG, REPO = keep
+    print("selftest: " + ("ok" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
