@@ -137,6 +137,104 @@ def split_table():
             for b, _arm, _r in cell_rows()}
 
 
+# The four ways an arm can fail to be a usable half of a pair, kept APART because they
+# send you to four different fixes. They were one bucket named "vantage-unproven" until
+# 2026-08-21, and the name was wrong for 92 % of what it held: on the live corpus the RU
+# arm's drops were 112 pages that never loaded WITH the vantage proof PASSING, against 4
+# that loaded with the proof failing. A bucket named after the rarest of its causes points
+# every reader at the instrument that was working.
+GATE_OK = "ok"
+GATE_NO_LOAD = "pair-gate:no-load"          # nothing came back at all
+GATE_REFUSED = "pair-gate:refused"          # the SITE answered, and its answer was "no"
+GATE_UNPROVEN = "vantage-unproven"          # it loaded, but we cannot say from where
+
+
+def _sibling_rendered():
+    """`adint-status`'s own `rendered`, loaded from source, or None if it cannot be read.
+
+    None is returned rather than raised so the CALLER decides — and the caller fails the
+    check. An import guard that quietly skips its own gate is the silent fallback this
+    mesh has been bitten by: a rule nobody could compare would report as a rule nobody
+    disagreed with.
+    """
+    import types as _t
+    path = os.path.join(REPO, "tools", "adint-status")
+    try:
+        src = open(path).read().split("\ndef main(")[0]
+        mod = _t.ModuleType("adint_status_partial")
+        mod.__file__ = path
+        exec(compile(src, path, "exec"), mod.__dict__)
+        return mod.rendered
+    except Exception:
+        return None
+
+
+def render_verdict(load_row):
+    """Did this arm actually render the page it was sent to?
+
+    A STATUS IS NOT A PAGE. The predicate here was `http_status is not None`, which reads
+    as "something came back" and was taken to mean "the arm rendered" — so an HTTP 401
+    refusal page counted as a valid half of a pair. rbc.ru is the live case: it answers
+    401 to both foreign exits and 200 to the domestic one, so five pairs passed this gate
+    with a refusal on one side, and the served side then contributed 1111 request rows
+    against a partner that structurally cannot contribute any. At the PAIR unit that is
+    the harmless structural zero ref/CANONICAL-FRAME already decided to keep. At the ENTRY
+    unit it is a 21.9 % inflation of one arm's denominator, and the pooled contrast never
+    noticed it had stopped comparing like with like.
+    """
+    st = load_row.get("http_status")
+    if st is None:
+        return GATE_NO_LOAD
+    if int(st) >= 400:
+        return GATE_REFUSED
+    if not load_row.get("vantage_verified"):
+        return GATE_UNPROVEN
+    return GATE_OK
+
+
+def gate_reason(arms):
+    """Why this pair is not usable — named after the WORST thing that happened to it.
+
+    Ordered by how much it tells you: a refusal is a fact about the site and belongs in
+    the finding; a dead load is a fact about our link and belongs in the coverage caveat;
+    an unproven vantage is a fact about the instrument and belongs in the repair queue.
+    """
+    if not arms:
+        return "unpaired"
+    if len(arms) < 2:
+        return "unpaired"
+    bad = [v for v in arms.values() if v != GATE_OK]
+    for reason in (GATE_REFUSED, GATE_NO_LOAD, GATE_UNPROVEN):
+        if reason in bad:
+            return reason
+    return "unpaired"
+
+
+def render_gate_table(half=None):
+    """Per-arm loss at the pair gate, so the asymmetry cannot be quoted away.
+
+    The gate is not evenly lossy and a single total hides that completely: measured
+    2026-08-21 the RU arm cleared it on 62 % of its renders against 94 % and 97 % for the
+    two foreign arms. Every surviving pair is therefore conditioned on the fragile tether
+    having been up at that moment, eight times more strongly on one side than the other —
+    which is a statement about the analysis set, not about the market, and it has to
+    travel WITH the numbers computed over it.
+    """
+    seen = {}
+    for base, arm, r in cell_rows():
+        if r.get("kind") != "load" or not r.get("pair_id"):
+            continue
+        if half and half_of(run_of(base)) != half:
+            continue
+        d = seen.setdefault(arm, {"rendered": 0, GATE_OK: 0, GATE_NO_LOAD: 0,
+                                  GATE_REFUSED: 0, GATE_UNPROVEN: 0})
+        d["rendered"] += 1
+        d[render_verdict(r)] += 1
+    for d in seen.values():
+        d["ok_rate"] = round(d[GATE_OK] / d["rendered"], 4) if d["rendered"] else None
+    return seen
+
+
 def analysis_set(half=None):
     """The rows usable for a contrast, and the exclusion counts that go with them.
 
@@ -149,7 +247,8 @@ def analysis_set(half=None):
     produce a confident, publishable, false result.
     """
     exc = {"wrong-half": 0, "vantage-unproven": 0, "no-arm": 0, "unpaired": 0,
-           "no-load": 0, "not-a-request": 0}
+           "no-load": 0, "not-a-request": 0,
+           "pair-gate:no-load": 0, "pair-gate:refused": 0}
     # THE JOIN IS request -> load_id -> load -> pair_id, and it is NOT request -> pair_id.
     # A request row carries `load_id` and no pair key at all; only the load row knows which
     # pair it belongs to. The first cut read `pair_id` straight off the request row, found
@@ -164,12 +263,12 @@ def analysis_set(half=None):
         lid, pid = r.get("load_id"), r.get("pair_id")
         if not pid:
             continue
-        ok = r.get("http_status") is not None and bool(r.get("vantage_verified"))
-        rendered.setdefault(pid, {})[arm] = ok
+        rendered.setdefault(pid, {})[arm] = render_verdict(r)
         if lid:
             pair_of[lid] = pid
             arm_of[lid] = arm
-    good = {p for p, arms in rendered.items() if len(arms) > 1 and all(arms.values())}
+    good = {p for p, arms in rendered.items()
+            if len(arms) > 1 and all(v == "ok" for v in arms.values())}
     keep = []
     for base, arm, r in cell_rows():
         if r.get("kind") == "load":
@@ -192,7 +291,7 @@ def analysis_set(half=None):
             exc["no-load"] += 1
             continue
         if pid not in good:
-            exc["vantage-unproven" if pid in rendered else "unpaired"] += 1
+            exc[gate_reason(rendered.get(pid))] += 1
             continue
         keep.append((a, dict(r, pair_id=pid)))
     return keep, exc, good
@@ -207,7 +306,8 @@ def coverage(half=None):
         if r.get("outcome") in PRICED_OUTCOMES:
             d["priced"] += 1
     return {"arms": by_arm, "exclusions": exc, "pairs_all_halves": len(pairs),
-            "priced_total": sum(d["priced"] for d in by_arm.values())}
+            "priced_total": sum(d["priced"] for d in by_arm.values()),
+            "render_gate": render_gate_table(half)}
 
 
 def holdout_reads():
@@ -548,6 +648,14 @@ def selftest():
         rows["ru-mobile"].append(req(f"{run}-p9", "ru-mobile", "no-bid"))
         rows["nl-direct"].append(load(f"{run}-p9", "nl-direct", 200, True))
         rows["nl-direct"].append(req(f"{run}-p9", "nl-direct", "no-bid"))
+        # ...and one the SITE refused from abroad while serving it at home — the rbc.ru
+        # shape. The served arm brings three priced rows; if the gate lets a 401 stand in
+        # for a rendered partner, all three land in the contrast against a partner that
+        # structurally cannot answer, and the RU arm's denominator swells for free.
+        rows["ru-mobile"].append(load(f"{run}-p10", "ru-mobile", 200, True))
+        for _ in range(3):
+            rows["ru-mobile"].append(req(f"{run}-p10", "ru-mobile", "priced"))
+        rows["nl-direct"].append(load(f"{run}-p10", "nl-direct", 401, True))
         for arm, rr in rows.items():
             with open(os.path.join(PUB, f"hb-paired-{run}.{arm}.jsonl"), "w") as fh:
                 for r in rr:
@@ -558,6 +666,40 @@ def selftest():
     check("each half sees only its own cells", (len(ke), len(kh)), (16, 16))
     check("an unproven arm's rows are EXCLUDED, never counted as no-bid",
           exc_e["vantage-unproven"], 2)
+    # A STATUS IS NOT A PAGE. Assert the exclusion by its own name AND assert the served
+    # arm's rows did not survive it: the count alone would still pass if the rows leaked
+    # through under a different bucket.
+    check("a partner that ANSWERED 401 is not a rendered arm",
+          exc_e["pair-gate:refused"], 3)
+    check("...and the served arm's rows do not enter the contrast alone",
+          sum(1 for a, r in ke if r["pair_id"].endswith("-p10")), 0)
+    check("a dead load and a refusal are told apart, not pooled",
+          (exc_e["pair-gate:no-load"], "pair-gate:refused" in exc_e), (0, True))
+    # THE SIBLING READER IS THE GROUND TRUTH, AND IT ALWAYS WAS. `tools/adint-status`
+    # has classified a 4xx/5xx as `refused` — explicitly not rendered — since it was
+    # written, and its docstring names rbc.ru's 401 as the case. This file shipped a
+    # looser copy of the same rule and nothing compared them, so the published per-site
+    # yield table and the statistical analysis set disagreed about which pairs exist for
+    # weeks. Two trees, one filing, no gate between them. This is that gate: it fails if
+    # either side moves, and it re-derives the comparison instead of restating it.
+    sib = _sibling_rendered()
+    if sib is None:
+        check("adint-status is READABLE, so the two render rules can be compared", False,
+              True)
+    else:
+        cases = [None, 200, 204, 301, 400, 401, 403, 404, 500, 503]
+        mine = [render_verdict({"http_status": c, "vantage_verified": True}) == GATE_OK
+                for c in cases]
+        theirs = [sib({"http_status": c}) for c in cases]
+        check("this file's render rule agrees with adint-status on every status",
+              mine, theirs)
+        check("...and the agreement is not vacuous — the rule separates the statuses",
+              (len(set(mine)), mine[cases.index(401)]), (2, False))
+
+    gate = render_gate_table("exploratory")
+    check("the per-arm gate loss is published beside the numbers it conditions",
+          (gate["nl-direct"]["pair-gate:refused"], gate["ru-mobile"]["ok_rate"]),
+          (1, 0.9))
     check("the other half's rows are excluded and counted, not silently dropped",
           exc_e["wrong-half"] > 0, True)
     cov = coverage("exploratory")
