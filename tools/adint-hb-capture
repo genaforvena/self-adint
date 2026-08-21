@@ -505,6 +505,42 @@ def echo_hosts(echo=None):
     return [h.strip() for h in str(IP_ECHO).split(",") if h.strip()]
 
 
+def shell_echo_control(reason):
+    """On a preflight refusal, ask the SAME echoes from the SHELL and say what happened.
+
+    A refusal currently records only that the BROWSER could not read an echo, which leaves
+    "the network was down" and "this browser context could not reach it" indistinguishable
+    in the record. Measured 2026-08-21: nl-direct refused 23 consecutive loads over 47
+    minutes with `exit=None echo_attempts=3/3`, and nothing in the artifact says which of
+    those two it was — a shell curl run afterwards answered 200, but afterwards is not a
+    comparison.
+
+    This is the control-curl principle the study already applies per pair, applied to the
+    vantage proof: a second measurement from a different stack AT THE SAME MOMENT. It
+    writes to stderr only, which `adint-paired-run` already folds into the run log, so it
+    adds no row and changes no analysis — a failure that was previously unattributable
+    becomes attributable, and nothing else moves.
+    """
+    import shutil
+    curl = shutil.which("curl")
+    if not curl:
+        print(f"echo-control: SKIPPED (no curl on PATH) — {reason}", file=sys.stderr)
+        return
+    for host in echo_hosts():
+        try:
+            r = subprocess.run([curl, "-s", "-m", "10", host], capture_output=True,
+                               timeout=15)
+            body = (r.stdout or b"").decode("utf-8", "replace").strip()[:40]
+            print(f"echo-control: shell {host} rc={r.returncode} body={body!r}",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"echo-control: shell {host} raised {type(e).__name__}", file=sys.stderr)
+    print(f"echo-control: the browser could not read an echo; the lines above are the "
+          f"SAME echoes from the shell at the same moment. Both failing means the link; "
+          f"only the browser failing means the browser context. ({reason})",
+          file=sys.stderr)
+
+
 def echo_ip(txt):
     """The address an echo body states, or None if it does not state exactly one."""
     if txt is None:
@@ -1193,6 +1229,7 @@ def main():
             print(f"preflight vantage: proxy={seen_exits['proxy']} direct={seen_exits['direct']}",
                   file=sys.stderr)
             if None in seen_exits.values():
+                shell_echo_control("proxy/direct preflight")
                 print("refusing: the echo could not be read, so the arms are unproven "
                       "(no vantage evidence is not evidence of a vantage)", file=sys.stderr)
                 return 2
@@ -1219,6 +1256,7 @@ def main():
             print(f"preflight vantage: via=direct exit={seen} echo_attempts={seen_tries}"
                   f"/{ECHO_TRIES}", file=sys.stderr)
             if seen is None:
+                shell_echo_control("via=direct preflight")
                 print("refusing: the echo could not be read, so --via direct is unproven",
                       file=sys.stderr)
                 return 2
@@ -1930,6 +1968,28 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
              live["load"].get("vantage_verified") is True
              and live["load"].get("browser_egress_ip") == live["direct"]),
         ]
+    # THE ECHO CONTROL IS A DIAGNOSTIC ON A FAILURE PATH, so the one thing it must never
+    # do is raise — a crash there would turn an honest rc=2 refusal into a traceback and
+    # lose the refusal itself. Driven with a captured stderr, asserting it probes EVERY
+    # echo host (a control that checks one host cannot tell a dead link from a dead host)
+    # and that it says so out loud when curl is missing rather than doing nothing quietly.
+    import io as _io, contextlib as _ctx
+    _buf = _io.StringIO()
+    try:
+        with _ctx.redirect_stderr(_buf):
+            shell_echo_control("selftest")
+        _out = _buf.getvalue()
+        _raised = False
+    except Exception:
+        _out, _raised = "", True
+    checks = checks + [
+        ("the echo control never raises on the refusal path", not _raised),
+        ("the echo control probes EVERY echo host, not just the first",
+         all(h in _out for h in echo_hosts())),
+        ("the echo control names the two hypotheses it exists to separate",
+         "the link" in _out and "browser context" in _out),
+    ]
+
     for name, good in checks:
         print(("ok   " if good else "FAIL ") + name)
         ok = ok and good
