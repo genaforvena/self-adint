@@ -330,13 +330,37 @@ def block(include_private):
         L.append("")
 
     # Coverage against the DESIGN, so a first cell can never read as the study.
+    #
+    # TWO figures, and the READABLE one leads, because they are not two views of one number —
+    # they are counted in different units and only one of them is the study's unit. A load whose
+    # paired half never saw the page contributes nothing to an RU-versus-NL contrast, and the
+    # table above already says so in its own bolded column; the coverage line went on counting
+    # loads ATTEMPTED anyway. Across the cells on disk 2026-08-21 that gap is not a rounding
+    # detail: 6.0 % of loads against 2.9 % of readable pairs, and the three most recent full
+    # cells each land near half (28 complete pairs, 14-15 readable). The blindness is systematic,
+    # not noise — the same sites fail on the same arm every cell: iz.ru answers the foreign exit
+    # 403 and rbc.ru 401, while aif.ru / magnit.ru / matchtv.ru / pikabu.ru return no response at
+    # all on the RU mobile arm. So the single progress number every commit and board post quoted
+    # was roughly double the progress the design actually asks for.
+    # Both stay, because they answer different questions (how much have we SPENT vs how much can
+    # we USE), and the line names which is which rather than leaving a reader to assume.
     if cl:
         loads = sum(c["loads"] for c in cl)
         designed = 4480 * 2  # §2.3: 4480 loads per arm over 14 days, two arms
-        L += [f"**Coverage against the design:** {loads} of {designed} loads "
-              f"({100.0*loads/designed:.1f} %) of the 14-day, two-arm schedule in §2.3 of "
-              f"`docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is "
-              f"a pilot of that design, not a sample of the Russian market.", ""]
+        # Per RUN, not per row: readable_pairs is carried on BOTH arms of a cell with the same
+        # value, so summing the rows counts every pair twice — the same double-count this file
+        # already fixed once for published-vs-unpublished copies, in a different column.
+        readable = sum({c["run"]: c["readable_pairs"] for c in cl}.values())
+        designed_pairs = designed // 2
+        L += [f"**Coverage against the design:** {readable} of {designed_pairs} readable pairs "
+              f"({100.0*readable/designed_pairs:.1f} %) of the 14-day, two-arm schedule in §2.3 "
+              f"of `docs/step0c-hb-ru-market-study-2026-08-18.md`. That is the study's own unit: "
+              f"a pair is readable only when BOTH arms saw the page, and only such a pair carries "
+              f"a contrast. Measured in loads attempted the same work reads {loads} of {designed} "
+              f"({100.0*loads/designed:.1f} %) — the larger figure is what we have SPENT, the "
+              f"smaller is what we can USE, and the gap is the systematic per-site blindness "
+              f"named in the table above, not noise. Everything measured so far is a pilot of "
+              f"that design, not a sample of the Russian market.", ""]
 
     # Publish drift: the same cell present in both trees with different load counts. Named
     # rather than resolved, because which copy is right is not this tool's call.
@@ -486,7 +510,20 @@ def selftest():
     check("a cell in both trees is ONE row per arm, not two",
           len([x for x in b2.splitlines() if "`nl-direct`" in x and "`testcell`" in x]), 1)
     check("its loads are counted once in the coverage line",
-          "6 of 8960 loads" in b2, True)
+          "6 of 8960 (0.1 %)" in b2, True)
+    # The coverage line's UNIT. It led with loads attempted while the table beside it bolded a
+    # readable count that was half as large, so every quoted progress figure was in a unit the
+    # design cannot spend. Assert the study's unit LEADS, and that the spent figure is still
+    # there — dropping it would trade one half-truth for the other.
+    check("coverage leads with readable pairs, the study's own unit",
+          b2.index("readable pairs") < b2.index("loads attempted"), True)
+    check("the readable count is against pairs, not against loads",
+          "1 of 4480 readable pairs" in b2, True)
+    # Per RUN, not per row: both arms carry the same readable_pairs, so summing rows doubles it.
+    check("the readable pair total is not double-counted across the two arms",
+          "2 of 4480 readable pairs" in b2, False)
+    check("the loads figure is kept beside it, named as what was spent",
+          "loads attempted" in b2 and "SPENT" in b2, True)
     check("no drift is claimed when the copies agree",
           "disagree" in b2, False)
 
