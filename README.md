@@ -35,7 +35,7 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-21 00:46 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-21 01:41 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
@@ -97,8 +97,10 @@ Three counts, because they are three different facts. `this arm` is what this ar
 | `2026-08-20-night-2026082022` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **15** | 45 s | 22,23 | 28/28 |
 | `2026-08-20-night-2026082023` | `us-exit` | 28 | 4 | 1 | 14 | 28 | 28 | **15** | 45 s | 0,23 | 28/28 |
 | `2026-08-20-night-2026082023` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **15** | 45 s | 0,23 | 28/28 |
+| `2026-08-21-night-2026082100` | `us-exit` | 28 | 5 | 1 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
+| `2026-08-21-night-2026082100` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
 
-**Coverage against the design:** 479 of 8960 loads (5.3 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is a pilot of that design, not a sample of the Russian market.
+**Coverage against the design:** 535 of 8960 loads (6.0 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is a pilot of that design, not a sample of the Russian market.
 
 <!-- /NUMBERS -->
 
