@@ -9,6 +9,41 @@ Artifacts: `data/adfox-cards-2026-08-21.json`, `data/yandex-vocab-2026-08-21.jso
 Corpus: 20 paired ledgers, 2026-08-19..20, 23,202 request rows, 14 RU publishers,
 two simultaneous arms (`ru-mobile` = MTS PDP in Moscow, `us-exit` = Tailscale exit node).
 
+## PRIOR ART FIRST — Yandex documents the visibility itself, and that must lead
+
+Before any of the below: **Yandex ships the auction's visibility as a publisher feature.**
+`https://yandex.ru/support/adfox/ru/monetization/script-features` — fetched and read
+2026-08-21, not taken second-hand — documents `window.Ya.headerBidding.getLastBidsReceived()`
+returning an array of `Bid` objects with `adapterName`, `containerId`, `campaignId`,
+`requestDuration`, `cost.{currency,cpm}`, `error.{code,message}`, plus the callback
+`onBidsReceived` and a table of error codes **0–9**.
+
+So "you can see who bid and what they bid" is **not a discovery** — it is a documented
+debugging surface, and anyone writing this up who does not cite that page up front will
+have it produced as a rebuttal. What is stated below is only what survives that citation:
+
+1. **The transport is a different surface from the documented one.** `getLastBidsReceived()`
+   is a JS method — you must run script in the page to call it. What is measured here is a
+   **query parameter already on the wire**, so the same content is visible to anything on
+   the network path that never runs any script. And the wire field names are **not** the
+   documented interface's: `bidderName` / `response_time` / `bid` / `campaign_id` /
+   `placement_id` against the doc's `adapterName` / `requestDuration` / `cost.cpm` /
+   `campaignId` / `containerId`. A separate serialization, not the documented object.
+2. **The endpoint is undocumented.** `/ads/adfox/<ownerId>/getCode` is in Yandex's own docs
+   (`.../ad-inventory/codes/code-loader`); `/ads/adfox/<ownerId>/getBulk/v2` is not, and a
+   search of GitHub code search + open web returned no public source naming it. One incidental
+   public line carries the same JSON shape — `grevinden/hh-research`, created 2026-08-18, one
+   commit, no analysis and scoped to hh.ru.
+3. **Two error codes in this corpus are outside the documented table.** The doc defines 0–9.
+   Observed here: `101` ×41 and `111` ×7 — 48 of 1,248 entries carrying a failure code that
+   the public table does not define.
+4. **The market result below is untouched by any of this.** That prices depend on the vantage
+   is a fact about who bids, not about what the protocol exposes. No prior art found.
+
+Prior-art coverage is honest about its holes: AdGuard's Russian filter list was not
+searched (correct raw path not found), GitHub code search indexes default branches only,
+and the sweep ran from a US vantage with Russian-language queries rather than a RU vantage.
+
 ## What is being read, and why "reveals" is the right verb
 
 On a page running AdFox the browser calls
@@ -53,7 +88,8 @@ Every field, over all 1,259 entries:
 `mediasniper`, `roxot`, `gnezdo`, `astralab`, `sape`, `videonow`, `smi2`, `adwile`, `umg`,
 `bidvol`, `segmento`, `otm`, `hyper`, `getintent`, `alfasense`, `hhru`, `hybrid`, four
 `adfox_*` and four `pb_*` adapters. Per-bidder latency: n=1,259, min 68 ms, p50 1,002 ms,
-p90 1,521 ms, max 2,015 ms. Seven distinct failure codes, `3` and `1` covering 89 %.
+p90 1,521 ms, max 2,015 ms. Seven distinct failure codes, `3` and `1` covering 89 % — and `101` (×41) and
+`111` (×7) are **not in Yandex's documented 0–9 table**.
 
 Who was invited, how slow each one was, and why each dropped out is fully legible from
 the page's own outbound request. On this half the operator is right without qualification.
