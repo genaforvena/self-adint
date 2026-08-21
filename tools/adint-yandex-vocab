@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""adint-yandex-vocab — the vocabulary a Yandex/AdFox ad request is written in.
+
+Operator, 2026-08-21: the odd names landed; get MORE of them, wide, from every side.
+
+This is a census of the QUERY-PARAMETER LANGUAGE on yandex.ru ad endpoints: how many
+distinct keys, what the short-code slots hold, and — the part that matters — what the
+`puidN` keys actually are.
+
+THE FINDING THIS TOOL EXISTS TO CARRY. `puid1..puid63` read like field names. They are
+not names, they are POSITIONS: the publisher fills slot N with whatever it likes, so the
+SAME key means different things on different sites. Measured here: `puid2` is a weather
+word on gismeteo (`cloud`/`rain`/`sun`) and an opaque 24-, 69- or 2-character token on
+three other publishers. Anything downstream that reads `puid2` as a field is reading
+four different fields under one name.
+
+PUBLISHING DISCIPLINE. A `puidN` value can BE an identifier — measured, one publisher's
+`puid2` is a 24-char Yandex-shaped token. So values are emitted as SHAPES unless they
+are short lowercase words, and the shape function is gated. The short-code slots
+(`p1`/`p2`/`pp`/`ps`) are ad-unit codes, not user ids, and are published verbatim; the
+gate below asserts an id-shaped value can never take that path.
+"""
+import argparse, collections, json, os, re, sys
+import urllib.parse as up
+
+CODE_SLOTS = ("p1", "p2", "pp", "ps", "pfc", "pfb")
+PUID_RE = re.compile(r"puid(\d+)$")
+WORD_RE = re.compile(r"[a-z]{2,10}$")
+
+
+def value_shape(v):
+    """A word stays a word. Anything that could be an id leaves as a shape."""
+    if v == "":
+        return "empty"
+    if v == "null":
+        return "the-string-null"
+    if WORD_RE.fullmatch(v):
+        return "word:%s" % v
+    if re.fullmatch(r"\d{1,4}", v):
+        return "int:%s" % v
+    if re.fullmatch(r"\d+", v):
+        return "digits:%d" % len(v)
+    return "opaque:%d" % len(v)
+
+
+def is_code_slot_safe(v):
+    """An ad-unit code is short and alphanumeric. Nothing else may be printed verbatim."""
+    return bool(re.fullmatch(r"[a-z0-9]{1,8}", v))
+
+
+def scan(paths, hostsuffix="yandex.ru"):
+    st = {
+        "rows": 0, "yandex_requests": 0,
+        "keys": collections.Counter(),
+        "codes": collections.defaultdict(collections.Counter),
+        "codes_unsafe": collections.Counter(),
+        "puid_keys": collections.Counter(),
+        "puid_shapes": collections.defaultdict(collections.Counter),
+        "puid_by_site": collections.defaultdict(lambda: collections.defaultdict(collections.Counter)),
+        "geo_by_arm": collections.defaultdict(collections.Counter),
+        "ylv_vs_pcode": collections.Counter(),
+        "pcode_versions": collections.Counter(),
+        "sites": collections.Counter(),
+    }
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("kind") != "request":
+                    continue
+                st["rows"] += 1
+                url = d.get("req_url_full") or ""
+                sp = up.urlsplit(url)
+                if not sp.netloc.endswith(hostsuffix):
+                    continue
+                st["yandex_requests"] += 1
+                q = dict(up.parse_qsl(sp.query, keep_blank_values=True))
+                arm = d.get("arm") or "?"
+                site = q.get("extid_tag_loader") or ""
+                if site:
+                    st["sites"][site] += 1
+                for k, v in q.items():
+                    st["keys"][k] += 1
+                    if k in CODE_SLOTS and v:
+                        if is_code_slot_safe(v):
+                            st["codes"][k][v] += 1
+                        else:
+                            st["codes_unsafe"][k] += 1
+                    m = PUID_RE.match(k)
+                    if m and v != "":
+                        st["puid_keys"][k] += 1
+                        sh = value_shape(v)
+                        st["puid_shapes"][k][sh] += 1
+                        if site:
+                            st["puid_by_site"][k][site][sh] += 1
+                # the geo the publisher itself puts in its targeting
+                if q.get("puid29"):
+                    st["geo_by_arm"][arm][q["puid29"]] += 1
+                ylv, pcv = q.get("ylv"), q.get("pcode-version")
+                if pcv:
+                    st["pcode_versions"][pcv] += 1
+                if ylv and pcv:
+                    try:
+                        st["ylv_vs_pcode"]["equal" if abs(float(ylv) - float(pcv) / 1e7) < 1e-12
+                                            else "differ"] += 1
+                    except ValueError:
+                        st["ylv_vs_pcode"]["unparseable"] += 1
+    return st
+
+
+def report(st, out=sys.stdout, top=0):
+    w = out.write
+    w("# The vocabulary of a Yandex ad request\n\n")
+    w("%d request rows read, %d of them to yandex.ru, across %d publisher tags.\n"
+      % (st["rows"], st["yandex_requests"], len(st["sites"])))
+    w("%d DISTINCT query-parameter names.\n\n" % len(st["keys"]))
+    w("## the short-code slots — ad unit codes, published verbatim\n\n")
+    for k in CODE_SLOTS:
+        vs = st["codes"][k]
+        if not vs:
+            continue
+        vals = sorted(vs)
+        shown = vals if not top else vals[:top]
+        w("  %-4s %3d distinct / %4d uses%s\n"
+          % (k, len(vs), sum(vs.values()),
+             ("  (%d id-shaped values withheld)" % st["codes_unsafe"][k]) if st["codes_unsafe"][k] else ""))
+        w("       %s\n" % ", ".join(shown))
+    w("\n## puidN — %d distinct keys, and they are POSITIONS, not names\n\n" % len(st["puid_keys"]))
+    for k in sorted(st["puid_keys"], key=lambda x: int(PUID_RE.match(x).group(1))):
+        w("  %-8s %5d uses  %s\n"
+          % (k, st["puid_keys"][k],
+             ", ".join("%s x%d" % (s, n) for s, n in st["puid_shapes"][k].most_common(6))))
+    w("\n### the same key, a different thing per publisher\n\n")
+    for k in sorted(st["puid_by_site"], key=lambda x: int(PUID_RE.match(x).group(1))):
+        per = st["puid_by_site"][k]
+        if len(per) < 2:
+            continue
+        kinds = {tuple(sorted(v)) for v in per.values()}
+        if len(kinds) < 2:
+            continue
+        w("  %s:\n" % k)
+        for s in sorted(per):
+            w("      %-18s %s\n" % (s, dict(per[s])))
+    w("\n## puid29 — the publisher's own targeting carries the VANTAGE\n\n")
+    for arm in sorted(st["geo_by_arm"]):
+        w("  arm=%-10s %s\n" % (arm, dict(st["geo_by_arm"][arm])))
+    w("\n## ylv / ybv: a float that looks like a floor and is a BUILD NUMBER\n\n")
+    w("  ylv == pcode-version/1e7 : %s\n" % dict(st["ylv_vs_pcode"]))
+    w("  distinct pcode-version values observed: %d %s\n"
+      % (len(st["pcode_versions"]), dict(st["pcode_versions"])))
+    if len(st["pcode_versions"]) < 2:
+        w("  CAVEAT: only ONE build version is in this corpus, so the relation is fitted on a\n")
+        w("  single point. It is consistent with ylv=version/1e7 and equally consistent with\n")
+        w("  ylv being a constant. It cannot be told apart until a second version is observed.\n")
+    return st
+
+
+def as_json(st):
+    return {
+        "yandex_requests": st["yandex_requests"],
+        "distinct_param_names": len(st["keys"]),
+        "param_names": dict(st["keys"]),
+        "code_slots": {k: dict(v) for k, v in st["codes"].items()},
+        "code_slot_values_withheld": dict(st["codes_unsafe"]),
+        "puid_keys": dict(st["puid_keys"]),
+        "puid_value_shapes": {k: dict(v) for k, v in st["puid_shapes"].items()},
+        "puid_by_site_shapes": {k: {s: dict(c) for s, c in v.items()}
+                                for k, v in st["puid_by_site"].items()},
+        "puid29_by_arm": {k: dict(v) for k, v in st["geo_by_arm"].items()},
+        "ylv_vs_pcode_version": dict(st["ylv_vs_pcode"]),
+        "pcode_versions": dict(st["pcode_versions"]),
+    }
+
+
+def selftest():
+    fails = []
+
+    def check(name, got, want):
+        ok = got == want
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        got %r want %r" % (got, want))
+            fails.append(name)
+
+    # A word is the finding; an id is never printed.
+    check("a weather word survives as itself", value_shape("cloud"), "word:cloud")
+    check("a yandex-shaped token leaves as a shape",
+          value_shape("0BNtRe!SlUXv32qHmu4zdw--"), "opaque:24")
+    check("the literal string null is its own state, not empty",
+          value_shape("null"), "the-string-null")
+    check("empty is its own state too", value_shape(""), "empty")
+    check("a small int stays readable", value_shape("23"), "int:23")
+    check("a long digit run is a width, not a number", value_shape("1787255539533"), "digits:13")
+
+    # The code-slot lane prints verbatim, so it needs its own guard.
+    check("an ad-unit code may be printed", is_code_slot_safe("dayz"), True)
+    check("an id-shaped value may NOT take the verbatim lane",
+          is_code_slot_safe("0BNtRe!SlUXv32qHmu4zdw--"), False)
+    check("nor a long digit run", is_code_slot_safe("1787255539533"), False)
+
+    import tempfile
+    def row(arm, site, extra):
+        q = {"extid_tag_loader": site, "p2": "dayz", **extra}
+        return json.dumps({"kind": "request", "arm": arm,
+                           "req_url_full": "https://yandex.ru/ads/adfox/1/getBulk/v2?" + up.urlencode(q)})
+    rows = [
+        row("ru-mobile", "www.gismeteo.ru", {"puid2": "cloud", "puid29": "RU_",
+                                             "ylv": "0.1306302", "pcode-version": "1306302"}),
+        row("us-exit", "hh.ru", {"puid2": "0BNtRe!SlUXv32qHmu4zdw--", "puid29": "CA_QC",
+                                 "ylv": "0.1306302", "pcode-version": "1306302"}),
+        # A row where the relation does NOT hold. Without it the "equal" gate below is
+        # vacuous — every fixture row agreeing means an `if True` passes it just as well.
+        row("ru-mobile", "iz.ru", {"ylv": "0.9999999", "pcode-version": "1306302"}),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write("\n".join(rows) + "\n")
+        tmp = fh.name
+    st = scan([tmp])
+    j = as_json(st)
+    check("all three yandex requests are seen", st["yandex_requests"], 3)
+    check("puid2 is recorded as TWO different shapes across two publishers",
+          j["puid_by_site_shapes"]["puid2"],
+          {"www.gismeteo.ru": {"word:cloud": 1}, "hh.ru": {"opaque:24": 1}})
+    check("puid29 separates the arms", j["puid29_by_arm"],
+          {"ru-mobile": {"RU_": 1}, "us-exit": {"CA_QC": 1}})
+    check("the ylv relation is checked, not assumed — the fixture carries a row that\n         DISAGREES, so an `if True` cannot pass this",
+          j["ylv_vs_pcode_version"], {"equal": 2, "differ": 1})
+    blob = json.dumps(j)
+    check("no puid VALUE that could be an id survives into the artifact",
+          "0BNtRe!SlUXv32qHmu4zdw--" in blob, False)
+    os.unlink(tmp)
+    print("\n%s" % ("all gates green" if not fails else "RED: %s" % fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ledgers", nargs="*")
+    ap.add_argument("--json", metavar="PATH")
+    ap.add_argument("--top", type=int, default=0, help="cap code-slot values printed (0 = all)")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+    if not a.ledgers:
+        print("n/a: no ledger given", file=sys.stderr)
+        sys.exit(2)
+    st = scan(a.ledgers)
+    if st["yandex_requests"] == 0:
+        print("n/a: no yandex.ru request in the given ledgers", file=sys.stderr)
+        sys.exit(2)
+    report(st, top=a.top)
+    if a.json:
+        with open(a.json, "w") as fh:
+            json.dump(as_json(st), fh, indent=1, sort_keys=True, ensure_ascii=False)
+        print("\nartifact -> %s" % a.json)
+
+
+if __name__ == "__main__":
+    main()

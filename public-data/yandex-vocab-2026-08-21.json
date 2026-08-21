@@ -1,0 +1,1124 @@
+{
+ "code_slot_values_withheld": {},
+ "code_slots": {
+  "p1": {
+   "blnzb": 8,
+   "bscqh": 15,
+   "bscql": 15,
+   "bsmxa": 7,
+   "bsohz": 7,
+   "btpkl": 15,
+   "bvvmu": 7,
+   "bwiwo": 8,
+   "bwvwe": 15,
+   "bzirr": 7,
+   "bzisb": 7,
+   "cdptj": 9,
+   "cdtyx": 2,
+   "cecto": 4,
+   "cluxl": 2,
+   "cnpjm": 10,
+   "cspnh": 11,
+   "csprc": 3,
+   "cspwv": 4,
+   "cspwy": 4,
+   "ctapm": 2,
+   "ctego": 2,
+   "ctorh": 1,
+   "cyhxe": 2,
+   "czwwc": 2,
+   "dayiy": 9,
+   "dayus": 9,
+   "dayut": 9,
+   "dayuu": 9,
+   "dayuv": 9,
+   "dayuw": 9,
+   "dayux": 9,
+   "dayyx": 9,
+   "dayyy": 9,
+   "dayza": 9,
+   "dayzb": 9,
+   "dbeod": 6,
+   "dbsex": 9,
+   "dbsey": 9,
+   "dbtge": 9,
+   "dbtjo": 11,
+   "dbxcr": 12,
+   "dbywr": 9,
+   "dbyxc": 9,
+   "dbyxd": 9,
+   "dbzsu": 9,
+   "dbzsv": 9,
+   "dbzsw": 9,
+   "dbzsx": 9,
+   "dcetc": 9,
+   "dcetd": 18,
+   "deayp": 15,
+   "dhsku": 10,
+   "djxwb": 11,
+   "djxwd": 12,
+   "djxwn": 11,
+   "dnzmt": 4,
+   "dojcb": 10,
+   "dojcc": 10,
+   "dojcd": 10,
+   "dpewm": 3
+  },
+  "p2": {
+   "emwl": 15,
+   "emxu": 4,
+   "enli": 15,
+   "eruc": 15,
+   "fban": 14,
+   "fbao": 14,
+   "fckv": 7,
+   "feii": 7,
+   "fgou": 23,
+   "fllx": 7,
+   "fluh": 105,
+   "flxw": 2,
+   "flxx": 7,
+   "fmui": 15,
+   "fmwx": 8,
+   "foiy": 8,
+   "fpoz": 8,
+   "fqgs": 8,
+   "fqqv": 14,
+   "fqve": 8,
+   "fqyp": 28,
+   "frfb": 14,
+   "frfe": 10,
+   "fryh": 14,
+   "fryi": 14,
+   "fsav": 14,
+   "fsaw": 14,
+   "fssz": 8,
+   "fulf": 7,
+   "fulg": 7,
+   "fxjd": 14,
+   "gbqh": 14,
+   "gcuq": 12,
+   "gdol": 13,
+   "gdyh": 11,
+   "gdyk": 11,
+   "gdyl": 12,
+   "gmxe": 10,
+   "gryj": 14,
+   "gvdo": 14,
+   "gvdq": 14,
+   "gwid": 16,
+   "gwkf": 16,
+   "gwkg": 16,
+   "gwkm": 16,
+   "gwkr": 16,
+   "gwya": 14,
+   "gybd": 16,
+   "hbed": 10,
+   "hbee": 30,
+   "hhro": 1,
+   "hiuy": 3,
+   "hjsh": 14,
+   "hjsy": 15,
+   "hnga": 4,
+   "hnge": 7,
+   "hofj": 2,
+   "hony": 2,
+   "hoyz": 14,
+   "hpsr": 2,
+   "htnq": 216,
+   "ibwi": 16,
+   "ibwo": 16,
+   "icun": 12,
+   "icxy": 23,
+   "iqsl": 2,
+   "jjbl": 12,
+   "jqni": 14,
+   "y": 34
+  },
+  "pfb": {
+   "bjhkfq": 8
+  },
+  "pfc": {
+   "dmnib": 8
+  },
+  "pp": {
+   "bbsl": 14,
+   "btlo": 14,
+   "g": 315,
+   "gxsh": 6,
+   "gxsi": 6,
+   "h": 91,
+   "hrs": 14,
+   "huvg": 14,
+   "i": 14,
+   "plb": 15,
+   "plc": 15,
+   "pld": 15,
+   "ple": 15,
+   "plf": 15,
+   "plg": 15,
+   "qpy": 15,
+   "ryz": 15,
+   "xzs": 14
+  },
+  "ps": {
+   "bxyd": 98,
+   "chxs": 40,
+   "cjyy": 9,
+   "dayz": 120,
+   "edud": 128,
+   "fnxu": 47,
+   "fsu": 168,
+   "mlfd": 12
+  }
+ },
+ "distinct_param_names": 213,
+ "param_names": {
+  "VAS": 96,
+  "action-id": 125,
+  "actual-format": 173,
+  "ad-pod-id": 119,
+  "ad-session-id": 1291,
+  "ad_type": 1,
+  "adf_refresh": 7,
+  "adfox-version": 7,
+  "adsdk-bundle-name": 119,
+  "adsdk-bundle-version": 119,
+  "b_id": 1,
+  "banner-lang": 970,
+  "banner-sizes": 103,
+  "banner-test-tags": 80,
+  "banners-videos": 3,
+  "bids": 1093,
+  "browser-info": 1042,
+  "c_id": 1,
+  "callback": 68,
+  "charset": 1042,
+  "client-timezone-offset": 119,
+  "client-ts": 119,
+  "client_features": 41,
+  "client_id": 41,
+  "client_type": 18,
+  "cmn_id": 1,
+  "cnt-class": 123,
+  "comboblock-unencoded-vast": 68,
+  "confirmRatio": 108,
+  "confirmTime": 98,
+  "constructor-rendered-assets": 45,
+  "crv_id": 1,
+  "csl": 7,
+  "ctime": 108,
+  "date": 1110,
+  "disable-base64": 1172,
+  "dl": 1117,
+  "dmv": 14,
+  "document-has-focus": 119,
+  "duid": 1022,
+  "ecma-version": 68,
+  "efc": 7,
+  "enable-flat-highlight": 6,
+  "enable-page-options": 42,
+  "esc": 7,
+  "event": 96,
+  "event-counter": 10,
+  "evt_t": 1,
+  "exp": 22,
+  "extid_loader": 1110,
+  "extid_tag_loader": 1110,
+  "fa": 1110,
+  "force-urlencoded": 592,
+  "grab": 1196,
+  "grab-orig-len": 1172,
+  "has_direct_sales": 7,
+  "hash": 7,
+  "height": 185,
+  "hidv2": 702,
+  "hittoken": 758,
+  "i": 41,
+  "imp-id": 86,
+  "initial-engine-id": 7,
+  "is-fullscreen": 119,
+  "is-turbo": 1110,
+  "laas_region_id": 7,
+  "layout-config": 1291,
+  "lts": 7,
+  "lvlfrom": 7,
+  "media-test-tag": 4,
+  "news-action": 30,
+  "nohit": 70,
+  "o_id": 1,
+  "order-banners-options": 14,
+  "p1": 510,
+  "p2": 1132,
+  "p5": 7,
+  "page-ref": 270,
+  "page-url": 1042,
+  "partner-stat-id": 315,
+  "pcode-active-testids": 213,
+  "pcode-flags-map": 1214,
+  "pcode-icookie": 1214,
+  "pcode-test-ids": 1214,
+  "pcode-uid": 1291,
+  "pcode-version": 1172,
+  "pcodever": 130,
+  "pd": 1110,
+  "pdh": 1110,
+  "pdw": 1110,
+  "pfb": 224,
+  "pfc": 224,
+  "pk": 200,
+  "pke": 120,
+  "plt_id": 1,
+  "pm": 7,
+  "pp": 622,
+  "pr": 1117,
+  "pr1": 1110,
+  "product-theme": 119,
+  "prr": 1110,
+  "ps": 622,
+  "pt": 63,
+  "puid1": 853,
+  "puid10": 290,
+  "puid11": 215,
+  "puid12": 229,
+  "puid13": 297,
+  "puid14": 215,
+  "puid15": 278,
+  "puid16": 215,
+  "puid17": 278,
+  "puid18": 278,
+  "puid19": 278,
+  "puid2": 829,
+  "puid20": 231,
+  "puid21": 292,
+  "puid22": 278,
+  "puid23": 63,
+  "puid24": 63,
+  "puid25": 63,
+  "puid26": 77,
+  "puid27": 63,
+  "puid28": 63,
+  "puid29": 168,
+  "puid3": 616,
+  "puid30": 231,
+  "puid33": 168,
+  "puid34": 168,
+  "puid35": 168,
+  "puid36": 47,
+  "puid37": 47,
+  "puid38": 47,
+  "puid4": 490,
+  "puid40": 47,
+  "puid41": 47,
+  "puid42": 47,
+  "puid43": 47,
+  "puid44": 60,
+  "puid45": 60,
+  "puid46": 60,
+  "puid47": 47,
+  "puid48": 47,
+  "puid49": 47,
+  "puid5": 379,
+  "puid50": 47,
+  "puid51": 47,
+  "puid52": 47,
+  "puid53": 47,
+  "puid54": 47,
+  "puid55": 47,
+  "puid56": 47,
+  "puid57": 47,
+  "puid58": 47,
+  "puid6": 298,
+  "puid63": 47,
+  "puid7": 235,
+  "puid8": 312,
+  "puid9": 227,
+  "pv": 1110,
+  "pw": 1110,
+  "rand": 7,
+  "redirnss": 35,
+  "refresh": 7,
+  "relative-size-ratio": 119,
+  "rendered-direct-assets": 83,
+  "repeat-number": 18,
+  "resp-time": 7,
+  "rn": 2,
+  "rnd": 87,
+  "rqs": 14,
+  "rsya-block-id": 7,
+  "rtb-answer-hash": 7,
+  "rtb-si": 14,
+  "same-node-hit-number": 68,
+  "site-info": 418,
+  "sj": 7,
+  "skip-token": 1111,
+  "slotNumber": 1104,
+  "stat-id": 31,
+  "subDesignId": 18,
+  "t": 1042,
+  "target-id": 68,
+  "target-ref": 104,
+  "test-tag": 176,
+  "tga-with-creatives": 1172,
+  "top-ancestor": 1291,
+  "top-ancestor-undetermined": 1291,
+  "top-screen-block-area": 94,
+  "top-screen-block-area-portion": 94,
+  "uah": 910,
+  "uniformat": 104,
+  "url": 41,
+  "usgn": 7,
+  "ut": 152,
+  "utf8": 1110,
+  "utg": 7,
+  "video-category-id": 36,
+  "video-content-id": 36,
+  "video-muted": 119,
+  "video-session-id": 18,
+  "video-volume": 119,
+  "viewability-undetermined": 185,
+  "vmap-request-id": 18,
+  "vsid": 122,
+  "web-reverse": 7,
+  "width": 185,
+  "wmode": 426,
+  "wtime-since-ad": 18,
+  "yaru": 1104,
+  "ybv": 1117,
+  "ylv": 1117,
+  "ytt": 1110
+ },
+ "pcode_versions": {
+  "1306302": 1172
+ },
+ "puid29_by_arm": {
+  "ru-mobile": {
+   "RU_": 96
+  },
+  "us-exit": {
+   "CA_QC": 72
+  }
+ },
+ "puid_by_site_shapes": {
+  "puid1": {
+   "hh.ru": {
+    "opaque:19": 47
+   },
+   "www.gismeteo.ru": {
+    "int:17": 21,
+    "int:18": 8,
+    "int:20": 4,
+    "int:21": 23,
+    "int:22": 7
+   },
+   "www.kp.ru": {
+    "opaque:19": 3,
+    "opaque:20": 10,
+    "opaque:21": 85
+   }
+  },
+  "puid10": {
+   "www.gismeteo.ru": {
+    "int:20": 63
+   }
+  },
+  "puid11": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid12": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "iz.ru": {
+    "digits:6": 14
+   },
+   "www.sports.ru": {
+    "word:direct": 168
+   }
+  },
+  "puid13": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "rt.rbc.ru": {
+    "opaque:1": 10
+   },
+   "www.gismeteo.ru": {
+    "word:index": 63
+   },
+   "www.rbc.ru": {
+    "opaque:1": 9
+   }
+  },
+  "puid14": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "www.sports.ru": {
+    "opaque:1": 168
+   }
+  },
+  "puid15": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "www.gismeteo.ru": {
+    "int:1": 7,
+    "int:2": 41,
+    "int:3": 15
+   }
+  },
+  "puid16": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid17": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "www.gismeteo.ru": {
+    "int:0": 59,
+    "int:1": 4
+   },
+   "www.sports.ru": {
+    "word:false": 28,
+    "word:true": 140
+   }
+  },
+  "puid18": {
+   "hh.ru": {
+    "int:355": 12,
+    "int:358": 6,
+    "int:359": 6,
+    "int:501": 23
+   },
+   "www.gismeteo.ru": {
+    "opaque:23": 63
+   }
+  },
+  "puid19": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "www.gismeteo.ru": {
+    "int:3": 63
+   }
+  },
+  "puid2": {
+   "hh.ru": {
+    "opaque:24": 47
+   },
+   "www.gismeteo.ru": {
+    "word:cloud": 38,
+    "word:rain": 21,
+    "word:sun": 4
+   },
+   "www.kp.ru": {
+    "opaque:69": 84
+   },
+   "www.sports.ru": {
+    "word:ru": 168
+   }
+  },
+  "puid20": {
+   "www.gismeteo.ru": {
+    "int:3": 34,
+    "int:4": 29
+   }
+  },
+  "puid21": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "iz.ru": {
+    "int:1": 14
+   },
+   "www.gismeteo.ru": {
+    "int:1280": 63
+   },
+   "www.sports.ru": {
+    "opaque:1": 168
+   }
+  },
+  "puid22": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "www.gismeteo.ru": {
+    "int:0": 63
+   },
+   "www.sports.ru": {
+    "opaque:1": 168
+   }
+  },
+  "puid23": {
+   "www.gismeteo.ru": {
+    "int:0": 63
+   }
+  },
+  "puid24": {
+   "www.gismeteo.ru": {
+    "int:0": 34,
+    "int:4": 29
+   }
+  },
+  "puid25": {
+   "www.gismeteo.ru": {
+    "int:0": 34,
+    "int:3": 29
+   }
+  },
+  "puid26": {
+   "iz.ru": {
+    "int:0": 14
+   },
+   "www.gismeteo.ru": {
+    "opaque:1": 34,
+    "opaque:4": 29
+   }
+  },
+  "puid27": {
+   "www.gismeteo.ru": {
+    "int:2": 55,
+    "int:3": 8
+   }
+  },
+  "puid28": {
+   "www.gismeteo.ru": {
+    "int:0": 63
+   }
+  },
+  "puid29": {
+   "www.sports.ru": {
+    "opaque:3": 96,
+    "opaque:5": 72
+   }
+  },
+  "puid3": {
+   "hh.ru": {
+    "opaque:5": 47
+   },
+   "rt.rbc.ru": {
+    "word:new": 10
+   },
+   "www.gismeteo.ru": {
+    "digits:6": 34,
+    "int:4368": 29
+   },
+   "www.kp.ru": {
+    "word:top": 84
+   },
+   "www.rbc.ru": {
+    "word:new": 9
+   }
+  },
+  "puid30": {
+   "www.gismeteo.ru": {
+    "int:0": 63
+   },
+   "www.sports.ru": {
+    "opaque:2": 72
+   }
+  },
+  "puid33": {
+   "www.sports.ru": {
+    "int:0": 168
+   }
+  },
+  "puid36": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid37": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid38": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid4": {
+   "hh.ru": {
+    "int:4": 16,
+    "int:5": 31
+   },
+   "iz.ru": {
+    "opaque:5": 21
+   },
+   "ria.ru": {
+    "word:index": 120
+   },
+   "rt.rbc.ru": {
+    "word:unauth": 10
+   },
+   "www.gismeteo.ru": {
+    "int:156": 29,
+    "int:82": 34
+   },
+   "www.rbc.ru": {
+    "word:unauth": 9
+   }
+  },
+  "puid40": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid41": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid42": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid43": {
+   "hh.ru": {
+    "opaque:9": 47
+   }
+  },
+  "puid44": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "video.matchtv.ru": {
+    "opaque:15": 6
+   }
+  },
+  "puid45": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "video.matchtv.ru": {
+    "opaque:6": 6
+   }
+  },
+  "puid46": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "video.matchtv.ru": {
+    "opaque:13": 6
+   }
+  },
+  "puid47": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid48": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid49": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid5": {
+   "hh.ru": {
+    "int:1": 7,
+    "int:2": 16,
+    "int:23": 16,
+    "int:3": 8
+   }
+  },
+  "puid50": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid51": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid52": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid53": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid54": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid55": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid56": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid57": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid58": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid6": {
+   "hh.ru": {
+    "word:anonymous": 47
+   },
+   "www.gismeteo.ru": {
+    "int:4146": 29,
+    "int:5377": 34
+   },
+   "www.sports.ru": {
+    "int:1": 168
+   }
+  },
+  "puid63": {
+   "hh.ru": {
+    "the-string-null": 47
+   }
+  },
+  "puid7": {
+   "hh.ru": {
+    "opaque:5": 47
+   },
+   "www.sports.ru": {
+    "word:mainpage": 168
+   }
+  },
+  "puid8": {
+   "hh.ru": {
+    "the-string-null": 47
+   },
+   "iz.ru": {
+    "word:main": 7
+   },
+   "www.gismeteo.ru": {
+    "int:14": 34,
+    "int:21": 4,
+    "int:39": 4,
+    "int:61": 4,
+    "int:80": 4,
+    "int:82": 4,
+    "int:83": 4,
+    "int:9": 5
+   }
+  },
+  "puid9": {
+   "hh.ru": {
+    "int:0": 47
+   }
+  }
+ },
+ "puid_keys": {
+  "puid1": 208,
+  "puid10": 63,
+  "puid11": 47,
+  "puid12": 229,
+  "puid13": 129,
+  "puid14": 215,
+  "puid15": 110,
+  "puid16": 47,
+  "puid17": 278,
+  "puid18": 110,
+  "puid19": 110,
+  "puid2": 362,
+  "puid20": 63,
+  "puid21": 292,
+  "puid22": 278,
+  "puid23": 63,
+  "puid24": 63,
+  "puid25": 63,
+  "puid26": 77,
+  "puid27": 63,
+  "puid28": 63,
+  "puid29": 168,
+  "puid3": 213,
+  "puid30": 135,
+  "puid33": 168,
+  "puid36": 47,
+  "puid37": 47,
+  "puid38": 47,
+  "puid4": 270,
+  "puid40": 47,
+  "puid41": 47,
+  "puid42": 47,
+  "puid43": 47,
+  "puid44": 60,
+  "puid45": 60,
+  "puid46": 60,
+  "puid47": 47,
+  "puid48": 47,
+  "puid49": 47,
+  "puid5": 47,
+  "puid50": 47,
+  "puid51": 47,
+  "puid52": 47,
+  "puid53": 47,
+  "puid54": 47,
+  "puid55": 47,
+  "puid56": 47,
+  "puid57": 47,
+  "puid58": 47,
+  "puid6": 278,
+  "puid63": 47,
+  "puid7": 215,
+  "puid8": 117,
+  "puid9": 47
+ },
+ "puid_value_shapes": {
+  "puid1": {
+   "int:17": 21,
+   "int:18": 8,
+   "int:20": 4,
+   "int:21": 23,
+   "int:22": 7,
+   "opaque:19": 50,
+   "opaque:20": 10,
+   "opaque:21": 85
+  },
+  "puid10": {
+   "int:20": 63
+  },
+  "puid11": {
+   "the-string-null": 47
+  },
+  "puid12": {
+   "digits:6": 14,
+   "the-string-null": 47,
+   "word:direct": 168
+  },
+  "puid13": {
+   "opaque:1": 19,
+   "the-string-null": 47,
+   "word:index": 63
+  },
+  "puid14": {
+   "opaque:1": 168,
+   "the-string-null": 47
+  },
+  "puid15": {
+   "int:1": 7,
+   "int:2": 41,
+   "int:3": 15,
+   "the-string-null": 47
+  },
+  "puid16": {
+   "the-string-null": 47
+  },
+  "puid17": {
+   "int:0": 59,
+   "int:1": 4,
+   "the-string-null": 47,
+   "word:false": 28,
+   "word:true": 140
+  },
+  "puid18": {
+   "int:355": 12,
+   "int:358": 6,
+   "int:359": 6,
+   "int:501": 23,
+   "opaque:23": 63
+  },
+  "puid19": {
+   "int:3": 63,
+   "the-string-null": 47
+  },
+  "puid2": {
+   "opaque:24": 47,
+   "opaque:69": 84,
+   "word:cloud": 38,
+   "word:rain": 21,
+   "word:ru": 168,
+   "word:sun": 4
+  },
+  "puid20": {
+   "int:3": 34,
+   "int:4": 29
+  },
+  "puid21": {
+   "int:1": 14,
+   "int:1280": 63,
+   "opaque:1": 168,
+   "the-string-null": 47
+  },
+  "puid22": {
+   "int:0": 63,
+   "opaque:1": 168,
+   "the-string-null": 47
+  },
+  "puid23": {
+   "int:0": 63
+  },
+  "puid24": {
+   "int:0": 34,
+   "int:4": 29
+  },
+  "puid25": {
+   "int:0": 34,
+   "int:3": 29
+  },
+  "puid26": {
+   "int:0": 14,
+   "opaque:1": 34,
+   "opaque:4": 29
+  },
+  "puid27": {
+   "int:2": 55,
+   "int:3": 8
+  },
+  "puid28": {
+   "int:0": 63
+  },
+  "puid29": {
+   "opaque:3": 96,
+   "opaque:5": 72
+  },
+  "puid3": {
+   "digits:6": 34,
+   "int:4368": 29,
+   "opaque:5": 47,
+   "word:new": 19,
+   "word:top": 84
+  },
+  "puid30": {
+   "int:0": 63,
+   "opaque:2": 72
+  },
+  "puid33": {
+   "int:0": 168
+  },
+  "puid36": {
+   "the-string-null": 47
+  },
+  "puid37": {
+   "the-string-null": 47
+  },
+  "puid38": {
+   "the-string-null": 47
+  },
+  "puid4": {
+   "int:156": 29,
+   "int:4": 16,
+   "int:5": 31,
+   "int:82": 34,
+   "opaque:5": 21,
+   "word:index": 120,
+   "word:unauth": 19
+  },
+  "puid40": {
+   "the-string-null": 47
+  },
+  "puid41": {
+   "the-string-null": 47
+  },
+  "puid42": {
+   "the-string-null": 47
+  },
+  "puid43": {
+   "opaque:9": 47
+  },
+  "puid44": {
+   "opaque:15": 13,
+   "the-string-null": 47
+  },
+  "puid45": {
+   "opaque:6": 13,
+   "the-string-null": 47
+  },
+  "puid46": {
+   "opaque:13": 13,
+   "the-string-null": 47
+  },
+  "puid47": {
+   "the-string-null": 47
+  },
+  "puid48": {
+   "the-string-null": 47
+  },
+  "puid49": {
+   "the-string-null": 47
+  },
+  "puid5": {
+   "int:1": 7,
+   "int:2": 16,
+   "int:23": 16,
+   "int:3": 8
+  },
+  "puid50": {
+   "the-string-null": 47
+  },
+  "puid51": {
+   "the-string-null": 47
+  },
+  "puid52": {
+   "the-string-null": 47
+  },
+  "puid53": {
+   "the-string-null": 47
+  },
+  "puid54": {
+   "the-string-null": 47
+  },
+  "puid55": {
+   "the-string-null": 47
+  },
+  "puid56": {
+   "the-string-null": 47
+  },
+  "puid57": {
+   "the-string-null": 47
+  },
+  "puid58": {
+   "the-string-null": 47
+  },
+  "puid6": {
+   "int:1": 168,
+   "int:4146": 29,
+   "int:5377": 34,
+   "word:anonymous": 47
+  },
+  "puid63": {
+   "the-string-null": 47
+  },
+  "puid7": {
+   "opaque:5": 47,
+   "word:mainpage": 168
+  },
+  "puid8": {
+   "int:14": 34,
+   "int:21": 4,
+   "int:39": 4,
+   "int:61": 4,
+   "int:80": 4,
+   "int:82": 4,
+   "int:83": 4,
+   "int:9": 5,
+   "the-string-null": 47,
+   "word:main": 7
+  },
+  "puid9": {
+   "int:0": 47
+  }
+ },
+ "yandex_requests": 3188,
+ "ylv_vs_pcode_version": {
+  "equal": 1104
+ }
+}

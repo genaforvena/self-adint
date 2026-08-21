@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""adint-adfox-cards — a DIRECT test of one claim, with an artifact.
+
+THE CLAIM (operator, 2026-08-21): "AdFox раскрывает все карты своих торгов" —
+AdFox lays its auction's cards on the table.
+
+This tool does not restate a draft. It decodes the thing itself and reports what
+is and is not in it, so the claim can be confirmed or broken on evidence.
+
+WHAT IS BEING READ. On a page running AdFox, the browser calls
+
+    https://yandex.ru/ads/adfox/<ownerId>/getBulk/v2?...&bids=<base64>
+
+`bids` is base64 of a JSON ARRAY: the header-bidding results the page has already
+collected, reported back to Yandex. Each element is one competing bidder.
+
+WHY THIS IS NOT A RESPONSE-BODY READ. We never see AdFox's response. Everything
+here is in a REQUEST the page makes, so it is readable by anyone with their own
+browser's network tab open on their own screen — no privileged vantage, no MITM.
+That is precisely what makes "reveals" the right verb.
+
+THE HYPOTHESIS SPLITS IN TWO, and they do not have the same answer:
+  (a) the ROSTER — who was invited, what they are called, how long they took,
+      and why each one failed;
+  (b) the PRICE — what anybody actually bid.
+Report them separately. A tool that folds them into one "confirmed" is lying by
+aggregation: see the printed verdict, which names the half that breaks.
+
+PUBLISHING DISCIPLINE. This emits COUNTS, SHAPES and per-bidder aggregates.
+`campaign_id` and `placement_id` are never printed as values — a placement id can
+be a uuid and a uuid in a published path is how the census leaked the first time.
+Only their SHAPE and their DISTINCT COUNT cross the boundary.
+"""
+import argparse, base64, collections, json, os, re, statistics, sys
+import urllib.parse as up
+
+BIDS_PARAM = "bids"
+
+
+def shape_of(v):
+    """The shape of an id, never the id."""
+    s = str(v)
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s):
+        return "uuid"
+    if re.fullmatch(r"\d+", s):
+        return "digits:%d" % len(s)
+    if re.fullmatch(r"[0-9a-f]{24}", s):
+        return "hex:24"
+    if ":" in s:
+        return "labelled"
+    return "other:%d" % len(s)
+
+
+def decode_bids(url):
+    """-> (present, decoded_ok, array). Absence and failure are different facts."""
+    q = up.parse_qs(up.urlsplit(url).query, keep_blank_values=True)
+    if BIDS_PARAM not in q:
+        return False, False, None
+    raw = q[BIDS_PARAM][0]
+    if raw == "":
+        return True, True, []
+    try:
+        arr = json.loads(base64.b64decode(raw + "==").decode("utf-8", "replace"))
+    except Exception:
+        return True, False, None
+    return True, True, arr if isinstance(arr, list) else []
+
+
+def scan(paths):
+    st = {
+        "files": 0, "request_rows": 0, "getbulk": 0,
+        "bids_present": 0, "bids_decode_fail": 0, "bids_empty": 0, "bids_nonempty": 0,
+        "entries": 0,
+        "owner_ids": set(), "sites": collections.Counter(),
+        "bidders": collections.Counter(), "bidders_priced": collections.Counter(),
+        "fields": collections.Counter(), "errors": collections.Counter(),
+        "latency": [], "per_arm_entries": collections.Counter(),
+        "per_arm_priced": collections.Counter(),
+        "placement_shapes": collections.Counter(), "campaign_shapes": collections.Counter(),
+        "placements_distinct": set(), "campaigns_distinct": set(),
+        "prices": [], "arr_len": collections.Counter(),
+        "entries_with_error": 0, "entries_with_price": 0,
+        "site_visible": collections.Counter(), "site_loads": collections.Counter(),
+    }
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        st["files"] += 1
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("kind") != "request":
+                    continue
+                st["request_rows"] += 1
+                url = d.get("req_url_full") or ""
+                if "/getBulk/" not in url:
+                    continue
+                st["getbulk"] += 1
+                m = re.search(r"/ads/adfox/(\d+)/getBulk", url)
+                if m:
+                    st["owner_ids"].add(m.group(1))
+                present, ok, arr = decode_bids(url)
+                if not present:
+                    continue
+                st["bids_present"] += 1
+                if not ok:
+                    st["bids_decode_fail"] += 1
+                    continue
+                arm = d.get("arm") or "?"
+                q = up.parse_qs(up.urlsplit(url).query)
+                site = (q.get("dl") or [""])[0]
+                st["site_loads"][site] += 1
+                if not arr:
+                    st["bids_empty"] += 1
+                    continue
+                st["bids_nonempty"] += 1
+                st["arr_len"][len(arr)] += 1
+                st["sites"][site] += len(arr)
+                st["site_visible"][site] += 1
+                for e in arr:
+                    if not isinstance(e, dict):
+                        continue
+                    st["entries"] += 1
+                    st["per_arm_entries"][arm] += 1
+                    for k in e:
+                        st["fields"][k] += 1
+                    bn = e.get("bidderName", "?")
+                    st["bidders"][bn] += 1
+                    if "error" in e:
+                        st["entries_with_error"] += 1
+                        code = (e["error"] or {}).get("code") if isinstance(e.get("error"), dict) else e.get("error")
+                        st["errors"][code] += 1
+                    if isinstance(e.get("response_time"), (int, float)):
+                        st["latency"].append(e["response_time"])
+                    if "placement_id" in e:
+                        st["placement_shapes"][shape_of(e["placement_id"])] += 1
+                        st["placements_distinct"].add(str(e["placement_id"]))
+                    if "campaign_id" in e:
+                        st["campaign_shapes"][shape_of(e["campaign_id"])] += 1
+                        st["campaigns_distinct"].add(str(e["campaign_id"]))
+                    if "bid" in e:
+                        st["entries_with_price"] += 1
+                        st["per_arm_priced"][arm] += 1
+                        st["bidders_priced"][bn] += 1
+                        st["prices"].append({
+                            "arm": arm, "bidder": bn, "bid": e.get("bid"),
+                            "currency": e.get("currency"), "unit": e.get("unit"),
+                            "cpm_adjustment": e.get("cpmAdjustment"),
+                            "placement_shape": shape_of(e.get("placement_id", "")),
+                            "response_time_ms": e.get("response_time"),
+                        })
+    return st
+
+
+def report(st, out=sys.stdout):
+    w = out.write
+    w("# AdFox: what the auction shows from outside\n\n")
+    w("Read from %d ledger file(s), %d request rows.\n" % (st["files"], st["request_rows"]))
+    w("getBulk/v2 requests: %d, from %d distinct AdFox owner ids.\n"
+      % (st["getbulk"], len(st["owner_ids"])))
+    w("  carrying a `bids=` parameter : %d\n" % st["bids_present"])
+    w("  decoded                      : %d (decode failures: %d)\n"
+      % (st["bids_present"] - st["bids_decode_fail"], st["bids_decode_fail"]))
+    w("  decoded to an EMPTY array    : %d\n" % st["bids_empty"])
+    w("  decoded to a NON-EMPTY array : %d  -> %d bidder entries\n"
+      % (st["bids_nonempty"], st["entries"]))
+    if st["bids_present"]:
+        w("  so the auction is legible on %.1f%% of the requests that report one.\n"
+          % (100.0 * st["bids_nonempty"] / st["bids_present"]))
+    w("\n## (a) THE ROSTER — what every entry carries\n\n")
+    w("field                 present / %d entries\n" % st["entries"])
+    for k, v in st["fields"].most_common():
+        w("  %-18s  %6d  (%5.1f%%)\n" % (k, v, 100.0 * v / max(1, st["entries"])))
+    w("\n%d distinct bidder names:\n" % len(st["bidders"]))
+    for k, v in st["bidders"].most_common():
+        w("  %5d  %s\n" % (v, k))
+    w("\nfailure codes reported back (%d of %d entries carry one):\n"
+      % (st["entries_with_error"], st["entries"]))
+    for k, v in st["errors"].most_common():
+        w("  code %-5s %5d\n" % (k, v))
+    if st["latency"]:
+        L = sorted(st["latency"])
+        w("\nper-bidder response_time, ms: n=%d min=%d p50=%d p90=%d max=%d\n"
+          % (len(L), L[0], statistics.median(L), L[int(0.9 * (len(L) - 1))], L[-1]))
+    w("\nid-shaped fields, published as SHAPE only:\n")
+    w("  placement_id shapes  %s  (%d distinct values, not printed)\n"
+      % (dict(st["placement_shapes"]), len(st["placements_distinct"])))
+    w("  campaign_id  shapes  %s  (%d distinct values, not printed)\n"
+      % (dict(st["campaign_shapes"]), len(st["campaigns_distinct"])))
+    w("\n## (b) THE PRICE — where the claim breaks\n\n")
+    w("entries carrying an actual `bid`: %d of %d  (%.2f%%)\n"
+      % (st["entries_with_price"], st["entries"],
+         100.0 * st["entries_with_price"] / max(1, st["entries"])))
+    w("entries carrying an `error` instead: %d\n" % st["entries_with_error"])
+    w("\nby arm — entries seen / of which priced:\n")
+    for arm in sorted(set(list(st["per_arm_entries"]) + list(st["per_arm_priced"]))):
+        w("  %-10s %5d / %d\n" % (arm, st["per_arm_entries"][arm], st["per_arm_priced"][arm]))
+    if st["prices"]:
+        w("\nevery priced entry (n=%d):\n" % len(st["prices"]))
+        for p in st["prices"]:
+            w("  %-9s %-10s bid=%-6s %s unit=%s adj=%s placement=%s %sms\n"
+              % (p["arm"], p["bidder"], p["bid"], p["currency"], p["unit"],
+                 p["cpm_adjustment"], p["placement_shape"], p["response_time_ms"]))
+    w("\n## where the auction is visible at all\n\n")
+    for s, n in st["sites"].most_common():
+        seen, loads = st["site_visible"][s], st["site_loads"][s]
+        w("  %5d entries  %3d/%3d requests  %s\n" % (n, seen, loads, s))
+    w("\n## VERDICT\n\n")
+    roster_ok = st["entries"] > 0 and st["fields"].get("bidderName", 0) == st["entries"]
+    price_rate = st["entries_with_price"] / max(1, st["entries"])
+    w("(a) roster: %s — every one of the %d entries names its bidder, and %d%% carry a\n"
+      % ("HOLDS" if roster_ok else "BREAKS", st["entries"],
+         round(100.0 * st["fields"].get("response_time", 0) / max(1, st["entries"]))))
+    w("    response_time, %d%% a failure code. Who was invited, how slow each one was, and\n"
+      % round(100.0 * st["entries_with_error"] / max(1, st["entries"])))
+    w("    why it dropped out is fully legible from the page's own outbound request.\n")
+    w("(b) price: BREAKS — only %.2f%% of entries carry a number. The cards shown are the\n"
+      % (100.0 * price_rate))
+    w("    PLAYERS and their EXITS, not the stakes. Reading this as 'AdFox publishes its\n")
+    w("    clearing prices' would be wrong on %d of %d entries.\n"
+      % (st["entries"] - st["entries_with_price"], st["entries"]))
+    return st
+
+
+def as_json(st):
+    return {
+        "files": st["files"], "getbulk_requests": st["getbulk"],
+        "owner_ids_distinct": len(st["owner_ids"]),
+        "bids_present": st["bids_present"], "bids_decode_fail": st["bids_decode_fail"],
+        "bids_empty": st["bids_empty"], "bids_nonempty": st["bids_nonempty"],
+        "entries": st["entries"],
+        "entry_fields": dict(st["fields"]),
+        "bidders": dict(st["bidders"]),
+        "bidders_priced": dict(st["bidders_priced"]),
+        "error_codes": {str(k): v for k, v in st["errors"].items()},
+        "entries_with_error": st["entries_with_error"],
+        "entries_with_price": st["entries_with_price"],
+        "per_arm_entries": dict(st["per_arm_entries"]),
+        "per_arm_priced": dict(st["per_arm_priced"]),
+        "placement_id_shapes": dict(st["placement_shapes"]),
+        "placement_id_distinct": len(st["placements_distinct"]),
+        "campaign_id_shapes": dict(st["campaign_shapes"]),
+        "campaign_id_distinct": len(st["campaigns_distinct"]),
+        "response_time_ms": ({
+            "n": len(st["latency"]), "min": min(st["latency"]),
+            "p50": statistics.median(st["latency"]), "max": max(st["latency"])}
+            if st["latency"] else None),
+        "priced_entries": st["prices"],
+        "sites_entries": dict(st["sites"]),
+    }
+
+
+def selftest():
+    fails = []
+
+    def check(name, got, want):
+        ok = got == want
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        got %r want %r" % (got, want))
+            fails.append(name)
+
+    # 1. ABSENT and UNDECODABLE are different facts, and neither is "empty".
+    check("no bids param -> absent, not empty",
+          decode_bids("https://yandex.ru/ads/adfox/1/getBulk/v2?dl=x"), (False, False, None))
+    check("bids= that is not base64 json -> present but NOT decoded",
+          decode_bids("https://yandex.ru/ads/adfox/1/getBulk/v2?bids=!!!")[:2], (True, False))
+    check("bids=W10= decodes to the empty array",
+          decode_bids("https://yandex.ru/ads/adfox/1/getBulk/v2?bids=W10%3D"), (True, True, []))
+
+    # 2. An id must never survive as a VALUE. This is the leak that already happened once.
+    check("a uuid placement renders as its shape",
+          shape_of("7ca8c21f-0b44-454a-830b-36df950c92ab"), "uuid")
+    check("a numeric campaign renders as its width", shape_of(850816), "digits:6")
+
+    # 3. THE GATE THAT MATTERS: the roster half and the price half must not be folded.
+    #    A ledger where every bidder errored must report price=0, not "confirmed".
+    import tempfile
+    rows = []
+    def mk(bids, arm="ru-mobile"):
+        b = base64.b64encode(json.dumps(bids).encode()).decode()
+        return json.dumps({"kind": "request", "arm": arm,
+                           "req_url_full": "https://yandex.ru/ads/adfox/6902/getBulk/v2?dl=https%3A%2F%2Fx.ru%2F&bids=" + up.quote(b)})
+    rows.append(mk([{"bidderName": "a", "campaign_id": 1, "response_time": 10, "error": {"code": 3}},
+                    {"bidderName": "b", "campaign_id": 2, "response_time": 20, "error": {"code": 1}}]))
+    rows.append(mk([{"bidderName": "c", "campaign_id": 3, "response_time": 30,
+                     "bid": 42, "currency": "RUB", "unit": 1,
+                     "placement_id": "7ca8c21f-0b44-454a-830b-36df950c92ab"}], arm="us-exit"))
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write("\n".join(rows) + "\n")
+        tmp = fh.name
+    st = scan([tmp])
+    check("all three entries are counted", st["entries"], 3)
+    check("the roster half sees every bidder", sorted(st["bidders"]), ["a", "b", "c"])
+    check("the price half counts ONLY the entry that carried a number",
+          st["entries_with_price"], 1)
+    check("errors are not counted as prices", st["entries_with_error"], 2)
+    check("priced entries are attributed to the arm that saw them",
+          dict(st["per_arm_priced"]), {"us-exit": 1})
+    j = as_json(st)
+    check("the uuid placement leaves as a shape, never a value",
+          j["placement_id_shapes"], {"uuid": 1})
+    blob = json.dumps(j)
+    check("no placement id value survives into the artifact",
+          "7ca8c21f-0b44-454a-830b-36df950c92ab" in blob, False)
+    os.unlink(tmp)
+
+    print("\n%s" % ("all gates green" if not fails else "RED: %s" % fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ledgers", nargs="*")
+    ap.add_argument("--json", metavar="PATH", help="write the machine-readable artifact here")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+    if not a.ledgers:
+        print("n/a: no ledger given", file=sys.stderr)
+        sys.exit(2)
+    st = scan(a.ledgers)
+    if st["getbulk"] == 0:
+        print("n/a: no getBulk/v2 request in the given ledgers", file=sys.stderr)
+        sys.exit(2)
+    report(st)
+    if a.json:
+        with open(a.json, "w") as fh:
+            json.dump(as_json(st), fh, indent=1, sort_keys=True, ensure_ascii=False)
+        print("\nartifact -> %s" % a.json)
+
+
+if __name__ == "__main__":
+    main()

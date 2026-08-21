@@ -1,0 +1,233 @@
+{
+ "bidders": {
+  "adfox_adsmart": 110,
+  "adfox_imho-video": 29,
+  "adfox_namename": 25,
+  "adfox_roden-media": 52,
+  "adriver": 135,
+  "adwile": 14,
+  "alfasense": 10,
+  "astralab": 41,
+  "betweendigital": 106,
+  "bidvol": 14,
+  "buzzoola": 115,
+  "getintent": 10,
+  "gnezdo": 48,
+  "hhru": 12,
+  "hybrid": 22,
+  "hyper": 11,
+  "mediasniper": 96,
+  "mytarget": 151,
+  "otm": 11,
+  "pb_adf": 12,
+  "pb_cpmstar": 12,
+  "pb_onetag": 12,
+  "pb_smartadserver": 12,
+  "roxot": 72,
+  "sape": 38,
+  "segmento": 11,
+  "smi2": 14,
+  "umg": 14,
+  "videonow": 50
+ },
+ "bidders_priced": {
+  "adwile": 5,
+  "roxot": 6
+ },
+ "bids_decode_fail": 0,
+ "bids_empty": 786,
+ "bids_nonempty": 307,
+ "bids_present": 1093,
+ "campaign_id_distinct": 77,
+ "campaign_id_shapes": {
+  "digits:6": 335,
+  "digits:7": 903
+ },
+ "entries": 1259,
+ "entries_with_error": 1248,
+ "entries_with_price": 11,
+ "entry_fields": {
+  "bid": 11,
+  "bidderName": 1259,
+  "campaign_id": 1238,
+  "cpmAdjustment": 11,
+  "currency": 11,
+  "disableFullscreen": 5,
+  "error": 1248,
+  "placement_id": 1043,
+  "response_time": 1259,
+  "unit": 11
+ },
+ "error_codes": {
+  "1": 400,
+  "101": 41,
+  "111": 7,
+  "2": 12,
+  "3": 715,
+  "4": 69,
+  "5": 4
+ },
+ "files": 20,
+ "getbulk_requests": 1110,
+ "owner_ids_distinct": 16,
+ "per_arm_entries": {
+  "ru-mobile": 578,
+  "us-exit": 681
+ },
+ "per_arm_priced": {
+  "ru-mobile": 11
+ },
+ "placement_id_distinct": 106,
+ "placement_id_shapes": {
+  "digits:3": 23,
+  "digits:4": 26,
+  "digits:5": 89,
+  "digits:6": 192,
+  "digits:7": 358,
+  "digits:8": 16,
+  "hex:24": 63,
+  "labelled": 135,
+  "other:19": 4,
+  "other:20": 12,
+  "other:22": 4,
+  "other:23": 12,
+  "other:24": 12,
+  "other:28": 3,
+  "other:30": 12,
+  "other:38": 10,
+  "uuid": 72
+ },
+ "priced_entries": [
+  {
+   "arm": "ru-mobile",
+   "bid": 1,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 655,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 30,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 1268,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 10,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 609,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 8,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 634,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 1,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 274,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 30,
+   "bidder": "roxot",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "uuid",
+   "response_time_ms": 1235,
+   "unit": 1
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 1617,
+   "bidder": "adwile",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "digits:5",
+   "response_time_ms": 710,
+   "unit": 2
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 1794,
+   "bidder": "adwile",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "digits:5",
+   "response_time_ms": 757,
+   "unit": 2
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 2028,
+   "bidder": "adwile",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "digits:5",
+   "response_time_ms": 519,
+   "unit": 2
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 2050,
+   "bidder": "adwile",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "digits:5",
+   "response_time_ms": 590,
+   "unit": 2
+  },
+  {
+   "arm": "ru-mobile",
+   "bid": 2097,
+   "bidder": "adwile",
+   "cpm_adjustment": 1,
+   "currency": "RUB",
+   "placement_shape": "digits:5",
+   "response_time_ms": 567,
+   "unit": 2
+  }
+ ],
+ "response_time_ms": {
+  "max": 2015,
+  "min": 68,
+  "n": 1259,
+  "p50": 1002
+ },
+ "sites_entries": {
+  "https://aif.ru/": 96,
+  "https://hh.ru/": 12,
+  "https://iz.ru/": 91,
+  "https://matchtv.ru/": 184,
+  "https://pikabu.ru/": 80,
+  "https://ria.ru/": 45,
+  "https://rt.rbc.ru/": 50,
+  "https://www.gismeteo.ru/": 81,
+  "https://www.kp.ru/?": 84,
+  "https://www.kp.ru/?section=zenyandex": 266,
+  "https://www.mk.ru/": 144,
+  "https://www.rbc.ru/": 42,
+  "https://www.sports.ru/": 84
+ }
+}
