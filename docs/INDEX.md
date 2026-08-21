@@ -1,8 +1,16 @@
 # What is in `docs/`, and which thread it belongs to
 
-Eighteen documents accumulated in four days across **two different lines of work**, and their
-file names do not say which. This index is the missing signpost. It is a map, not a summary:
-each entry says what the document DECIDES, so you can tell from here whether you need it.
+The documents in `docs/` accumulated across **two different lines of work**, and their file
+names do not say which. This index is the missing signpost. It is a map, not a summary: each
+entry says what the document DECIDES, so you can tell from here whether you need it.
+
+> **No count is written here on purpose.** This paragraph used to open "Eighteen documents
+> accumulated in four days"; by the time anyone read that sentence it was twenty-five across
+> seven, and nothing in the file could tell you so. A total maintained by hand beside the
+> roster it counts rots the moment the roster grows, and it rots *silently* — the wrong
+> number is as readable as the right one. The roster below is the count, and nothing but the
+> roster is. There is no gate that a new document reaches this index — adding one is a hand
+> step, and `step0f`/`step0g` sat here unlisted for a day, which is how this paragraph exists.
 
 > **Known defect in the naming, stated rather than silently repaired.** `step0b` / `step0c`
 > belong to the *measurement* thread; `step0d`, `step1`, `step2`, `step3` belong to the
@@ -30,6 +38,9 @@ demand side hand over about it for free?* Everything here is observation.
 | **`step0e-bid-request-audience-2026-08-20.md`** | **what the bid request actually SAYS about the person.** The payload was never read before this: schemas 1–5 parsed it and threw it away, and schema 6 kept the body while cutting every GET exchange's query string at 500 chars. Answers the README's thesis with a refinement and a negative — 18 of 23 bid-request paths carry no audience field at all, and the identity that does travel is the wrapper operator's |
 | `prebid-local-runbook.md` | standing up prebid locally, and what counts as the artifact |
 | `REPRODUCE.md` | **the commands.** How to re-run any of the above and how to check the gates |
+| **`step0f-adfox-cards-2026-08-21.md`** | **the operator's «AdFox раскрывает все карты» tested against the wire**, not against a draft. Prior art leads: Yandex documents the visibility as a publisher feature, so only what survives that citation is claimed as ours. The bidder ROSTER holds; the PRICE claim breaks — and a price turns out to be a function of the vantage it was asked from |
+| **`step0g-loyalty-label-2026-08-21.md`** | **(ru) `userLoyaltyGroups` is a segment NAME and a first-visit DEFAULT, not a verdict about a person.** The operator read the finding as «на сайтах видно, насколько ты лоялен власти» and asked directly whether he had it wrong. He had — and the thing that shows it was already in our own capture |
+| `DATASHEET-ru-hb-frame.md` | the datasheet for the published frame + rejection ledger, following *Datasheets for Datasets* (Gebru et al.) — what the dataset excludes, stated as content rather than caveat, because a dataset nobody can bound cannot be cited |
 
 ## Thread B — ACCESS: how a person or a small buyer gets in legally
 
@@ -55,6 +66,12 @@ cost a small buyer to get a seat?* Everything here is procedure, correspondence 
 | `method-planted-invariant-oracle-2026-08-15-operator.{txt,pdf}` | the planted-invariant oracle method, as given |
 
 ---
+
+## Drafts written for readers outside this repository
+
+| document | what it is |
+|---|---|
+| `draft-devto-2026-08-20-audience-profile.md` | a dev.to draft of the `step0e` result for a general audience — *"I went looking for my ad profile inside the bid request. It wasn't there."* A DRAFT: the `pub` channel owns dev.to, and nothing here is posted by the measurement thread |
 
 ## Reading order, if you are new
 
