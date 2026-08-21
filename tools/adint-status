@@ -126,6 +126,30 @@ def run_of(path):
     return b.split(".")[0]
 
 
+def zone_msk(hour_utc):
+    """Which MSK daypart a UTC hour falls in. Mirrors `adint-paired-run.zone_msk`."""
+    h = (hour_utc + 3) % 24
+    return "night" if h < 6 else "morning" if h < 12 else "day" if h < 18 else "evening"
+
+
+def named_zone(run):
+    """The daypart a cell CLAIMS, from its run_id: `<date>-<zone>-<seed>`."""
+    parts = run.split("-")
+    return parts[3] if len(parts) > 3 else None
+
+
+def zone_spread(loads):
+    """{zone: n} over the loads' own timestamps — what the cell actually sampled."""
+    out = {}
+    for r in loads:
+        h = r.get("hour_utc")
+        if h is None:
+            continue
+        z = zone_msk(h)
+        out[z] = out.get(z, 0) + 1
+    return out
+
+
 def unseen_cause(load):
     """None if this arm saw the page; otherwise WHICH KIND of not-seeing it was.
 
@@ -238,6 +262,11 @@ def cells(include_private):
             "sites": len({r.get("url") for r in rows}),
             "hours": sorted({r.get("hour_utc") for r in rows if r.get("hour_utc") is not None}),
             "windows": sorted({r.get("window_s") for r in rows}),
+            # What this arm actually sampled, versus what the cell's NAME claims. A cell that
+            # starts inside its window and runs past the boundary keeps the name it was born
+            # with, and the design in §2.3 stratifies on exactly that name.
+            "zones": zone_spread(rows),
+            "named_zone": named_zone(run_of(f)),
             "pairs": len({r.get("pair_id") for r in rows if r.get("pair_id")}),
             "verified": sum(1 for r in rows if r.get("vantage_verified")),
             "egress": sorted({r.get("egress_ip") for r in rows if r.get("egress_ip")}),
@@ -361,6 +390,36 @@ def block(include_private):
               f"smaller is what we can USE, and the gap is the systematic per-site blindness "
               f"named in the table above, not noise. Everything measured so far is a pilot of "
               f"that design, not a sample of the Russian market.", ""]
+
+    # ZONE DRIFT. A cell is named for the daypart it STARTED in and keeps that name for its
+    # whole length, so a long run crosses the boundary and files the overflow under the wrong
+    # stratum. `adint-paired-run` already detects this and says so — into its run log, which
+    # lives in the gitignored `data/` tree and is never published. So the warning fired
+    # correctly into a channel with no reader, and the corpus a reader DOES get shows a cell
+    # called `night` with no hint that a third of it is morning. Recomputed here from each
+    # load's own `hour_utc`, which means it also covers every cell already on disk rather than
+    # only the ones captured after the fix. Named, never silently re-bucketed: which stratum
+    # those loads belong to is the study's call, not this tool's.
+    zd = []
+    for run in sorted({c["run"] for c in cl}):
+        rows_of = [c for c in cl if c["run"] == run]
+        want = rows_of[0].get("named_zone")
+        tot = {}
+        for c in rows_of:
+            for z, n in (c.get("zones") or {}).items():
+                tot[z] = tot.get(z, 0) + n
+        off = {z: n for z, n in tot.items() if z != want}
+        if want and off:
+            spread = ", ".join(f"{n} {z}" for z, n in sorted(off.items(), key=lambda kv: -kv[1]))
+            zd.append(f"`{run}` is named `{want}` but {spread} load(s) of "
+                      f"{sum(tot.values())} fall outside it")
+    if zd:
+        L += ["> **Some cells carry loads outside the daypart they are named for.** "
+              + "; ".join(zd) + ". A cell takes its name from the daypart it STARTED in and "
+              "keeps it for the whole run, so a long cell crosses the boundary. The design in "
+              "§2.3 stratifies by daypart, so these loads are filed under a daypart they were "
+              "not sampled in. They are named here rather than re-bucketed — which stratum "
+              "they belong to is a decision about the study, not about this table.", ""]
 
     # Publish drift: the same cell present in both trees with different load counts. Named
     # rather than resolved, because which copy is right is not this tool's call.
@@ -526,6 +585,46 @@ def selftest():
           "loads attempted" in b2 and "SPENT" in b2, True)
     check("no drift is claimed when the copies agree",
           "disagree" in b2, False)
+    # ZONE DRIFT. The unit boundary first: MSK is UTC+3, so these are the edges the cell name
+    # is decided on, and getting one wrong silently re-files a whole stratum.
+    check("21:00 UTC is MSK night", zone_msk(21), "night")
+    check("02:00 UTC is still night", zone_msk(2), "night")
+    check("03:00 UTC is MSK morning", zone_msk(3), "morning")
+    check("09:00 UTC is MSK day", zone_msk(9), "day")
+    check("15:00 UTC is MSK evening", zone_msk(15), "evening")
+    check("the cell's claimed zone comes out of its run_id",
+          named_zone("2026-08-21-night-2026082102"), "night")
+    check("a run_id with no zone field claims nothing rather than guessing",
+          named_zone("weird"), None)
+    # The fixture cell is named `testcell` and its loads are hour_utc 9 — no zone in the name,
+    # so nothing is claimed and nothing can be contradicted. Assert the disclosure stays SILENT
+    # there, so a later fixture change cannot make this note fire on every cell unnoticed.
+    check("no zone note when the cell name claims no daypart",
+          "outside the daypart" in b2, False)
+    # And that it FIRES on a cell whose loads leave its named daypart. Built here rather than
+    # asserted against the live corpus: a gate that reads today's cells passes or fails on what
+    # happened to run last night.
+    zcell = {"nl-direct": [("s001", 200, 2), ("s002", 200, 3)],
+             "ru-mobile": [("s001", 200, 2), ("s002", 200, 3)]}
+    for arm, loads in zcell.items():
+        with open(os.path.join(PUB, f"hb-paired-2026-08-21-night-zonetest.{arm}.jsonl"), "w") as fh:
+            for sid, st, hr in loads:
+                fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
+                                     "hour_utc": hr, "url": f"https://{sid}.ru/",
+                                     "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                     "http_status": st,
+                                     "pair_id": f"zonetest-{sid}"}) + "\n")
+    b3 = block(False)
+    check("a cell whose loads leave its named daypart is disclosed",
+          "is named `night` but 2 morning load(s) of 4 fall outside it" in b3, True)
+    # Order-independent on purpose: the first cut asserted `"night load(s)" not in b3`, and the
+    # two zones tie at n=2, so whichever sorted first decided whether the string appeared at all.
+    # It stayed GREEN under a mutation that reported every zone as drift — a gate whose verdict
+    # turned on a tiebreak, not on the behaviour. Name the quantity instead of the sentence.
+    check("the in-zone half is not reported as drift",
+          "2 night" in b3, False)
+    for arm in zcell:
+        os.remove(os.path.join(PUB, f"hb-paired-2026-08-21-night-zonetest.{arm}.jsonl"))
 
     # The copies disagreeing is publish drift: named, never resolved by preference.
     with open(os.path.join(PRIV, "hb-paired-testcell.nl-direct.jsonl"), "a") as fh:

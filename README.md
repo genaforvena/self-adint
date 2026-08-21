@@ -35,7 +35,7 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-21 01:41 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-21 03:28 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
@@ -99,8 +99,12 @@ Three counts, because they are three different facts. `this arm` is what this ar
 | `2026-08-20-night-2026082023` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **15** | 45 s | 0,23 | 28/28 |
 | `2026-08-21-night-2026082100` | `us-exit` | 28 | 5 | 1 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
 | `2026-08-21-night-2026082100` | `ru-mobile` | 28 | 0 | 10 | 14 | 28 | 28 | **14** | 45 s | 0,1 | 28/28 |
+| `2026-08-21-night-2026082102` | `nl-direct` | 28 | 5 | 0 | 14 | 28 | 28 | **15** | 45 s | 2,3 | 28/28 |
+| `2026-08-21-night-2026082102` | `ru-mobile` | 28 | 0 | 11 | 14 | 28 | 28 | **15** | 45 s | 2,3 | 27/28 |
 
-**Coverage against the design:** 535 of 8960 loads (6.0 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. Everything measured so far is a pilot of that design, not a sample of the Russian market.
+**Coverage against the design:** 147 of 4480 readable pairs (3.3 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. That is the study's own unit: a pair is readable only when BOTH arms saw the page, and only such a pair carries a contrast. Measured in loads attempted the same work reads 591 of 8960 (6.6 %) — the larger figure is what we have SPENT, the smaller is what we can USE, and the gap is the systematic per-site blindness named in the table above, not noise. Everything measured so far is a pilot of that design, not a sample of the Russian market.
+
+> **Some cells carry loads outside the daypart they are named for.** `2026-08-19-day-2026081914` is named `day` but 1 evening load(s) of 24 fall outside it; `2026-08-20-evening-2026082020` is named `evening` but 5 night load(s) of 29 fall outside it; `2026-08-21-night-2026082102` is named `night` but 18 morning load(s) of 56 fall outside it. A cell takes its name from the daypart it STARTED in and keeps it for the whole run, so a long cell crosses the boundary. The design in §2.3 stratifies by daypart, so these loads are filed under a daypart they were not sampled in. They are named here rather than re-bucketed — which stratum they belong to is a decision about the study, not about this table.
 
 <!-- /NUMBERS -->
 
