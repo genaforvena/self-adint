@@ -35,7 +35,7 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-21 04:31 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-08-21 05:12 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
@@ -105,6 +105,33 @@ Three counts, because they are three different facts. `this arm` is what this ar
 | `2026-08-21-night-2026082102` | `ru-mobile` | 28 | 0 | 11 | 14 | 28 | 28 | **15** | 45 s | 2,3 | 27/28 |
 
 **Coverage against the design:** 161 of 4480 readable pairs (3.6 %) of the 14-day, two-arm schedule in §2.3 of `docs/step0c-hb-ru-market-study-2026-08-18.md`. That is the study's own unit: a pair is readable only when BOTH arms saw the page, and only such a pair carries a contrast. Measured in loads attempted the same work reads 646 of 8960 (7.2 %) — the larger figure is what we have SPENT, the smaller is what we can USE, and the gap is the systematic per-site blindness named in the table above, not noise. Everything measured so far is a pilot of that design, not a sample of the Russian market.
+
+### Per-site yield — the denominator under every per-site claim
+
+Worst-seen first. **`readable` is the n any statement about that site rests on**, and it is not the same number for any two sites: it runs 0 % to 78 % across the frame. So every aggregate over readable pairs above is a **site-weighted** average, weighted by nothing anyone chose — a site the instrument cannot see drops out of it silently, contributing no row and no warning. `attempted` counts pair ids seen in ANY arm, which is the honest denominator for how much of a site the instrument can reach. The loss column keeps the two kinds apart BY ARM, because they are different claims: a `refused` is the publisher's server declining that vantage, a `no answer` is our own link failing to fetch the page. Not shown to correlate with anything about the site's wrapper, and not ruled out either.
+
+| site | attempted | complete | **readable** | yield | lost, by arm and kind |
+|---|---:|---:|---:|---:|---|
+| `rbc.ru` | 24 | 23 | **0** | 0 % | ru-mobile no-answer 18, nl-direct refused 14, us-exit refused 10 |
+| `aif.ru` | 23 | 22 | **4** | 17 % | ru-mobile no-answer 18 |
+| `iz.ru` | 24 | 21 | **7** | 29 % | us-exit refused 8, nl-direct refused 5, ru-mobile no-answer 3 |
+| `magnit.ru` | 26 | 22 | **8** | 31 % | ru-mobile no-answer 14 |
+| `matchtv.ru` | 25 | 22 | **8** | 32 % | ru-mobile no-answer 14 |
+| `pikabu.ru` | 26 | 25 | **11** | 42 % | ru-mobile no-answer 14 |
+| `gismeteo.ru` | 25 | 23 | **13** | 52 % | nl-direct refused 10, ru-mobile no-answer 6 |
+| `mk.ru` | 25 | 22 | **13** | 52 % | nl-direct no-answer 7, ru-mobile no-answer 5 |
+| `kp.ru` | 24 | 21 | **13** | 54 % | nl-direct no-answer 6, ru-mobile no-answer 6 |
+| `hh.ru` | 24 | 20 | **14** | 58 % | ru-mobile no-answer 4, us-exit no-answer 3, nl-direct refused 2, us-exit refused 1 |
+| `aviasales.ru` | 23 | 22 | **17** | 74 % | ru-mobile no-answer 5 |
+| `sports.ru` | 24 | 23 | **18** | 75 % | ru-mobile no-answer 4, us-exit no-answer 1 |
+| `interfax.ru` | 22 | 21 | **17** | 77 % | ru-mobile no-answer 3, us-exit no-answer 1 |
+| `ria.ru` | 23 | 21 | **18** | 78 % | ru-mobile no-answer 3 |
+
+These 161 readable pairs are the same 161 the coverage line counts — the table is a decomposition of that figure, not a second measurement of it. A row whose `complete` is high and whose `readable` is zero is the shape to watch: both arms wrote a load, so the pair looks complete, and one arm never saw the page, so there is no contrast inside it.
+
+> **Structural zeroes — sites in the frame that can yield no readable pair.** `rbc.ru` (24 attempted, 18 ru-mobile no-answer, 14 nl-direct refused, 10 us-exit refused). A site here costs loads every replicate and returns no contrast, and it is absent from every aggregate above without appearing in any of them. Keeping or dropping it is a decision about the study, recorded in `ref/CANONICAL-FRAME` where the frame is declared — never made here, and never made by quietly dropping it, since a frame that sheds what the instrument cannot see becomes a frame defined by the instrument and then reports full coverage of itself.
+
+> Declared in `ref/CANONICAL-FRAME`: `rbc.ru`. This list is recomputed from the corpus on every run, so a site whose refusal breaks leaves it here on its own — check the declaration still describes a site that is on this list.
 
 > **Some cells carry loads outside the daypart they are named for.** `2026-08-19-day-2026081914` is named `day` but 1 evening load(s) of 24 fall outside it; `2026-08-20-evening-2026082020` is named `evening` but 5 night load(s) of 29 fall outside it; `2026-08-21-night-2026082102` is named `night` but 18 morning load(s) of 56 fall outside it. A cell takes its name from the daypart it STARTED in and keeps it for the whole run, so a long cell crosses the boundary. The design in §2.3 stratifies by daypart, so these loads are filed under a daypart they were not sampled in. They are named here rather than re-bucketed — which stratum they belong to is a decision about the study, not about this table.
 

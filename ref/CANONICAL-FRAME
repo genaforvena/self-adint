@@ -66,3 +66,48 @@ ledger:   public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl
 # reproducible by a stranger. They enter when the walk arrives. (iz.ru #3322 and lenta.ru
 # #3128 were on this list at 07:46Z; the RU walk has since reached both — iz.ru admitted,
 # lenta.ru read as ad-serving-only, which is how a pending line is supposed to end.)
+
+# ── rbc.ru: KEPT, and recorded as a structural zero for the PAIR unit ─────────────────
+# Decided 2026-08-21 from the per-site yield table in the published README (produced by
+# tools/adint-status, which is where the numbers below are re-derived on every run — do
+# not quote these figures, read that table).
+#
+# THE MEASUREMENT, over every cell on disk at the decision:
+#
+#   nl-direct   14 loads   401 x14        100 % refused
+#   us-exit     10 loads   401 x10        100 % refused
+#   ru-mobile   18 loads   no answer x18, and 5 loads   200
+#
+# So: 24 of 24 loads from a FOREIGN vantage were declined by rbc.ru's own server, across
+# TWO INDEPENDENT foreign exits in different countries and different ASNs. That second
+# arm is what makes this a finding rather than an anecdote — one exit refusing could be
+# that IP's reputation; two unrelated exits at 100 % is a decision about the vantage
+# CLASS. And the domestic arm returned 200 five times, so the site is not unreadable: it
+# is readable from Moscow and refused from abroad, which is precisely the effect this
+# study exists to measure.
+#
+# THE DECISION: rbc.ru STAYS IN THE FRAME.
+#
+# Dropping it was the tempting option and it is the wrong one twice over. First the trap
+# named in docs/step0h-vantage-blindness-2026-08-21.md: a frame that quietly drops the
+# sites the instrument cannot see becomes a frame DEFINED BY the instrument, and then
+# reports full coverage of itself. Second, and specific to this site: dropping it would
+# delete the corpus's cleanest single measurement of vantage-conditional access. The
+# reason it yields no readable pair is not that it is uninformative — it is that our
+# PAIR unit requires both arms to see the page, and a site that answers one arm and
+# refuses the other is exactly the case the pair unit cannot express.
+#
+# WHAT THAT COSTS, stated so nobody re-derives it as a surprise: rbc.ru contributes
+# 0 readable pairs and will keep contributing 0 for as long as the foreign refusal holds,
+# so every aggregate over readable pairs in this study is an aggregate over a frame that
+# does not include rbc.ru. It costs ~2 loads per replicate for a structurally guaranteed
+# zero in the pair column. We pay it, and the per-site yield table is the receipt: the
+# row is rendered with readable = 0 rather than omitted, and a gate in
+# `tools/adint-status --test` asserts a zero-yield row is never dropped from that table.
+#
+# WHAT rbc.ru IS EVIDENCE FOR, then, is a SINGLE-ARM claim about access, not a paired
+# claim about the auction. Do not fold it into a contrast; cite it as what it is.
+#
+# THE RE-OPENING CONDITION, so this is a decision and not a permanent belief: if any
+# foreign-arm load of rbc.ru ever returns a status below 400, the "100 % across two
+# exits" statement is dead and this block must be rewritten from the table, not patched.

@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 import sys
+import urllib.parse
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PUB = os.path.join(REPO, "public-data")
@@ -218,20 +219,122 @@ def _dedup_cell_files(files):
     return sorted(by_name.values()), set(by_name), drift
 
 
-def cells(include_private):
-    """One paired run = one cell of the schedule."""
-    out = []
+def _cell_files(include_private):
+    """The deduped set of cell files, and the drift notes from deduping them.
+
+    Factored out of `cells` so `site_yield` reads the SAME set. Two readers each doing
+    their own glob is how one of them ends up counting a published cell twice while the
+    other does not — the double-count this file already fixed once, re-introduced by
+    copying the loop instead of the selection.
+    """
     pats = [os.path.join(PUB, "hb-paired-*.jsonl")]
     if include_private:
         pats.append(os.path.join(PRIV, "hb-paired-*.jsonl"))
     files = sorted(set(sum([glob.glob(p) for p in pats], [])))
+    return _dedup_cell_files(files)
+
+
+def _cell_loads(include_private):
+    """[(run, arm, load_row), ...] over every deduped cell file."""
+    files, _seen, _drift = _cell_files(include_private)
+    out = []
+    for f in files:
+        ld = [r for r in read_jsonl(f) if r.get("kind") == "load"]
+        if not ld:
+            continue
+        arm = ld[0].get("arm") or os.path.basename(f)
+        out += [(run_of(f), arm, r) for r in ld]
+    return out
+
+
+def site_yield(include_private):
+    """Per SITE: how many of its pairs are readable, and which arm lost the rest.
+
+    The aggregate figures one screen up are sums over a set that is NOT uniformly
+    sampled. Measured across the cells on disk 2026-08-21, per-site readable yield runs
+    from 0 % to 78 %: `rbc.ru` answers the foreign vantage 401 on every single load, so
+    it contributes ZERO readable pairs and vanishes from every aggregate over readable
+    pairs — silently, because an aggregate has no place to say which of its inputs are
+    missing. `ria.ru` resting on 18 readable pairs and `aif.ru` resting on 4 read
+    identically in any per-site sentence that does not carry its n. This table is that n.
+
+    The two losses are kept apart by ARM, because they are different claims and neither
+    one is about "the pair":
+
+      `NL refused`  the publisher's server answered the foreign vantage and declined it.
+                    A fact about that site's relationship to that vantage.
+      `RU no ans`   the navigation from the domestic tether never returned a response.
+                    Our own link. Naming this as the publisher's refusal would record our
+                    slowness as their policy — and the direction is not symmetric: across
+                    13 cells the publisher-answered 4xx count is 50 on the foreign arm and
+                    0 on the domestic one.
+
+    Yield is readable/attempted, where attempted is pair ids seen in ANY arm — so a load
+    one arm refused to even start still counts against the site, which is the honest
+    denominator for "how much of this site can the instrument see".
+    """
+    rows = _cell_loads(include_private)
+    by_site = {}
+    for run, arm, r in rows:
+        host = (urllib.parse.urlsplit(r.get("url") or "").hostname or "?").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        pid = r.get("pair_id")
+        if not pid:
+            continue
+        d = by_site.setdefault(host, {"cells": {}, "loss": {}})
+        # PER CELL, then summed. A pair belongs to one cell, and a cell has exactly the two
+        # arms that ran it. Intersecting over every arm the CORPUS has ever carried demands
+        # that a pair exist in an arm which never ran that cell: with the retired `us-exit`
+        # arm on disk beside `nl-direct`/`ru-mobile`, that three-way intersection was empty
+        # for every site and reported 0 readable pairs corpus-wide — a table that would have
+        # said the study has no data at all. Seen, then fixed; the gate below holds it.
+        c = d["cells"].setdefault(run, {})
+        a = c.setdefault(arm, {"all": set(), "seen": set()})
+        a["all"].add(pid)
+        cause = unseen_cause(r)
+        if cause is None:
+            a["seen"].add(pid)
+        else:
+            d["loss"][(arm, cause)] = d["loss"].get((arm, cause), 0) + 1
+
+    out = []
+    for host, d in by_site.items():
+        attempted = complete = readable = 0
+        arms_seen = set()
+        for run, arms in d["cells"].items():
+            arms_seen |= set(arms)
+            attempted += len(set.union(*[a["all"] for a in arms.values()]))
+            # A cell touched by ONE arm only has no pair at all — intersecting a single set
+            # with itself would report every attempt as complete, the one-arm defect this
+            # file already fixed for the cells table.
+            if len(arms) > 1:
+                complete += len(set.intersection(*[a["all"] for a in arms.values()]))
+                readable += len(set.intersection(*[a["seen"] for a in arms.values()]))
+        out.append({
+            "site": host,
+            "attempted": attempted,
+            "complete": complete,
+            "readable": readable,
+            "arms": sorted(arms_seen),
+            "loss": dict(d["loss"]),
+        })
+    # Worst yield first: the sites an aggregate is most blind to are the ones a reader must
+    # see before the aggregate. Ties by attempted, so a big hole outranks a small one.
+    return sorted(out, key=lambda r: (r["readable"] / r["attempted"] if r["attempted"] else 0,
+                                      -r["attempted"], r["site"]))
+
+
+def cells(include_private):
+    """One paired run = one cell of the schedule."""
+    out = []
     # ONE ROW PER (cell, arm), not per FILE. A published cell exists in BOTH trees under the
     # same basename, so reading with --include-private listed the morning cell twice and its
     # loads were counted twice in the coverage percentage — the study's own progress figure,
     # inflated by the act of publishing. Dedup on the identity of the CELL, keeping the
     # published copy; if the two copies disagree on load count, that is publish drift and it
     # is REPORTED rather than resolved by preference.
-    files, seen_key, drift = _dedup_cell_files(files)
+    files, seen_key, drift = _cell_files(include_private)
     by_run_arm = {}
     by_run_arm_rendered = {}
     for f in files:
@@ -390,6 +493,91 @@ def block(include_private):
               f"smaller is what we can USE, and the gap is the systematic per-site blindness "
               f"named in the table above, not noise. Everything measured so far is a pilot of "
               f"that design, not a sample of the Russian market.", ""]
+
+    # PER-SITE YIELD. The coverage figure above is a sum over a set that is not uniformly
+    # sampled, and an aggregate has no place to say which of its inputs are missing. Printed
+    # here so that any per-site sentence anywhere in the corpus has an n to carry: `ria.ru`
+    # at 18 readable pairs and `aif.ru` at 4 are not the same claim, and `rbc.ru` at 0 is not
+    # in the aggregate at all.
+    sy = site_yield(include_private)
+    if sy:
+        tr = sum(r["readable"] for r in sy)
+        L += ["### Per-site yield — the denominator under every per-site claim", "",
+              "Worst-seen first. **`readable` is the n any statement about that site rests "
+              "on**, and it is not the same number for any two sites: it runs "
+              f"{min(100.0*r['readable']/r['attempted'] for r in sy if r['attempted']):.0f} %"
+              f" to {max(100.0*r['readable']/r['attempted'] for r in sy if r['attempted']):.0f} %"
+              " across the frame. So every aggregate over readable pairs above is a "
+              "**site-weighted** average, weighted by nothing anyone chose — a site the "
+              "instrument cannot see drops out of it silently, contributing no row and no "
+              "warning. `attempted` counts pair ids seen in ANY arm, which is the honest "
+              "denominator for how much of a site the instrument can reach. The loss column "
+              "keeps the two kinds apart BY ARM, because they are different claims: a "
+              "`refused` is the publisher's server declining that vantage, a `no answer` is "
+              "our own link failing to fetch the page. Not shown to correlate with anything "
+              "about the site's wrapper, and not ruled out either.", "",
+              "| site | attempted | complete | **readable** | yield | lost, by arm and kind |",
+              "|---|---:|---:|---:|---:|---|"]
+        for r in sy:
+            loss = ", ".join(f"{a} {k} {n}" for (a, k), n in
+                             sorted(r["loss"].items(), key=lambda kv: -kv[1])) or "—"
+            y = f"{100.0*r['readable']/r['attempted']:.0f} %" if r["attempted"] else "n/a"
+            L.append(f"| `{r['site']}` | {r['attempted']} | {r['complete']} | "
+                     f"**{r['readable']}** | {y} | {loss} |")
+        L += ["", f"These {tr} readable pairs are the same {tr} the coverage line counts — "
+              "the table is a decomposition of that figure, not a second measurement of it. "
+              "A row whose `complete` is high and whose `readable` is zero is the shape to "
+              "watch: both arms wrote a load, so the pair looks complete, and one arm never "
+              "saw the page, so there is no contrast inside it.", ""]
+
+    # STRUCTURAL ZEROES, and whether the frame declaration OWNS them. A site with zero
+    # readable pairs contributes nothing to any contrast and vanishes from every aggregate
+    # without leaving a row in it. Whether it stays in the frame is a decision about the
+    # STUDY — `ref/CANONICAL-FRAME` is where the frame is declared and so where such a
+    # decision belongs. What this tool can check is that the decision was MADE: a
+    # zero-yield site the declaration never names is an undeclared hole, and an undeclared
+    # hole is indistinguishable from nobody having noticed.
+    #
+    # It also re-derives the re-opening condition those declarations rest on. `rbc.ru` is
+    # kept on the strength of "100 % refused across two independent foreign exits"; that is
+    # a measured number living in prose, and a measured number in prose rots. Here the list
+    # is recomputed from the corpus every run, so if the refusal ever breaks, the site
+    # leaves this list by itself and the declaration is left visibly describing a site that
+    # is no longer on it.
+    if sy:
+        zero = [r for r in sy if r["attempted"] and not r["readable"]]
+        if zero:
+            try:
+                decl = open(os.path.join(REPO, "ref", "CANONICAL-FRAME"),
+                            encoding="utf-8").read()
+            except OSError:
+                decl = ""
+            named = [r for r in zero if r["site"] in decl]
+            unnamed = [r for r in zero if r["site"] not in decl]
+            L += ["> **Structural zeroes — sites in the frame that can yield no readable "
+                  "pair.** " + "; ".join(
+                      f"`{r['site']}` ({r['attempted']} attempted, "
+                      + ", ".join(f"{n} {a} {k}" for (a, k), n in
+                                  sorted(r['loss'].items(), key=lambda kv: -kv[1]))
+                      + ")" for r in zero)
+                  + ". A site here costs loads every replicate and returns no contrast, and "
+                  "it is absent from every aggregate above without appearing in any of them. "
+                  "Keeping or dropping it is a decision about the study, recorded in "
+                  "`ref/CANONICAL-FRAME` where the frame is declared — never made here, and "
+                  "never made by quietly dropping it, since a frame that sheds what the "
+                  "instrument cannot see becomes a frame defined by the instrument and then "
+                  "reports full coverage of itself.", ""]
+            if named:
+                L += ["> Declared in `ref/CANONICAL-FRAME`: "
+                      + ", ".join(f"`{r['site']}`" for r in named)
+                      + ". This list is recomputed from the corpus on every run, so a site "
+                      "whose refusal breaks leaves it here on its own — check the "
+                      "declaration still describes a site that is on this list.", ""]
+            if unnamed:
+                L += ["> **Not declared anywhere: "
+                      + ", ".join(f"`{r['site']}`" for r in unnamed)
+                      + ".** These are holes nobody has decided about. An undeclared hole "
+                      "reads exactly like one nobody noticed.", ""]
 
     # ZONE DRIFT. A cell is named for the daypart it STARTED in and keeps that name for its
     # whole length, so a long run crosses the boundary and files the overflow under the wrong
@@ -585,6 +773,101 @@ def selftest():
           "loads attempted" in b2 and "SPENT" in b2, True)
     check("no drift is claimed when the copies agree",
           "disagree" in b2, False)
+    # ── PER-SITE YIELD: the denominator under every per-site claim ──
+    # The fixture puts ONE site in TWO cells whose arm PAIRS differ — `cellA` ran
+    # nl-direct/ru-mobile, `cellB` ran nl-direct/us-exit, which is the corpus on disk (a
+    # retired third arm sits beside the live two). The first cut intersected pair ids over
+    # every arm the CORPUS carries rather than per cell, which demands a pair exist in an
+    # arm that never ran that cell: it reported 0 readable pairs for EVERY site, i.e. a
+    # table saying the study has no data. Seen red, then fixed.
+    for f in glob.glob(os.path.join(PUB, "hb-paired-*.jsonl")):
+        os.remove(f)
+    for f in glob.glob(os.path.join(PRIV, "hb-paired-*.jsonl")):
+        os.remove(f)
+    # cellA: alpha readable, beta lost to an NL refusal. cellB (different arm pair): alpha
+    # readable again, beta lost to a RU-side no-answer on the third arm.
+    sitecells = {
+        ("cellA", "nl-direct"): [("alpha", "a1", 200), ("beta", "b1", 403),
+                                 ("rbc", "c1", 401)],
+        ("cellA", "ru-mobile"): [("alpha", "a1", 200), ("beta", "b1", 200),
+                                 ("rbc", "c1", 200)],
+        ("cellB", "nl-direct"): [("alpha", "a2", 200), ("beta", "b2", 200)],
+        ("cellB", "us-exit"):   [("alpha", "a2", 200), ("beta", "b2", None)],
+    }
+    for (cell, arm), loads in sitecells.items():
+        with open(os.path.join(PUB, f"hb-paired-{cell}.{arm}.jsonl"), "w") as fh:
+            for host, pid, st in loads:
+                fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
+                                     "hour_utc": 9, "url": f"https://www.{host}.ru/",
+                                     "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                     "http_status": st,
+                                     "pair_id": f"{cell}-{pid}"}) + "\n")
+    sy = {r["site"]: r for r in site_yield(False)}
+    # Read through a miss-tolerant accessor, and assert the KEY SET first. A gate that
+    # subscripts a dict the mutation just emptied dies with a KeyError, and a suite that
+    # dies reports nothing about the gates after it — the red gate hiding every later one.
+    # Seen: dropping the www. strip turned six clean FAILs into one traceback.
+    def g(site, field):
+        return (sy.get(site) or {}).get(field)
+    check("the site key drops the www. prefix so one host is one row",
+          sorted(sy), ["alpha.ru", "beta.ru", "rbc.ru"])
+    check("a site is intersected per CELL, not across every arm the corpus carries",
+          g("alpha.ru", "readable"), 2)
+    check("a site whose halves never both saw the page yields nothing",
+          g("beta.ru", "readable"), 0)
+    check("...and it is still COMPLETE — both arms wrote a load",
+          g("beta.ru", "complete"), 2)
+    check("attempted counts pair ids in ANY arm, so a one-sided attempt still counts",
+          g("alpha.ru", "attempted"), 2)
+    # The two losses are different claims and are never folded: a publisher declining a
+    # vantage vs our own link failing to fetch. Keyed BY ARM, because "50 refusals on the
+    # foreign arm and 0 on the domestic one" is the corpus's single largest finding and it
+    # is invisible in an arm-blind total.
+    check("the loss split names the arm and the kind",
+          sorted((g("beta.ru", "loss") or {}).items()),
+          [(("nl-direct", "refused"), 1), (("us-exit", "no-answer"), 1)])
+    # THE CROSS-CHECK: the per-site table is a DECOMPOSITION of the coverage figure, not a
+    # second measurement of it. If the two ever disagree, one of them is counting cells the
+    # other is not — the exact defect that made the first cut render zeroes.
+    cl_ = cells(False)
+    check("per-site readable sums to the corpus readable total",
+          sum(r["readable"] for r in sy.values()),
+          sum({c["run"]: c["readable_pairs"] for c in cl_}.values()))
+    bsy = block(False)
+    # `.index()` on a string the mutation deleted raises rather than failing, and the raise
+    # ends the suite — same shape as the KeyError above. Ask whether the rows are PRESENT
+    # and in order, so a dropped row reads as a FAIL and the checks after it still run.
+    order = [ln for ln in bsy.splitlines() if ln.startswith("| `") and ".ru`" in ln]
+    check("the yield table is rendered, worst-seen first",
+          [ln.split("`")[1] for ln in order], ["beta.ru", "rbc.ru", "alpha.ru"])
+    check("a zero-yield row is not silently dropped from the table",
+          "| `beta.ru` | 2 | 2 | **0** | 0 % |" in bsy, True)
+    # A zero-yield site must be NAMED as a structural zero, and the disclosure must say
+    # whether the frame declaration owns it. `rbc.ru` is in `ref/CANONICAL-FRAME`;
+    # `beta.ru` is in no declaration anywhere and must be called out as undecided.
+    check("a zero-yield site is disclosed as a structural zero",
+          "Structural zeroes" in bsy and "`rbc.ru` (1 attempted, 1 nl-direct refused)" in bsy, True)
+    check("a zero-yield site named in the frame declaration reads as decided",
+          "Declared in `ref/CANONICAL-FRAME`: `rbc.ru`" in bsy, True)
+    check("a zero-yield site NO declaration names is called out as undecided",
+          "Not declared anywhere: `beta.ru`" in bsy, True)
+    # And the disclosure must not fire on a site that HAS readable pairs, or it degrades
+    # into a list of the whole frame and stops meaning anything.
+    check("a site with readable pairs is not called a structural zero",
+          "`alpha.ru` (2 attempted" in bsy, False)
+    for f in glob.glob(os.path.join(PUB, "hb-paired-*.jsonl")):
+        os.remove(f)
+    # Restore the cells the later checks read.
+    for arm, loads in fixture.items():
+        for tree in (PUB, PRIV):
+            with open(os.path.join(tree, f"hb-paired-testcell.{arm}.jsonl"), "w") as fh:
+                for sid, st in loads:
+                    fh.write(json.dumps({"kind": "load", "arm": arm, "window_s": 45,
+                                         "hour_utc": 9, "url": f"https://{sid}.ru/",
+                                         "egress_ip": "1.2.3.4", "vantage_verified": True,
+                                         "http_status": st,
+                                         "pair_id": f"testcell-{sid}"}) + "\n")
+
     # ZONE DRIFT. The unit boundary first: MSK is UTC+3, so these are the edges the cell name
     # is decided on, and getting one wrong silently re-files a whole stratum.
     check("21:00 UTC is MSK night", zone_msk(21), "night")
