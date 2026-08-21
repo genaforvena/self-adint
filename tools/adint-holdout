@@ -576,15 +576,73 @@ def access_contrast(half, domestic):
             "p_one_sided_exact": p_exact,
         }
 
+    # THE SITE IS THE UNIT FOR A POLICY CLAIM, AND THE VISIT IS THE UNIT FOR A RATE CLAIM.
+    # These are two different questions and this file has now got them wrong in two
+    # different ways in one day.
+    #
+    # A refusal is a property of a SITE's relationship to a class of vantage. Measured on
+    # the exploratory half, all seven discordant (cell, site) units come from FOUR sites,
+    # and rbc.ru is 2 observed / 2 discordant — a deterministic policy. Every additional
+    # cell re-observes that policy and McNemar counts it as another independent success,
+    # so its p falls with elapsed time for the same reason the latching version did. It is
+    # a slower monotone, not an absent one.
+    #
+    # So: for "does vantage affect ACCESS", the independent unit is the site, there are 14
+    # of them, and the answer does NOT improve by collecting longer — only by widening the
+    # frame. For "how often does site X refuse", the visit IS the unit and more cells help,
+    # because that is a rate and the intermittent sites (iz.ru 3/6, gismeteo 1/7, hh 1/7)
+    # genuinely resolve with repetition. Both are reported; neither is allowed to wear the
+    # other's interpretation.
+    site_policy = {}
+    for site, arms in per_site.items():
+        f_seen = sum(v["served"] + v["refused"] for a, v in arms.items() if a != domestic)
+        f_ref = sum(v["refused"] for a, v in arms.items() if a != domestic)
+        d_seen = sum(v["served"] + v["refused"] for a, v in arms.items() if a == domestic)
+        d_ref = sum(v["refused"] for a, v in arms.items() if a == domestic)
+        if not f_seen or not d_seen:
+            verdict = "not-comparable"
+        elif f_ref and not d_ref:
+            verdict = ("refuses-foreign-always" if f_ref == f_seen
+                       else "refuses-foreign-sometimes")
+        elif d_ref and not f_ref:
+            verdict = "refuses-domestic-only"
+        elif f_ref and d_ref:
+            verdict = "refuses-both"
+        else:
+            verdict = "refuses-neither"
+        site_policy[site] = {"verdict": verdict, "foreign_refused": f_ref,
+                             "foreign_loads": f_seen, "domestic_refused": d_ref,
+                             "domestic_loads": d_seen}
+
+    comparable = [v for v in site_policy.values() if v["verdict"] != "not-comparable"]
+    kf = sum(1 for v in comparable if v["verdict"].startswith("refuses-foreign"))
+    kd = sum(1 for v in comparable if v["verdict"] == "refuses-domestic-only")
+    kk = kf + kd
+    p_site = (sum(math.comb(kk, i) for i in range(kf, kk + 1)) / (2 ** kk)) if kk else None
+
     return {
         "UNIT_WARNING": (
             "The per-load figures below treat repeated draws of the same sites, within a "
             "cell and often within one browser generation, as independent. They are not. "
-            "Quote `cell_site_mcnemar`, whose unit is (cell, site) and which compares "
-            "each foreign arm ALONE against the domestic one."),
+            "For the ACCESS question quote `site_level`, whose unit is the site. "
+            "`cell_site_mcnemar` answers a RATE question — how often a site refuses per "
+            "visit — and inflates for a site whose refusal is a fixed policy, since it "
+            "scores each re-observation as independent."),
         "per_load": by_arm,
         "per_site": per_site,
         "cell_site_mcnemar": per_arm_test,
+        "site_level": {
+            "QUESTION": ("Does the vantage affect ACCESS? The unit is the SITE, because a "
+                         "refusal is a site's policy toward a class of vantage and every "
+                         "extra cell re-observes the same policy rather than sampling a "
+                         "new one. This p does NOT improve by collecting longer — only by "
+                         "widening the frame."),
+            "sites_comparable": len(comparable),
+            "refuse_foreign": kf,
+            "refuse_domestic_only": kd,
+            "p_one_sided_exact": p_site,
+            "policies": site_policy,
+        },
     }
 
 def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
@@ -799,10 +857,14 @@ def selftest():
     # against the live corpus that reader excluded all 13 466 request rows as `unpaired`
     # and rendered a tidy report with priced_total 0. A fixture that does not have the
     # data's shape cannot catch a miswired reader.
-    def load(pid, arm, status, verified):
+    def load(pid, arm, status, verified, site=None):
+        # The site defaults to one PER PAIR, not one for the whole fixture. It used to be
+        # a single constant url, so every row in the corpus collapsed to one site and the
+        # site-level unit had exactly one member — a table that renders fine and asserts
+        # nothing about a per-site verdict.
         return {"kind": "load", "pair_id": pid, "load_id": f"L-{pid}-{arm}", "arm": arm,
                 "http_status": status, "vantage_verified": verified,
-                "url": "https://s.ru/"}
+                "url": site or f"https://{pid.split('-')[-1]}.ru/"}
     def req(pid, arm, outcome):
         return {"kind": "request", "load_id": f"L-{pid}-{arm}", "arm": arm,
                 "outcome": outcome, "bidder": "roxot"}
@@ -837,6 +899,17 @@ def selftest():
         # shape. The served arm brings three priced rows; if the gate lets a 401 stand in
         # for a rendered partner, all three land in the contrast against a partner that
         # structurally cannot answer, and the RU arm's denominator swells for free.
+        # An INTERMITTENT refuser: same site, refused on one foreign visit and served on
+        # another, so `refuses-foreign-sometimes` is a reachable verdict and not a branch
+        # nothing ever takes.
+        for n, st in ((1, 403), (2, 200)):
+            rows["ru-mobile"].append(load(f"{run}-x{n}", "ru-mobile", 200, True,
+                                          site="https://inter.ru/"))
+            rows["ru-mobile"].append(req(f"{run}-x{n}", "ru-mobile", "no-bid"))
+            rows["nl-direct"].append(load(f"{run}-x{n}", "nl-direct", st, True,
+                                          site="https://inter.ru/"))
+            if st == 200:
+                rows["nl-direct"].append(req(f"{run}-x{n}", "nl-direct", "no-bid"))
         rows["ru-mobile"].append(load(f"{run}-p10", "ru-mobile", 200, True))
         for _ in range(3):
             rows["ru-mobile"].append(req(f"{run}-p10", "ru-mobile", "priced"))
@@ -848,14 +921,14 @@ def selftest():
 
     ke, exc_e, _ = analysis_set("exploratory")
     kh, exc_h, _ = analysis_set("holdout")
-    check("each half sees only its own cells", (len(ke), len(kh)), (20, 20))
+    check("each half sees only its own cells", (len(ke), len(kh)), (22, 22))
     check("an unproven arm's rows are EXCLUDED, never counted as no-bid",
           exc_e["vantage-unproven"], 2)
     # A STATUS IS NOT A PAGE. Assert the exclusion by its own name AND assert the served
     # arm's rows did not survive it: the count alone would still pass if the rows leaked
     # through under a different bucket.
     check("a partner that ANSWERED 401 is not a rendered arm",
-          exc_e["pair-gate:refused"], 3)
+          exc_e["pair-gate:refused"], 4)
     check("...and the served arm's rows do not enter the contrast alone",
           sum(1 for a, r in ke if r["pair_id"].endswith("-p10")), 0)
     check("a dead load and a refusal are told apart, not pooled",
@@ -939,7 +1012,27 @@ def selftest():
     check("the price contrast ships the caveat that its unit is the REQUEST",
           "paired_permutation" in rr["fisher_one_sided_CAVEAT"]["UNIT_WARNING"], True)
 
+    # THE SITE-LEVEL VERDICT MUST ALSO BE ABLE TO POINT THE OTHER WAY, and must tell a
+    # fixed policy apart from an occasional one — that distinction is the whole reason
+    # this unit exists beside the per-visit one.
+    globals()["cell_rows"] = _fake
+    try:
+        flip_site = access_contrast("exploratory", "ru-mobile")["site_level"]
+    finally:
+        globals()["cell_rows"] = saved_rows
+    check("an inverted corpus lands on refuse_domestic_only, not refuse_foreign",
+          (flip_site["refuse_foreign"], flip_site["refuse_domestic_only"]), (0, 2))
+    check("...and its p reflects that direction rather than reporting the smaller tail",
+          flip_site["p_one_sided_exact"], 1.0)
+
     ac_e = access_contrast("exploratory", "ru-mobile")
+    pol = ac_e["site_level"]["policies"]
+    verdicts = {v["verdict"] for v in pol.values()}
+    check("a site refusing on EVERY foreign load is told apart from one refusing sometimes",
+          {"refuses-foreign-always", "refuses-foreign-sometimes"} <= verdicts, True)
+    check("only comparable sites enter the site-level count",
+          ac_e["site_level"]["sites_comparable"],
+          sum(1 for v in pol.values() if v["verdict"] != "not-comparable"))
     ac_b = access_contrast(None, "ru-mobile")
     check("a half-scoped access contrast counts fewer loads than the straddling one",
           all(ac_e["per_load"][a]["attempted"] < ac_b["per_load"][a]["attempted"]
@@ -962,7 +1055,7 @@ def selftest():
     gate = render_gate_table("exploratory")
     check("the per-arm gate loss is published beside the numbers it conditions",
           (gate["nl-direct"]["pair-gate:refused"], gate["ru-mobile"]["ok_rate"]),
-          (1, 0.9))
+          (2, 0.9167))
     check("the other half's rows are excluded and counted, not silently dropped",
           exc_e["wrong-half"] > 0, True)
     cov = coverage("exploratory")
@@ -982,7 +1075,7 @@ def selftest():
 
     # ── THE TEST ── within pairs, and shown both to fire and NOT to fire.
     perm = paired_permutation(ke, "ru-mobile", seed=1, n=2000) or {}
-    check("the permutation uses every complete pair of its half", perm.get("pairs_used"), 8)
+    check("the permutation uses every complete pair of its half", perm.get("pairs_used"), 9)
     check("a one-sided effect gives a small p", perm.get("p", 1) < 0.05, True)
     check("the p is floor-censored at 1/(n+1), never 0", perm.get("p", 0) >= 1 / 2001, True)
     # Nothing else distinguishes a within-pair permutation from a global reshuffle on a
