@@ -46,6 +46,12 @@ SPLIT_SALT = "adint-split-2026-08-21|"
 SEED = 20260821
 PERMUTATIONS = 100_000
 PRICED_OUTCOMES = ("priced",)
+# "We could not read the response" is not "the bidder did not price it". These outcomes
+# mean the body never became a readable auction answer — measured on the exploratory half
+# they are 43-46 % of every arm's rows, and they were sitting in the denominator of the
+# priced-rate contrast being scored as not-priced. A price can only be OBSERVED on a
+# response we could parse, so the denominator is the responses we could parse.
+UNKNOWN_OUTCOMES = ("binary", "unread", "unparsed", "no-answer", "redirect", "error")
 
 
 def doc_hash(path=None):
@@ -325,10 +331,16 @@ def coverage(half=None):
     keep, exc, pairs = analysis_set(half)
     by_arm = {}
     for arm, r in keep:
-        d = by_arm.setdefault(arm, {"entries": 0, "priced": 0})
+        d = by_arm.setdefault(arm, {"entries": 0, "priced": 0, "classifiable": 0,
+                                    "unreadable": 0})
         d["entries"] += 1
         if r.get("outcome") in PRICED_OUTCOMES:
             d["priced"] += 1
+            d["classifiable"] += 1
+        elif r.get("outcome") in UNKNOWN_OUTCOMES:
+            d["unreadable"] += 1
+        else:
+            d["classifiable"] += 1
     return {"arms": by_arm, "exclusions": exc, "pairs_all_halves": len(pairs),
             "priced_total": sum(d["priced"] for d in by_arm.values()),
             "render_gate": render_gate_table(half)}
@@ -613,10 +625,28 @@ def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
             "different weeks under different exits, and no single p over that mixture "
             "answers a question anyone asked.")
     if ru in arms:
+        # The caveats live in a SIBLING key, not inside `fisher_one_sided`. Putting them
+        # in there turned the arm map into {DENOMINATOR, UNIT_WARNING, nl-direct, us-exit}
+        # and the "every foreign arm gets its own 2x2, none is dropped" gate went red — a
+        # gate doing exactly its job, since anything iterating that map for arms would
+        # then have found two arms that are not arms.
+        out["fisher_one_sided_CAVEAT"] = {
+            "UNIT_WARNING": (
+                "DESCRIPTIVE ONLY — do not quote this p. The unit is the ad REQUEST, and "
+                "requests are not independent draws: thousands of them come from tens of "
+                "page loads, within cells, within browser generations. This is the same "
+                "inflation that made the per-load access figures look decisive. The "
+                "quotable statistic for the price contrast is `paired_permutation`, whose "
+                "unit is the PAIR — one site, one moment, both arms."),
+            "DENOMINATOR": (
+                "classifiable responses (priced + a real no-bid), NOT all entries. A body "
+                "we could not read is not a bidder declining to price; those outcomes are "
+                "43-46 % of every arm's rows and are counted separately as `unreadable`."),
+        }
         out["fisher_one_sided"] = {}
-        a, b = arms[ru]["priced"], arms[ru]["entries"] - arms[ru]["priced"]
+        a, b = arms[ru]["priced"], arms[ru]["classifiable"] - arms[ru]["priced"]
         for f in others:
-            c, d = arms[f]["priced"], arms[f]["entries"] - arms[f]["priced"]
+            c, d = arms[f]["priced"], arms[f]["classifiable"] - arms[f]["priced"]
             out["fisher_one_sided"][f] = {"table": [a, b, c, d],
                                           "p": fisher_one_sided(a, b, c, d)}
     return out
@@ -791,6 +821,13 @@ def selftest():
                 rows[arm].append(load(f"{run}-p{i}", arm, 200, True))
                 rows[arm].append(req(f"{run}-p{i}", arm,
                                      "priced" if arm == "ru-mobile" else "no-bid"))
+        # Bodies that never became a readable auction answer. Without these the fixture
+        # had NO unreadable rows at all, so the classifiable/unreadable split was a
+        # partition of one part — it passed while asserting nothing, and the gate that
+        # demands a real share of each is what exposed it.
+        for arm in rows:
+            for _ in range(2):
+                rows[arm].append(req(f"{run}-p1", arm, "binary"))
         # One pair per cell whose RU arm could not prove its vantage.
         rows["ru-mobile"].append(load(f"{run}-p9", "ru-mobile", 200, False))
         rows["ru-mobile"].append(req(f"{run}-p9", "ru-mobile", "no-bid"))
@@ -811,7 +848,7 @@ def selftest():
 
     ke, exc_e, _ = analysis_set("exploratory")
     kh, exc_h, _ = analysis_set("holdout")
-    check("each half sees only its own cells", (len(ke), len(kh)), (16, 16))
+    check("each half sees only its own cells", (len(ke), len(kh)), (20, 20))
     check("an unproven arm's rows are EXCLUDED, never counted as no-bid",
           exc_e["vantage-unproven"], 2)
     # A STATUS IS NOT A PAGE. Assert the exclusion by its own name AND assert the served
@@ -884,6 +921,23 @@ def selftest():
           (0, 4))
     check("...and it reports a p for that direction too, so the test is two-way",
           nl.get("p_one_sided_exact"), 1.0)
+
+    # THE DENOMINATOR IS THE RESPONSES WE COULD READ. Every row is either classifiable or
+    # unreadable and never both, and the 2x2 must be built from the former — a body that
+    # never became a readable auction answer is not a bidder declining to price it.
+    cx = coverage("exploratory")["arms"]
+    check("classifiable and unreadable partition the entries exactly",
+          all(v["classifiable"] + v["unreadable"] == v["entries"] for v in cx.values()),
+          True)
+    check("...and unreadable is a real share, not an empty bucket dressed as a partition",
+          all(v["unreadable"] > 0 for v in cx.values()), True)
+    rr = _report(analysis_set("exploratory")[0], coverage("exploratory"), "ru-mobile", 1,
+                 200, half="exploratory")
+    tbl = rr["fisher_one_sided"]["nl-direct"]["table"]
+    check("the 2x2 is built from classifiable responses, not from every entry",
+          tbl[0] + tbl[1], cx["ru-mobile"]["classifiable"])
+    check("the price contrast ships the caveat that its unit is the REQUEST",
+          "paired_permutation" in rr["fisher_one_sided_CAVEAT"]["UNIT_WARNING"], True)
 
     ac_e = access_contrast("exploratory", "ru-mobile")
     ac_b = access_contrast(None, "ru-mobile")

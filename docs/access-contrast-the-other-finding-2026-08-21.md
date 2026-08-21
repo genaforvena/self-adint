@@ -88,3 +88,44 @@ Recorded as the second entry in `ref/HOLDOUT-LEAKS.jsonl`. The holdout is still 
 and is now partially compromised on **both** contrasts. It was the access contrast that
 leak #1 had left clean; that is no longer true, and it is worth saying plainly rather than
 discovering later.
+
+---
+
+## Postscript: the same unit error was standing in the price contrast
+
+Correcting the access test made it obvious that the **price** contrast had the identical
+defect and nobody had said so. `fisher_one_sided` compares priced-rates with the ad
+**request** as its unit, and requests are not independent draws — thousands of them come
+from tens of page loads, inside cells, inside browser generations. It is the same
+inflation, in the headline result rather than the secondary one.
+
+The tool already carries the right test: `paired_permutation`, whose unit is the pair —
+one site, one moment, both arms. The Fisher tables are now labelled **descriptive only**,
+with the caveat naming the permutation as the quotable statistic, and a gate requires that
+caveat to be present.
+
+**And the denominator was wrong.** A row whose outcome is `binary`, `unread`, `unparsed`,
+`no-answer`, `redirect`, or `error` means *we never got a readable auction answer* — not
+*the bidder declined to price it*. Those are **43–46 %** of every arm's rows and they were
+sitting in the denominator being scored as not-priced. A price can only be observed on a
+response we could parse, so the denominator is now `classifiable` (priced + a real
+no-bid), with `unreadable` reported beside it.
+
+| arm | entries | unreadable | classifiable | priced |
+|---|---|---|---|---|
+| ru-mobile | 3797 | 1746 | 2051 | 11 |
+| nl-direct | 1518 | 650 | 868 | 0 |
+| us-exit | 2794 | 1276 | 1518 | 1 |
+
+The p barely moves (0.0246 → 0.0204 and 0.0131 → 0.0127) because the unreadable share is
+similar across arms — but a number that happens to be near-right for a reason nobody
+checked is not the same as a right number, and the arms were never guaranteed to be
+similar there.
+
+Two gates found their own bugs while being written. Putting the caveats *inside*
+`fisher_one_sided` turned the arm map into `{DENOMINATOR, UNIT_WARNING, nl-direct,
+us-exit}` and reddened the existing "every foreign arm gets its own 2×2" check — a gate
+doing exactly its job, since anything iterating that map for arms would have found two
+that are not arms. And the fixture contained **no unreadable rows at all**, so the
+classifiable/unreadable split was a partition of one part: it passed while asserting
+nothing, until a gate demanded a real share of each.
