@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""adint-loyalty-arms — is the "loyalty" label about the PERSON, or is it the default?
+
+Operator, 2026-08-21, asking to be checked rather than agreed with: he read a finding as
+"сайтам видно, насколько ты лоялен власти" and wants to know if he misread it.
+
+A label is not a verdict. `userLoyaltyGroups` / `Пользователь.Лояльность.Disloyal` is a
+SEGMENT NAME chosen by a publisher's analytics, and a name is evidence about the namer, not
+about the named. The only thing that can separate "this is about him" from "this is what
+everybody gets" is a CONTROL ARM — a profile that has no history at all. If the untouched
+profile carries the same label, the label is a default and the question is answered.
+
+THREE ARMS, ONE WINDOW, RUN BACK TO BACK — because a vantage measured on another day is
+not a comparison (two arms separated by a day differ in the day, and the day is the
+stronger effect).
+
+  ru-clean : brand-new profile, RU vantage       -> what does a visitor with NO history get?
+  ru-warm  : THE SAME profile, N more loads      -> does the label move when views accumulate?
+                                                    (the sibling key literally reads
+                                                    "Лояльность (просмотры за 30 дней)", so
+                                                    THIS is the mechanism the name claims)
+  us-clean : brand-new profile, other vantage    -> is the label a function of where you are?
+
+The arm this tool CANNOT run is the operator's own browser profile. It was never captured —
+the original finding was made on a throwaway profile — and a claim about his profile cannot
+be manufactured from ours. That gap is printed, not papered over.
+
+VANTAGE, NAMED. RU = netns `ruvantage`, default via the Note3 USB tether
+(192.168.42.129 dev enx*), MTS. The tool asserts BOTH legs before trusting the arm: the
+egress address AND the resolver, because a namespace can egress in one country while
+resolving in another, and then "RU vantage" is only half true.
+"""
+import argparse, json, os, re, subprocess, sys, time
+import urllib.parse as up
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CAPTURE = os.path.join(HERE, "adint-hb-capture")
+PY = sys.executable
+LOYALTY_EVENT = "userLoyaltyGroups"
+YMU_LOYALTY = "Лояльность"
+
+
+def arm_cmd(url, out, arm, settle, netns=None, profile_dir=None, ip_echo=None):
+    inner = [PY, CAPTURE, url, "--settle", str(settle), "--arm", arm, "--via", "direct",
+             "--out", out, "--echo-tries", "3"]
+    if profile_dir:
+        inner += ["--profile-dir", profile_dir]
+    if ip_echo:
+        inner += ["--ip-echo", ip_echo]
+    if netns:
+        return ["sudo", "ip", "netns", "exec", netns, "runuser", "-u",
+                os.environ.get("USER", "mesh-home"), "--", "env",
+                f"HOME={os.path.expanduser('~')}", f"PATH={os.environ.get('PATH','')}"] + inner
+    return inner
+
+
+def probe_vantage(netns=None):
+    """Both legs. An egress in one country and a resolver in another is half a vantage."""
+    def run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=40).stdout.strip()
+        except Exception:
+            return ""
+    pre = ["sudo", "ip", "netns", "exec", netns] if netns else []
+    ip = run(pre + ["curl", "-s", "--max-time", "25",
+                    "https://ipv4.internet.yandex.net/api/v0/ip"]).strip().strip('"')
+    res = run(pre + ["python3", "-c",
+                     "import socket;print(socket.gethostbyname('ngs.ru'))"]).strip()
+    ns = ""
+    if netns:
+        ns = run(["sudo", "ip", "netns", "exec", netns, "cat", "/etc/resolv.conf"])
+    else:
+        try:
+            ns = open("/etc/resolv.conf").read()
+        except Exception:
+            ns = ""
+    ns = ",".join(re.findall(r"nameserver\s+(\S+)", ns))
+    route = run(pre + ["ip", "route", "show", "default"])
+    return {"egress_ip": ip, "resolver": ns, "resolved_ngs_ru": res, "default_route": route}
+
+
+def extract_labels(path):
+    """Pull every loyalty-shaped signal out of a capture. ABSENT is its own answer."""
+    found = {"iportal_event": [], "ymu_keys": [], "requests": 0, "hosts": set()}
+    if not os.path.exists(path):
+        return found
+    for line in open(path, "r", errors="replace"):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("kind") != "request":
+            continue
+        found["requests"] += 1
+        u = d.get("req_url_full") or d.get("url") or ""
+        host = up.urlsplit(u).netloc
+        found["hosts"].add(host)
+        dec = up.unquote(u)
+        if LOYALTY_EVENT in dec:
+            q = dict(up.parse_qsl(up.urlsplit(u).query))
+            found["iportal_event"].append({
+                "host": host,
+                "eventName": q.get("eventName"),
+                "param1": q.get("param1"), "param2": q.get("param2"),
+                "param3": q.get("param3"), "param4": q.get("param4"),
+            })
+        if YMU_LOYALTY in dec and "site-info" in u:
+            q = dict(up.parse_qsl(up.urlsplit(u).query))
+            try:
+                j = json.loads(q.get("site-info") or "{}")
+            except Exception:
+                continue
+
+            def walk(o, p=""):
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        walk(v, p + "." + k if p else k)
+                elif isinstance(o, list):
+                    for i, x in enumerate(o):
+                        walk(x, "%s[%d]" % (p, i))
+                else:
+                    if YMU_LOYALTY in p:
+                        found["ymu_keys"].append({"host": host, "path": p, "value": o})
+            walk(j)
+    found["hosts"] = sorted(found["hosts"])
+    return found
+
+
+def summarise(label):
+    """One comparable token per arm. 'ABSENT' is a reading, not a missing reading."""
+    ev = {e.get("param3") for e in label["iportal_event"] if e.get("param3")}
+    ym = {k["path"].split(".")[-1] for k in label["ymu_keys"]}
+    return {"iportal_param3": sorted(ev) or ["ABSENT"],
+            "ymu_bucket": sorted(ym) or ["ABSENT"]}
+
+
+def selftest():
+    fails = []
+
+    def check(name, got, want):
+        ok = got == want
+        print("  %-4s %s" % ("ok" if ok else "FAIL", name))
+        if not ok:
+            print("        got %r want %r" % (got, want))
+            fails.append(name)
+
+    # The arms must differ in the THING, not in the label. A named arm is not a treatment.
+    ru = arm_cmd("https://ngs.ru/", "/tmp/o", "ru-clean", 20, netns="ruvantage")
+    us = arm_cmd("https://ngs.ru/", "/tmp/o", "us-clean", 20, netns=None)
+    check("the RU arm really enters the namespace", ru[:5],
+          ["sudo", "ip", "netns", "exec", "ruvantage"])
+    check("the other arm is NOT namespaced", "netns" in us, False)
+    check("naming an arm does not namespace it",
+          arm_cmd("https://ngs.ru/", "/tmp/o", "ru-clean", 20)[:1], [PY])
+    # The warm arm is only warm if it REUSES the directory.
+    w1 = arm_cmd("https://ngs.ru/", "/tmp/o", "ru-warm", 20, profile_dir="/tmp/p")
+    check("the warm arm reuses a profile directory", "--profile-dir" in w1 and "/tmp/p" in w1, True)
+    check("the clean arm carries no profile directory",
+          "--profile-dir" in arm_cmd("https://ngs.ru/", "/tmp/o", "ru-clean", 20), False)
+
+    # ABSENT must be distinguishable from a label. This is the whole point of the control.
+    import tempfile
+    ev = ("https://analytics.iportal.ru/v1/hits/event/?url=https://ngs.ru/&eventName=userLoyaltyGroups"
+          "&param1=%D0%9F%D0%BE%D0%BB%D1%8C%D0%B7%D0%BE%D0%B2%D0%B0%D1%82%D0%B5%D0%BB%D1%8C"
+          "&param2=%D0%9B%D0%BE%D1%8F%D0%BB%D1%8C%D0%BD%D0%BE%D1%81%D1%82%D1%8C&param3=Disloyal&param4=-1")
+    si = json.dumps({"__ymu": {"Пользователь": {"Лояльность (просмотры за 30 дней)": {"Новый": "1"}}}},
+                    ensure_ascii=False)
+    ymu = "https://mc.yandex.com/watch/1337757/1?page-url=x&site-info=" + up.quote(si)
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write(json.dumps({"kind": "request", "req_url_full": ev}) + "\n")
+        fh.write(json.dumps({"kind": "request", "req_url_full": ymu}) + "\n")
+        a = fh.name
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        fh.write(json.dumps({"kind": "request", "req_url_full": "https://ngs.ru/x.js"}) + "\n")
+        b = fh.name
+    la, lb = extract_labels(a), extract_labels(b)
+    check("the label is read off the wire, value and all",
+          la["iportal_event"][0]["param3"], "Disloyal")
+    check("the metrica key is read as a PATH, since the word is in the key",
+          la["ymu_keys"][0]["path"].endswith("Новый"), True)
+    check("and its value too", la["ymu_keys"][0]["value"], "1")
+    check("a capture with no label reads ABSENT, not Disloyal",
+          summarise(lb), {"iportal_param3": ["ABSENT"], "ymu_bucket": ["ABSENT"]})
+    check("a capture with the label does not read ABSENT",
+          summarise(la), {"iportal_param3": ["Disloyal"], "ymu_bucket": ["Новый"]})
+    os.unlink(a); os.unlink(b)
+    print("\n%s" % ("all gates green" if not fails else "RED: %s" % fails))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--site", default="https://ngs.ru/")
+    ap.add_argument("--warm-urls", default="https://ngs.ru/text/,https://ngs.ru/text/gorod/,"
+                                           "https://ngs.ru/text/economics/,https://ngs.ru/text/incidents/,"
+                                           "https://ngs.ru/text/transport/")
+    ap.add_argument("--netns", default="ruvantage")
+    ap.add_argument("--settle", type=int, default=25)
+    ap.add_argument("--out-prefix", default="data/loyalty-arms")
+    ap.add_argument("--ip-echo", default="https://ipv4.internet.yandex.net/api/v0/ip,https://api.ipify.org")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+
+    stamp = time.strftime("%Y-%m-%dT%H%MZ", time.gmtime())
+    prof = "/tmp/adint-loyalty-warm-%s" % stamp
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    vru, vus = probe_vantage(a.netns), probe_vantage(None)
+    print("window opened %s" % started)
+    print("  RU vantage : %s" % json.dumps(vru, ensure_ascii=False))
+    print("  other      : %s" % json.dumps(vus, ensure_ascii=False))
+    if not vru["egress_ip"]:
+        print("n/a: the RU vantage did not answer its echo — not running arms that cannot be named",
+              file=sys.stderr)
+        sys.exit(2)
+
+    arms = []
+    out_ru = "%s-%s.ru-clean.jsonl" % (a.out_prefix, stamp)
+    arms.append(("ru-clean", arm_cmd(a.site, out_ru, "ru-clean", a.settle,
+                                     netns=a.netns, ip_echo=a.ip_echo), out_ru))
+    for i, u in enumerate([a.site] + [x for x in a.warm_urls.split(",") if x], start=1):
+        o = "%s-%s.ru-warm%d.jsonl" % (a.out_prefix, stamp, i)
+        arms.append(("ru-warm%d" % i, arm_cmd(u, o, "ru-warm", a.settle, netns=a.netns,
+                                              profile_dir=prof, ip_echo=a.ip_echo), o))
+    out_us = "%s-%s.us-clean.jsonl" % (a.out_prefix, stamp)
+    arms.append(("us-clean", arm_cmd(a.site, out_us, "us-clean", a.settle, ip_echo=a.ip_echo), out_us))
+
+    results = []
+    for name, cmd, out in arms:
+        t0 = time.time()
+        rc = subprocess.run(cmd, capture_output=True, text=True).returncode
+        lab = extract_labels(out)
+        results.append((name, rc, out, lab, summarise(lab), round(time.time() - t0, 1)))
+        print("  %-10s rc=%s %5.1fs requests=%-4d %s"
+              % (name, rc, results[-1][5], lab["requests"],
+                 json.dumps(results[-1][4], ensure_ascii=False)))
+    closed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    print("\n== VERDICT ==")
+    clean = [r for r in results if r[0] == "ru-clean"]
+    warm = [r for r in results if r[0].startswith("ru-warm")]
+    us = [r for r in results if r[0] == "us-clean"]
+    if clean and clean[0][4]["iportal_param3"] != ["ABSENT"]:
+        print("A profile with NO history at all carries %s."
+              % clean[0][4]["iportal_param3"])
+        print("So the label is a DEFAULT for a first-time visitor, not a judgement of anyone.")
+    warmlab = sorted({v for r in warm for v in r[4]["iportal_param3"]})
+    print("after %d accumulated loads in ONE profile the label reads: %s" % (len(warm), warmlab))
+    if us:
+        print("from the other vantage, same window: %s" % json.dumps(us[0][4], ensure_ascii=False))
+    print("\nNOT MEASURED: the operator's own browser profile. It was never captured, and a")
+    print("claim about it cannot be made out of ours. That arm needs his own hands.")
+
+    man = "%s-%s.manifest.json" % (a.out_prefix, stamp)
+    with open(man, "w") as fh:
+        json.dump({"window_opened": started, "window_closed": closed,
+                   "site": a.site, "vantage_ru": vru, "vantage_other": vus,
+                   "arms": [{"arm": n, "rc": rc, "ledger": o, "summary": s,
+                             "iportal_event": l["iportal_event"], "ymu_keys": l["ymu_keys"],
+                             "n_requests": l["requests"], "seconds": sec}
+                            for n, rc, o, l, s, sec in results]},
+                  fh, indent=1, ensure_ascii=False)
+    print("\nmanifest -> %s" % man)
+
+
+if __name__ == "__main__":
+    main()
