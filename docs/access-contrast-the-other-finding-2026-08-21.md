@@ -26,25 +26,46 @@ independent foreign exits — different countries, different ASNs — are refuse
 domestic one; `iz.ru` refuses both intermittently (403), which is a different mechanism
 from a blanket geo-block and worth keeping distinct.
 
-## The p that looks decisive is the wrong unit
+## The p that looks decisive is the wrong unit — twice over
 
 Per load, one-sided Fisher gives 1.4 × 10⁻⁴ against nl-direct and 7.3 × 10⁻⁴ against
 us-exit. **Do not quote those.** The same fourteen sites are drawn again every replicate,
-within a cell and often within one browser generation; the loads are not independent
-draws, and a test over them treats correlated repetition as fresh evidence. It will look
-decisive no matter what.
+within a cell and often within one browser generation; a test over them treats correlated
+repetition as fresh evidence and will look decisive no matter what.
 
-The unit the design supports is the **site**. Concordant sites carry no information about
-the contrast, so this is a sign test over discordant ones:
+The first attempt to fix that was **also wrong, and worse** — it asked, per site, *has this
+site ever refused a foreign arm*, and ran a sign test over the sites that differed. That is
+not a test. **"Ever refused" latches:** one transient 4xx converts a site to discordant
+permanently, so k can only rise as loads accumulate and p = 2⁻ᵏ can only fall. A statistic
+that moves one direction with more data reaches any threshold by waiting. On this corpus it
+went 2 → 2 → 2 → 2 → 3 → 3 → 4 across seven cells and would have kept going whether or not
+the effect were real. It also made the *frame* look like the binding constraint — fourteen
+sites, floor p = 2⁻¹⁴ — which was an artefact of the wrong unit.
 
-- 14 sites, **4 discordant**, all 4 refusing the foreign class only, 0 refusing domestic only
-- one-sided exact p = 2⁻⁴ = **0.0625**
+The unit that works is **(cell, site)**, compared with McNemar. A cell is an independent
+browser generation, and the domestic-only count `c` can rise, so the p is free to move both
+ways. And **each foreign arm is compared alone**: pooling them asks whether the foreign
+*class* was refused, which is an OR over two arms against the domestic arm's one — two
+chances versus one, biased toward the finding.
 
-Not significant, and total-looking asymmetry cannot rescue it: with four discordant sites
-0.0625 is the smallest p the test can produce. The pattern is clean, it is consistent
-across two unrelated exits, and it is **unconfirmed**. Both figures are published together
-with the inflation named, because reporting only the site level would hide how the count
-was reached, and reporting only the load level would be a lie about the evidence.
+| contrast | units | concordant | foreign-only | domestic-only | one-sided exact p |
+|---|---|---|---|---|---|
+| nl-direct vs ru-mobile | 20 | 17 | 3 | 0 | **0.125** |
+| us-exit vs ru-mobile | 42 | 38 | 4 | 0 | **0.0625** |
+
+Neither is significant. Pooling the two foreign arms would have given 7 discordant units and
+p = 0.0078 — three-quarters of that was the two-chances-versus-one asymmetry.
+
+So the honest state of the access finding: the pattern is clean, consistent across two
+unrelated exits, and **unconfirmed**. What it needs is more *cells*, not a wider frame —
+the corrected unit accrues twelve times a day, and each additional one-sided discordant unit
+halves the p.
+
+A note on how the corrected test was found: writing the McNemar p as a `min(b, c)` tail — the
+smaller of the two — would have reported **p = 0.0625 for a corpus in which the DOMESTIC arm
+was the refused one**, reading as confirmation of the opposite claim. The gate that catches
+it feeds the test exactly that inverted corpus and requires the discordance to land on the
+domestic side. It was written before the bug and it caught it.
 
 ## And a second holdout leak, from the fix for the first
 

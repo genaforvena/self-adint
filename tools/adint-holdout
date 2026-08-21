@@ -502,48 +502,78 @@ def access_contrast(half, domestic):
     by_arm = {a: {"attempted": tot[a], "refused": ref.get(a, 0),
                   "rate": round(ref.get(a, 0) / tot[a], 4)} for a in tot}
 
-    # THE SITE-LEVEL TEST. A site is discordant when it refuses one class of vantage and
-    # serves the other; concordant sites carry no information about the contrast, exactly
-    # as in McNemar. With every discordant site falling the same way the one-sided exact
-    # p is 2**-k, and with k this small that is a number worth being sober about.
-    dom, k_foreign, k_domestic, disc = None, 0, 0, []
-    for site, arms in per_site.items():
-        f_ref = any(v["refused"] for a, v in arms.items() if a != domestic)
-        d_ref = any(v["refused"] for a, v in arms.items() if a == domestic)
-        if f_ref and not d_ref:
-            k_foreign += 1
-            disc.append({"site": site, "refused": "foreign-only"})
-        elif d_ref and not f_ref:
-            k_domestic += 1
-            disc.append({"site": site, "refused": "domestic-only"})
-    k = k_foreign + k_domestic
-    if k:
-        lo = min(k_foreign, k_domestic)
-        p_site = sum(math.comb(k, i) for i in range(lo + 1)) / (2 ** k)
-    else:
-        p_site = None
+    # THE UNIT IS (CELL, SITE, FOREIGN-ARM), AND BOTH HALVES OF THAT MATTER.
+    #
+    # The first cut of this test asked, per SITE, "has this site ever refused a foreign
+    # arm, and has it ever refused the domestic one" and ran a sign test over the sites
+    # that differed. It looked principled and it is not a test at all: "ever refused"
+    # LATCHES. One transient 4xx converts a site to discordant permanently, k can only
+    # rise as loads accumulate, and p = 2**-k can only fall. A statistic that moves one
+    # direction with more data reaches any threshold by waiting. Measured on this corpus
+    # it went 2 -> 2 -> 2 -> 2 -> 3 -> 3 -> 4 across seven cells, and it would have kept
+    # going whether or not the effect were real. It also made the frame look like the
+    # binding constraint (14 sites, floor p = 2**-14), which was an artifact of the wrong
+    # unit — the cells are the constraint, and there are twelve of those a day.
+    #
+    # A CELL is an independent browser generation, so (cell, site) is a fair unit, and
+    # McNemar over discordant units is a real test: the domestic-only cell `c` CAN rise,
+    # so the p is free to move both ways.
+    #
+    # AND EACH FOREIGN ARM IS COMPARED ALONE. Pooling them and asking "was the foreign
+    # CLASS refused" is an OR over two arms against the domestic arm's one — two chances
+    # versus one, biased toward the finding. Measured: pooled gives 7 discordant units and
+    # p = 0.0078; split, it is 3 (p = 0.125) and 4 (p = 0.0625), neither significant. The
+    # pooled number was three-quarters artefact of the asymmetry.
+    units = {}
+    for base, arm, r in cell_rows(half):
+        if r.get("kind") != "load" or not r.get("pair_id"):
+            continue
+        v = render_verdict(r)
+        if v not in (GATE_OK, GATE_REFUSED):
+            continue
+        d = units.setdefault((run_of(base), _site(r)), {}).setdefault(arm, [0, 0])
+        d[0] += 1
+        d[1] += 1 if v == GATE_REFUSED else 0
+
+    per_arm_test = {}
+    for foreign in sorted({a for arms in units.values() for a in arms} - {domestic}):
+        b = c = conc = tot = 0
+        for arms in units.values():
+            if foreign not in arms or domestic not in arms:
+                continue
+            tot += 1
+            f_ref, d_ref = arms[foreign][1] > 0, arms[domestic][1] > 0
+            if f_ref and not d_ref:
+                b += 1
+            elif d_ref and not f_ref:
+                c += 1
+            else:
+                conc += 1
+        k = b + c
+        # ONE-SIDED IN THE STATED DIRECTION: P(X >= b) under Binomial(k, 1/2), the
+        # probability of seeing this many foreign-only refusals or more if the vantage
+        # made no difference. Writing `min(b, c)` here — as the first cut did — takes
+        # whichever tail is smaller, so a corpus in which the DOMESTIC arm was the refused
+        # one would report p = 0.0625 and read as a confirmation of the opposite claim.
+        # The gate that caught it hands the test exactly that corpus.
+        p_exact = (sum(math.comb(k, i) for i in range(b, k + 1)) / (2 ** k)
+                   if k else None)
+        per_arm_test[foreign] = {
+            "units": tot, "concordant": conc,
+            "foreign_only_refused": b, "domestic_only_refused": c,
+            "p_one_sided_exact": p_exact,
+        }
 
     return {
         "UNIT_WARNING": (
-            "The per-load figures below treat repeated draws of the same fourteen sites, "
-            "within a cell and often within one browser generation, as independent. They "
-            "are not. Quote the site level."),
+            "The per-load figures below treat repeated draws of the same sites, within a "
+            "cell and often within one browser generation, as independent. They are not. "
+            "Quote `cell_site_mcnemar`, whose unit is (cell, site) and which compares "
+            "each foreign arm ALONE against the domestic one."),
         "per_load": by_arm,
         "per_site": per_site,
-        "site_level": {
-            "sites": len(per_site),
-            "discordant": k,
-            "foreign_refused_only": k_foreign,
-            "domestic_refused_only": k_domestic,
-            "discordant_sites": sorted(disc, key=lambda x: x["site"]),
-            "p_one_sided_exact": p_site,
-            "note": ("Sign test over discordant sites; concordant sites carry no "
-                     "information about the contrast. p = 2**-k when all k fall one way, "
-                     "so a handful of sites cannot reach a small p however total the "
-                     "asymmetry looks."),
-        },
+        "cell_site_mcnemar": per_arm_test,
     }
-
 
 def _report(keep, cov, ru, seed, n, half=_MUST_SAY):
     if half is _MUST_SAY:
@@ -827,6 +857,34 @@ def selftest():
     except TypeError as e:
         check("_report() with no half REFUSES, so the accessor's strictness survives its "
               "callers", "explicit half" in str(e), True)
+    # THE ACCESS TEST MUST BE ABLE TO MOVE BOTH WAYS. Its predecessor asked "has this site
+    # EVER refused a foreign arm" — a latching indicator, monotone in n, so its p could
+    # only fall with more data and any threshold was reachable by waiting. Assert the live
+    # test is not that: hand it a corpus where the DOMESTIC arm is the refused one and
+    # require the discordance to land on the domestic side.
+    inv = []
+    for cell in ("c0", "c1"):
+        for site in ("s1", "s2"):
+            inv.append((cell, site, "ru-mobile", 403))
+            inv.append((cell, site, "nl-direct", 200))
+    saved_rows = cell_rows
+    def _fake(half=None, include_private=True):
+        return [(f"hb-paired-{c}", a, {"kind": "load", "pair_id": f"{c}-{si}",
+                                       "site": si, "http_status": st,
+                                       "vantage_verified": True})
+                for c, si, a, st in inv]
+    globals()["cell_rows"] = _fake
+    try:
+        flipped = access_contrast("exploratory", "ru-mobile")["cell_site_mcnemar"]
+    finally:
+        globals()["cell_rows"] = saved_rows
+    nl = flipped.get("nl-direct", {})
+    check("the access test is not a latch — a domestic-refused corpus lands on the "
+          "domestic side", (nl.get("foreign_only_refused"), nl.get("domestic_only_refused")),
+          (0, 4))
+    check("...and it reports a p for that direction too, so the test is two-way",
+          nl.get("p_one_sided_exact"), 1.0)
+
     ac_e = access_contrast("exploratory", "ru-mobile")
     ac_b = access_contrast(None, "ru-mobile")
     check("a half-scoped access contrast counts fewer loads than the straddling one",
