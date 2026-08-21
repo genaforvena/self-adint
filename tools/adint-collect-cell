@@ -240,6 +240,28 @@ def main():
                corpus_bytes=after)
         return 0
 
+    # A HALF-EMPTY CELL IS NOT A COLLECTED CELL. The gate above catches only a cell that
+    # produced NOTHING; a cell whose foreign arm produced 1 load against the domestic arm's
+    # 28 sails through it as `collected`, and `arms_alive` lists both because one load is
+    # not zero. Measured live 2026-08-21: cell 2026082112 lost 23 consecutive nl-direct
+    # loads to vantage-unproven between 12:01 and 12:47 and would have recorded green.
+    #
+    # A PAIR NEEDS BOTH ARMS, so a cell is worth exactly min(loads) pairs however large the
+    # other arm is. That ratio is the classification rather than a threshold picked to
+    # taste: below one half, most of what the cell attempted has no partner and can enter
+    # no contrast. `arms_alive` keeps its old meaning — produced anything at all — and
+    # `pairs_possible` is the number that matters, published beside it so the two cannot be
+    # confused again.
+    lo, hi, starved = pair_yield(loads)
+    if starved:
+        record("partial", f"arm {'/'.join(starved)} produced {lo} load(s) against {hi} — a "
+                          f"pair needs both arms, so this cell is worth at most {lo} pair(s) "
+                          f"and most of what it attempted has no partner",
+               rc=rc, loads=loads, pairs_possible=lo, starved_arms=starved,
+               elapsed_s=round(time.time() - t0, 1), corpus_bytes=after)
+        # NOT a return: the rows that DID land are real and still get published. This
+        # record is about how to READ the cell, not about withholding it.
+
     published = []
     for key in ("ru", "nl"):
         if key in files:
@@ -256,11 +278,28 @@ def main():
                    cwd=REPO, capture_output=True, timeout=600)
 
     record("collected", f"cell captured and published (rc={rc})", rc=rc,
+           pairs_possible=min(loads.values()) if loads else 0,
            arms_alive=sorted(k for k, v in loads.items() if v),
            loads=loads, published=published,
            elapsed_s=round(time.time() - t0, 1), corpus_bytes=after,
            files={k: os.path.basename(v) for k, v in files.items()})
     return 0
+
+
+def pair_yield(loads):
+    """(min, max, starved_arms) — the pair arithmetic, as a function so it can be tested.
+
+    A pair needs BOTH arms, so a cell is worth exactly `min(loads)` pairs however large the
+    other arm is. `starved` is empty unless the smaller arm fell below half the larger, at
+    which point most of what the cell attempted has no partner and the cell must not be
+    recorded with the same word as a balanced one.
+    """
+    if not loads or not any(loads.values()):
+        return 0, 0, []
+    lo, hi = min(loads.values()), max(loads.values())
+    if hi and lo < 0.5 * hi:
+        return lo, hi, sorted(k for k, v in loads.items() if v == lo)
+    return lo, hi, []
 
 
 def selftest():
@@ -320,6 +359,43 @@ def selftest():
     # matched its own text and could never fail. Assert the BEHAVIOUR: start a real
     # process whose argv looks like a running cell, and see the guard find it and then
     # stop finding it.
+    # A LIVE CELL IS NOT A TEST FAILURE. Every guard check in this section needs an empty
+    # process table to start from, and this tool's whole job is to run cells — so for
+    # roughly half of every two-hour cadence a real cell IS running and these checks go red
+    # on a tool that is working perfectly. `mesh-doctor` drives every `--test` hourly, so
+    # that is a permanently flapping red, and a red everyone learns to ignore is worse than
+    # no gate at all. Honest n/a instead: the suite exits 2 (which `mesh-land` treats as a
+    # pass) and SAYS the guard was not exercised. Never a silent pass — that would be the
+    # vacuity this file is otherwise careful about.
+    # THE PAIR ARITHMETIC, driven rather than described.
+    check("a balanced cell is not starved", pair_yield({"ru": 28, "nl": 28}), (28, 28, []))
+    check("28 against 1 IS starved, and the starved arm is named",
+          pair_yield({"ru": 28, "nl": 1}), (1, 28, ["nl"]))
+    check("28 against 26 is not — a pair needs both arms, not equal arms",
+          pair_yield({"ru": 28, "nl": 26}), (26, 28, []))
+    check("exactly half is not starved; below half is",
+          (pair_yield({"ru": 28, "nl": 14})[2], pair_yield({"ru": 28, "nl": 13})[2]),
+          ([], ["nl"]))
+    check("an empty cell yields no pairs and names no starved arm (the empty gate owns it)",
+          pair_yield({"ru": 0, "nl": 0}), (0, 0, []))
+    check("the cell is worth min(loads) pairs, never the larger arm",
+          pair_yield({"ru": 28, "nl": 3})[0], 3)
+
+    _live = running_pid()
+    if _live and _live != PROBE_FAILED:
+        print(f"n/a  single-writer guard NOT exercised — a real cell is running (pid "
+              f"{_live}) and these checks need an empty process table. Re-run between "
+              f"cells. This is not a pass.")
+        DATA, LOG, REPO = keep          # never leave the globals pointing at the fixture
+        # AN N/A MUST NOT SWALLOW A RED. If anything above this point already failed, the
+        # suite failed — the unexercised guard does not make those failures inapplicable.
+        # Caught by breaking pair_yield while a cell was in flight: two checks went FAIL
+        # and the summary still said n/a and returned 2, which mesh-land reads as a pass.
+        if not ok:
+            print("selftest: FAIL (and the single-writer guard was not exercised)")
+            return 1
+        print("selftest: n/a (single-writer guard unexercised — a cell is in flight)")
+        return 2
     check("no cell running is reported as none", running_pid(), None)
     fake = subprocess.Popen(["/bin/bash", "-c",
                              "exec -a 'python3 tools/adint-paired-run --frame f' sleep 30"])
