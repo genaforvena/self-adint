@@ -176,6 +176,17 @@ def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tr
     # and not in the treatment.
     if nav_tries:
         inner += ["--nav-tries", str(nav_tries)]
+    return in_vantage(inner, netns)
+
+
+def in_vantage(inner, netns):
+    """Wrap a command so it runs in the arm's vantage. ONE wrapper, every launcher.
+
+    The load and the vantage PREFLIGHT below must be wrapped by the same code: a probe that
+    runs in a different namespace than the arm it speaks for measures a vantage nobody
+    loads from, which is a more convincing version of the failure the preflight exists to
+    catch.
+    """
     if netns:
         # runuser drops back to the user INSIDE the namespace; HOME is passed explicitly
         # because `sudo ip netns exec` does not carry it and playwright's browser path is
@@ -185,6 +196,20 @@ def arm_cmd(arm, url, out, window, nav_timeout, pair_prefix, netns=None, echo_tr
                 "--", "env", f"HOME={os.path.expanduser('~')}",
                 f"PATH={os.environ.get('PATH','')}"] + inner
     return inner
+
+
+def probe_cmd(arm, netns=None, echo_tries=None, ip_echo=None):
+    """Ask ONE arm, in its own vantage, where it actually leaves from.
+
+    Same binary, same `--via direct`, same echo host and same echo budget as the arm's real
+    loads — and the same namespace wrapper — so the answer is about the arm and not about
+    how the question was asked.
+    """
+    inner = [PY, CAPTURE, "--vantage-only", "--arm", arm, "--via", "direct",
+             "--echo-tries", str(echo_tries if echo_tries else 1)]
+    if ip_echo:
+        inner += ["--ip-echo", ip_echo]
+    return in_vantage(inner, netns)
 
 
 def control_cmd(url, netns, max_time, ua):
@@ -249,6 +274,118 @@ def run_control(url, netns, max_time, ua, ua_from_browser):
             pass
         rec["remote_ip"] = out[2] or None
     return rec
+
+
+def load_capture_module():
+    """Import tools/adint-hb-capture as a module, so the verdict has ONE implementation.
+
+    The alternative — re-deciding `did these two arms collapse` here — is how this path came
+    to have no guard while the capture had a good one.
+    """
+    import importlib.machinery as m, importlib.util as u
+    loader = m.SourceFileLoader("adint_hb_capture", CAPTURE)
+    spec = u.spec_from_loader("adint_hb_capture", loader)
+    mod = u.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def read_vantage(cmd, timeout=180):
+    """Run one --vantage-only probe and return its json dict, or a dict that SAYS why not.
+
+    Never returns a bare address on a failed read: `exit` stays None, and the reason
+    travels with it, because two arms whose probes both died must not read as two arms that
+    agree.
+    """
+    try:
+        pr = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"exit": None, "probe": f"timeout after {timeout}s"}
+    out = (pr.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+    for line in reversed(out):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict) and "exit" in rec:
+            rec["probe_rc"] = pr.returncode
+            return rec
+    return {"exit": None, "probe": f"rc={pr.returncode}, no vantage line on stdout",
+            "stderr": (pr.stderr or b"").decode("utf-8", "replace")[-300:]}
+
+
+# The corpus this fixes recorded an exit IP and NO country and NO ASN, so the country of the
+# foreign arm for 74% of the cells is not recoverable from the corpus at all — only
+# re-derivable from a geolocation service TODAY, against an address whose answer moves. Two
+# services disagreed about 38.49.216.141 within one minute on 2026-08-29 (ifconfig.co: US ·
+# ipwho.is: CA/Rica Web Services), which is the whole reason this is stamped WITH ITS
+# PROVENANCE and its timestamp rather than recorded as a fact about the address.
+GEO_SERVICE = "https://ipwho.is/"
+
+
+def geo_of(ip, timeout=15):
+    """Country + ASN for an exit, or an explicit unknown. Never a guess, never a default."""
+    if not ip:
+        return {"geo": "unknown: no exit to geolocate"}
+    try:
+        pr = subprocess.run(["curl", "-s", "--max-time", str(timeout), f"{GEO_SERVICE}{ip}"],
+                            capture_output=True, timeout=timeout + 5)
+        d = json.loads((pr.stdout or b"").decode("utf-8", "replace"))
+        if not d.get("success"):
+            return {"geo": f"unknown: {GEO_SERVICE} refused ({d.get('message') or d})"}
+        conn = d.get("connection") or {}
+        return {"country": d.get("country_code"), "country_name": d.get("country"),
+                "asn": conn.get("asn"), "as_org": conn.get("org"),
+                "geo_service": GEO_SERVICE,
+                "geo_asof": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        return {"geo": f"unknown: {type(e).__name__}"}
+
+
+def vantage_preflight(arms, say, run_id, vpath, echo_tries=None, ip_echo=None,
+                      probe=None, geo=None):
+    """Ask each arm where it ACTUALLY leaves from, compare the answers, refuse if they agree.
+
+    `probe` and `geo` are injectable ONLY so the pass path can be driven: a guard whose
+    refusals are tested and whose acceptance is not is a guard that might refuse forever,
+    and nobody would find out until a cell that should have run did not. The defaults are
+    the real ones.
+
+    Returns the capture's own return code: 0 proceed · 1 arms-collapsed · 2 vantage-unproven.
+    """
+    probe = probe or (lambda a, ns: read_vantage(probe_cmd(a, netns=ns,
+                                                           echo_tries=echo_tries,
+                                                           ip_echo=ip_echo)))
+    geo = geo or geo_of
+    vantages = {}
+    for a, ns in arms:
+        rec = dict(probe(a, ns))
+        rec.update(geo(rec.get("exit")))
+        rec["netns"] = ns or "root"
+        vantages[a] = rec
+        say(f"vantage {a}: exit={rec.get('exit')} netns={rec['netns']} "
+            + (f"country={rec.get('country')} asn={rec.get('asn')} ({rec.get('as_org')}) "
+               f"per {rec.get('geo_service')} at {rec.get('geo_asof')}"
+               if rec.get("country") else f"{rec.get('geo', 'geo unknown')}")
+            + (f" — probe: {rec['probe']}" if rec.get("probe") else ""))
+    rc_v, msg_v = load_capture_module().vantage_collapse(
+        {a: v.get("exit") for a, v in vantages.items()})
+    # Written whatever the verdict, including the refusals: a run that did not happen because
+    # its arms had collapsed is a MEASUREMENT of the vantage, and the corpus that preceded
+    # this has no record of any such thing — which is why nobody noticed the foreign arm
+    # changing country twice.
+    with open(vpath, "w", encoding="utf-8") as vf:
+        json.dump({"run": run_id, "ts": datetime.now(timezone.utc).isoformat(),
+                   "verdict_rc": rc_v, "verdict": msg_v,
+                   "verdict_from": "adint-hb-capture:vantage_collapse",
+                   "arms": vantages}, vf, ensure_ascii=False, indent=1)
+    say(f"{msg_v} · vantage out={os.path.basename(vpath)}")
+    if rc_v != 0:
+        # rc1 collapsed, rc2 unproven — the capture's own words for the same two facts, so a
+        # refused pair reads the same whichever path refused it.
+        say(f"REFUSING the run: {rc_cause(rc_v)}. No cell is worth more than the claim that "
+            f"its two arms were two vantages.")
+    return rc_v
 
 
 def main():
@@ -359,6 +496,25 @@ def main():
     # The order is written BEFORE the run, so "both arms got the same list" is checkable
     # from the artifact instead of being a property of this process's memory.
     say("order=" + ",".join(order))
+
+    # ── THE CROSS-ARM VANTAGE PREFLIGHT ────────────────────────────────────────────────
+    # Each arm is a separate capture process and each only ever proved that IT could read
+    # SOME echo; nothing compared the two answers, so the two arms could leave from the same
+    # exit with only their LABELS differing and every row would still carry
+    # vantage_verified=True — that field is browser-vs-parent self-consistency, never a check
+    # that the vantage is the one the arm's NAME claims. Measured 2026-08-28: the host
+    # default route, which IS the `nl-direct` arm's definition, reads MTS Russia — the same
+    # carrier the RU arm tethers through.
+    #
+    # Asked ONCE per run, before the cell is spent, from inside each arm's own namespace and
+    # with the arm's own echo host and budget. Sequential on purpose: this is not a paired
+    # measurement and it must not contend with itself on the tether.
+    rc_v = vantage_preflight([(args.nl_arm, None), (args.ru_arm, args.ru_netns)],
+                             say, run_id, f"{prefix}.vantage.json",
+                             echo_tries=args.echo_tries, ip_echo=args.ip_echo)
+    if rc_v != 0:
+        log.close()
+        return rc_v
 
     skews = []
     attempts = []
@@ -584,6 +740,164 @@ def selftest():
           ru[ru.index("--settle") + 1] == nl[nl.index("--settle") + 1] == "45", True)
     check("the arms are labelled apart",
           (ru[ru.index("--arm") + 1], nl[nl.index("--arm") + 1]), ("ru-mobile", "nl-direct"))
+    # ── THE CROSS-ARM VANTAGE PREFLIGHT ──
+    # The guard this path never had. Each arm proved only that IT read some echo; these
+    # assert that the two answers are compared, that the comparison is asked from inside
+    # each arm's OWN vantage, and that a blind probe can never read as agreement.
+    pru = probe_cmd("ru-mobile", netns="ruvantage", echo_tries=3, ip_echo="https://e/")
+    pnl = probe_cmd("nl-direct", netns=None, echo_tries=3, ip_echo="https://e/")
+    check("the RU probe runs inside the same namespace the RU arm loads from",
+          pru[:5], ["sudo", "ip", "netns", "exec", "ruvantage"])
+    check("the NL probe is not namespaced, like the NL arm", "netns" in pnl, False)
+    check("the probe wrapper IS the arm's wrapper, not a second copy of it",
+          pru[:len(pru) - len(pnl)], ru[:len(ru) - len(nl)])
+    def positionals(cmd):
+        """Every token in a capture command that is not a flag or a flag's value.
+
+        The arm has exactly one (the url it loads); the probe must have none — a probe that
+        loaded a page would be a load nobody counted, taken before the run it gates.
+        """
+        rest, found, i = cmd[cmd.index(CAPTURE) + 1:], [], 0
+        while i < len(rest):
+            t = rest[i]
+            if t.startswith("--"):
+                i += 1 if t == "--vantage-only" else 2
+            else:
+                found.append(t)
+                i += 1
+        return found
+    check("the probe asks the capture, and loads no url",
+          (pnl[1], "--vantage-only" in pnl, positionals(pnl)), (CAPTURE, True, []))
+    check("the ARM, by contrast, does load exactly one url — so that check can fail",
+          positionals(nl), ["https://x.ru/"])
+    check("the probe uses the arm's echo host and budget, so it measures the arm",
+          (pnl[pnl.index("--ip-echo") + 1], pnl[pnl.index("--echo-tries") + 1]),
+          ("https://e/", "3"))
+
+    # THE VERDICT ITSELF IS NOT DECIDED HERE. It is imported from the capture, so this path
+    # and the capture's own proxy/direct preflight cannot answer the same question two ways
+    # — the failure being fixed is precisely that the verdict existed in one file only.
+    try:
+        _vc = load_capture_module().vantage_collapse
+    except Exception as e:
+        ok = False
+        print(f"FAIL the capture's vantage_collapse could not be imported: {e}")
+        _vc = None
+    if _vc is not None:
+        check("two exits that differ are a pair",
+              _vc({"ru": "1.1.1.1", "nl": "2.2.2.2"})[0], 0)
+        check("two arms on ONE exit are refused as collapsed",
+              _vc({"ru": "5.227.27.235", "nl": "5.227.27.235"})[0], 1)
+        check("the collapse message names the exit both arms left from",
+              "5.227.27.235" in _vc({"ru": "5.227.27.235", "nl": "5.227.27.235"})[1], True)
+        check("an unread echo is UNKNOWN, never agreement",
+              _vc({"ru": None, "nl": None})[0], 2)
+        check("one blind arm is unproven even when the other answered",
+              _vc({"ru": None, "nl": "2.2.2.2"})[0], 2)
+        check("an empty exit string is unknown too, not a value that could match",
+              _vc({"ru": "", "nl": ""})[0], 2)
+        check("one arm cannot be distinct from anything", _vc({"nl": "2.2.2.2"})[0], 2)
+        check("the paired run's cause words are the capture's return codes",
+              (rc_cause(0), rc_cause(1), rc_cause(2)),
+              ("recorded", "arms-collapsed", "vantage-unproven"))
+
+    # ── THE PASS PATH, driven. ──
+    # A guard whose refusals are tested and whose acceptance is not can refuse forever and
+    # nobody finds out until a cell that should have run did not. Today this node HAS no
+    # second vantage (the exit node swallows the proxy leg and the ru tether is absent), so
+    # the two-distinct-exits world cannot be produced live here — it is driven through the
+    # injected probe instead, and the refusal legs beside it were driven live.
+    import tempfile as _tf
+    said = []
+
+    def _run(exits, geo=None):
+        del said[:]
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            vp = fh.name
+        rc = vantage_preflight([("nl-direct", None), ("ru-mobile", "ruvantage")],
+                               said.append, "run-x", vp,
+                               probe=lambda a, ns: {"exit": exits[a]},
+                               geo=geo or (lambda ip: {"country": "XX", "asn": 1,
+                                                       "as_org": "o", "geo_service": "s",
+                                                       "geo_asof": "t"}))
+        # A MISSING artifact must read as a failed check, never as a crashed suite: a red
+        # that comes from a traceback proves the mutant broke something, not that this arm
+        # was watching. Absent renders as an empty dict and the assertions below say so.
+        try:
+            art = json.load(open(vp))
+        except Exception as e:
+            art = {"arms": {"nl-direct": {}, "ru-mobile": {}},
+                   "verdict_rc": f"no artifact ({type(e).__name__})", "verdict_from": None}
+        return rc, art, vp
+
+    rc0, art0, _ = _run({"nl-direct": "2.2.2.2", "ru-mobile": "3.3.3.3"})
+    check("two real vantages PASS, and the run proceeds", rc0, 0)
+    check("the passing run still writes the vantage artifact", art0["verdict_rc"], 0)
+    check("the artifact records each arm's exit, so the corpus can be re-read later",
+          {a: v["exit"] for a, v in art0["arms"].items()},
+          {"nl-direct": "2.2.2.2", "ru-mobile": "3.3.3.3"})
+    check("the artifact records the country and ASN the old schema never had",
+          (art0["arms"]["ru-mobile"]["country"], art0["arms"]["ru-mobile"]["asn"]),
+          ("XX", 1))
+    check("and it records WHO said so and WHEN — two services disagreed about one of our "
+          "own exits within a minute on 2026-08-29",
+          ("geo_service" in art0["arms"]["ru-mobile"]
+           and "geo_asof" in art0["arms"]["ru-mobile"]), True)
+    check("the artifact names the namespace each answer came from",
+          art0["arms"]["ru-mobile"]["netns"], "ruvantage")
+    check("the verdict cites the ONE function that decided it",
+          art0["verdict_from"], "adint-hb-capture:vantage_collapse")
+
+    rc1, art1, _ = _run({"nl-direct": "5.5.5.5", "ru-mobile": "5.5.5.5"})
+    check("one exit under two labels is refused", rc1, 1)
+    check("a REFUSED run writes its artifact too — a collapse is a measurement of the "
+          "vantage, and the corpus that preceded this recorded no such thing",
+          art1["verdict_rc"], 1)
+    check("the refusal is said out loud, not only returned",
+          any("REFUSING" in s for s in said), True)
+
+    rc2, _, _ = _run({"nl-direct": None, "ru-mobile": None})
+    check("two blind probes are unproven, not agreed", rc2, 2)
+
+    # An unreachable geolocation service must not take the verdict with it: the country is
+    # a LABEL on the run, the exit is the evidence.
+    rc3, art3, _ = _run({"nl-direct": "2.2.2.2", "ru-mobile": "3.3.3.3"},
+                        geo=lambda ip: {"geo": "unknown: Timeout"})
+    check("a dead geo service leaves the verdict intact and the country unknown",
+          (rc3, art3["arms"]["nl-direct"].get("country"),
+           art3["arms"]["nl-direct"]["geo"].startswith("unknown")), (0, None, True))
+
+    # THE REAL geo_of, not the injected stand-in. The arm above proves the PREFLIGHT
+    # survives a dead geo service; only this one proves geo_of itself says unknown instead
+    # of handing back a plausible country, and a fixture cannot cover the path it replaces.
+    _svc = GEO_SERVICE
+    try:
+        globals()["GEO_SERVICE"] = "https://geo.invalid.mesh-home.test/"
+        g_live = geo_of("1.2.3.4", timeout=5)
+    finally:
+        globals()["GEO_SERVICE"] = _svc
+    check("an unreachable geo service yields NO country, not a plausible one",
+          (g_live.get("country"), g_live.get("asn"),
+           str(g_live.get("geo", "")).startswith("unknown")), (None, None, True))
+
+    # A probe that died must not hand back an address, and must say why it has none.
+    dead = read_vantage(["/bin/sh", "-c", "echo not-json; exit 3"])
+    check("a probe with no vantage line yields no exit", dead.get("exit"), None)
+    check("and it carries the reason instead of a silence", "rc=3" in dead.get("probe", ""),
+          True)
+    live = read_vantage(["/bin/sh", "-c",
+                         'echo \'{"kind":"vantage","exit":"9.9.9.9","echo_attempts":1}\''])
+    check("a probe that answered is read by VALUE, not scraped from prose",
+          live.get("exit"), "9.9.9.9")
+    check("a probe that times out is unknown, not slow-but-fine",
+          read_vantage(["/bin/sh", "-c", "sleep 5"], timeout=1).get("exit"), None)
+
+    # The corpus correction: an exit with no country is what made 74% of the foreign arm
+    # unrecoverable. Absent geo renders UNKNOWN and never a default country.
+    g = geo_of(None)
+    check("no exit means no country, stated as unknown",
+          (g.get("country"), g.get("geo", "").startswith("unknown")), (None, True))
+
     print("selftest: " + ("ok" if ok else "FAIL"))
     return 0 if ok else 1
 

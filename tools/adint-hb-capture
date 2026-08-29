@@ -594,6 +594,49 @@ def egress_ips(timeout=15):
             "proxied_leg": "measured" if proxy_env else "n/a: no proxy in this environment"}
 
 
+# ── THE CROSS-ARM VANTAGE VERDICT ──────────────────────────────────────────────────────
+# ONE entry point, called by every site that has to decide whether two labelled arms
+# actually left from different places: this file's proxy/direct preflight, its --via direct
+# leak check, and tools/adint-paired-run's ru/nl preflight, which imports it from here.
+#
+# A private second copy is exactly how the ru/nl path came to have NO guard at all while
+# this file had a good one — the verdict LOOKED implemented, because it was implemented
+# somewhere. The ru/nl arms are two independent capture processes and each only ever proved
+# that IT read some echo; nothing compared their two answers, so `ru-mobile` and `nl-direct`
+# could both leave through MTS Russia with only the LABELS differing and every row would
+# carry vantage_verified=True (that field is browser-vs-parent self-consistency, never a
+# check that the vantage is the one the arm's NAME claims). Measured 2026-08-28: the host
+# default route — the `nl-direct` arm's whole definition — reads 5.227.27.235 / MTS PJSC,
+# the same carrier the RU arm tethers through.
+#
+# The arm NAME is not the vantage, exactly as a declared pref is not the FIB.
+def vantage_collapse(exits):
+    """exits: {arm_label: exit_ip_or_None} -> (rc, message).
+
+    rc 0  the arms leave from distinct exits (the message names them)
+    rc 1  two or more arms collapsed onto one exit: the labels differ, the treatment does not
+    rc 2  at least one exit is unknown, or there is only one arm to compare — no vantage
+          evidence is not evidence of a vantage, and it must never read as agreement
+    """
+    if len(exits) < 2:
+        return 2, ("refusing: a collapse verdict needs two arms to compare; got "
+                   f"{sorted(exits)} — one arm cannot be distinct from anything")
+    unknown = sorted(a for a, ip in exits.items() if not ip)
+    if unknown:
+        return 2, ("refusing: the echo could not be read for " + ", ".join(unknown)
+                   + " — the arms are unproven (no vantage evidence is not evidence "
+                     "of a vantage)")
+    by_exit = {}
+    for a, ip in exits.items():
+        by_exit.setdefault(ip, []).append(a)
+    for ip, arms in sorted(by_exit.items()):
+        if len(arms) > 1:
+            return 1, (f"refusing: {' and '.join(sorted(arms))} both leave from {ip} — "
+                       "the labels differ and the treatment does not")
+    return 0, ("vantage distinct: "
+               + " ".join(f"{a}={exits[a]}" for a in sorted(exits)))
+
+
 # The echo host is part of the INSTRUMENT, and on a censored or mangling vantage it can be the
 # one host that does not work. Measured 2026-08-18 from the RU MTS vantage: MTS's own resolvers
 # (212.188.31.154/155) answer api.ipify.org AND example.com with 8.47.69.0 / 8.6.112.0 — the
@@ -1087,6 +1130,47 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
     return load, rows
 
 
+def vantage_only(sync_playwright, args):
+    """Prove THIS process's vantage and print it — load nothing, write no row.
+
+    The instrument is the BROWSER, launched exactly as a load launches it: `--via` decides
+    whether the inherited proxy is stripped from the CHILD's environment, because here the
+    env wins over `--no-proxy-server` (measured 2026-08-16; the flag alone still left from
+    privoxy's exit). A parent's curl measures the parent, and an arm's NAME measures
+    nothing — the only answer that counts is the echo read from inside the browser that
+    would have done the loading.
+
+    Exists so a PARENT that launches two arms as separate processes can ask each one where
+    it actually leaves from, in the arm's own namespace, and compare the two answers before
+    spending a cell. tools/adint-paired-run is that parent.
+
+    stdout is ONE json object, so the caller parses a value instead of scraping a sentence.
+    rc 0 carries an exit; rc 2 carries `exit: null` — an unread echo is UNKNOWN and must
+    never be rendered as an address, or two blind arms would agree.
+    """
+    use_proxy = (args.via == "inherited-proxy")
+    launch_env = None if use_proxy else {k: v for k, v in os.environ.items()
+                                         if k not in PROXY_VARS}
+    exit_ip, attempts = None, 0
+    with sync_playwright() as pw:
+        b = pw.chromium.launch(headless=True,
+                               args=[] if use_proxy else ["--no-proxy-server"],
+                               **({} if launch_env is None else {"env": launch_env}))
+        try:
+            exit_ip, attempts = echo_read(b.new_context())
+        finally:
+            b.close()
+    print(json.dumps({"kind": "vantage", "arm": args.arm, "via": args.via,
+                      "exit": exit_ip, "echo_attempts": attempts,
+                      "echo_tries": ECHO_TRIES, "ip_echo": IP_ECHO,
+                      "ts": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False),
+          flush=True)
+    if exit_ip is None:
+        shell_echo_control(f"--vantage-only {args.arm}")
+        return 2
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("urls", nargs="*")
@@ -1149,6 +1233,12 @@ def main():
                          "SAME prefix and the SAME ordered URL list — the key is positional")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--vantage-only", action="store_true",
+                    help="read this browser's exit through the echo, print it as one "
+                         "json line and exit — no url is loaded and no row is written. "
+                         "For a parent that launches arms as separate processes and "
+                         "must compare where they ACTUALLY left from before spending a "
+                         "cell on labels")
     ap.add_argument("--test", action="store_true")
     args = ap.parse_args()
 
@@ -1170,6 +1260,9 @@ def main():
 
     if args.test:
         return selftest(sync_playwright)
+
+    if args.vantage_only:
+        return vantage_only(sync_playwright, args)
 
     urls = list(args.urls)
     if args.file:
@@ -1228,15 +1321,16 @@ def main():
                     b.close()
             print(f"preflight vantage: proxy={seen_exits['proxy']} direct={seen_exits['direct']}",
                   file=sys.stderr)
-            if None in seen_exits.values():
+            # The verdict is not spelled out here: it comes from vantage_collapse, the one
+            # entry point tools/adint-paired-run's ru/nl preflight calls too, so the two
+            # paths cannot decide this question differently.
+            rc_v, msg_v = vantage_collapse({"proxy": seen_exits["proxy"],
+                                            "direct": seen_exits["direct"]})
+            if rc_v == 2:
                 shell_echo_control("proxy/direct preflight")
-                print("refusing: the echo could not be read, so the arms are unproven "
-                      "(no vantage evidence is not evidence of a vantage)", file=sys.stderr)
-                return 2
-            if seen_exits["proxy"] == seen_exits["direct"]:
-                print(f"refusing: both arms leave from {seen_exits['direct']} — the labels "
-                      "differ and the treatment does not", file=sys.stderr)
-                return 1
+            if rc_v != 0:
+                print(msg_v, file=sys.stderr)
+                return rc_v
             if seen_exits["direct"] != ip.get("egress_ip_direct"):
                 print(f"note: the browser's direct exit ({seen_exits['direct']}) is not the "
                       f"parent's ({ip.get('egress_ip_direct')}); the ROW records the browser's",
@@ -1260,10 +1354,18 @@ def main():
                 print("refusing: the echo could not be read, so --via direct is unproven",
                       file=sys.stderr)
                 return 2
-            if seen == ip.get("egress_ip_proxied"):
-                print(f"refusing: --via direct still leaves from {seen} (the proxy's exit)",
-                      file=sys.stderr)
-                return 1
+            # Same question, same grammar: two NAMED vantages that turn out to be one exit.
+            # `--via direct` leaking back through privoxy is a collapse whose second arm
+            # happens to be a measurement the parent already holds rather than a browser we
+            # launched. Only asked when there IS a proxy leg to collide with: with no proxy
+            # in the environment egress_ips() reports None for it (never a number), and
+            # comparing against None here would refuse a run that has no proxy to leak into.
+            if ip.get("egress_ip_proxied"):
+                rc_v, msg_v = vantage_collapse({"--via direct": seen,
+                                                "the proxy's exit": ip.get("egress_ip_proxied")})
+                if rc_v == 1:
+                    print(msg_v, file=sys.stderr)
+                    return 1
             ip["egress_ip_direct"] = seen
         for i, u in enumerate(urls, 1):
             arm = plan[i - 1]
