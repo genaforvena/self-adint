@@ -1,0 +1,159 @@
+{
+  "at_read_by_receiver": false,
+  "counts": {
+    "foreign-deny:204": 10,
+    "foreign-pass:200": 20,
+    "matched:200": 20,
+    "no-ifa:204": 5,
+    "panic:500": 2
+  },
+  "egress": {
+    "legs_agree": true,
+    "node_egress": {
+      "asn": "AS197537",
+      "asn_org": "Wisdom Cloud Internet Technology Pte. Ltd.",
+      "at": "2026-08-30T02:14:00Z",
+      "country": "US",
+      "ip": "38.49.216.141",
+      "leg": "as-invoked (proxy env honoured if set)",
+      "said_by": "ifconfig.co"
+    },
+    "node_egress_direct": {
+      "asn": "AS197537",
+      "asn_org": "Wisdom Cloud Internet Technology Pte. Ltd.",
+      "at": "2026-08-30T02:14:01Z",
+      "country": "US",
+      "ip": "38.49.216.141",
+      "leg": "proxy env stripped",
+      "said_by": "ifconfig.co"
+    },
+    "proxy_env": {
+      "ALL_PROXY": "http://127.0.0.1:8118",
+      "HTTPS_PROXY": "http://127.0.0.1:8118",
+      "HTTP_PROXY": "http://127.0.0.1:8118"
+    },
+    "run_path": "loopback-only (127.0.0.1; the corpus never leaves this host)"
+  },
+  "finished": "2026-08-30T02:14:01Z",
+  "gates": [
+    {
+      "detail": "listening on 127.0.0.1:46913",
+      "gate": "receiver-ready",
+      "ok": true
+    },
+    {
+      "detail": "21 rows on disk; 20 matched requests sent plus the post-cap probe matched-003",
+      "gate": "every-matched-row-written",
+      "ok": true
+    },
+    {
+      "detail": "probe matched-003 written 2x, post-cap response 204",
+      "gate": "records-continue-past-the-cap",
+      "ok": true
+    },
+    {
+      "detail": "strays=[]",
+      "gate": "no-foreign-row-on-disk",
+      "ok": true
+    },
+    {
+      "detail": "hits=[]",
+      "gate": "no-foreign-ifa-anywhere",
+      "ok": true
+    },
+    {
+      "detail": "hits=[]",
+      "gate": "no-coordinates-on-disk",
+      "ok": true
+    },
+    {
+      "detail": "2 panic requests, statuses=[500, 500], handler marker in log=True",
+      "gate": "panic-path-exercised",
+      "ok": true
+    },
+    {
+      "detail": "20/20 answered 200",
+      "gate": "foreign-pass-is-bid-on",
+      "ok": true
+    },
+    {
+      "detail": "10/10 answered 204",
+      "gate": "foreign-deny-is-204",
+      "ok": true
+    },
+    {
+      "detail": "5 sent, none matched, none written",
+      "gate": "no-ifa-is-not-a-match",
+      "ok": true
+    },
+    {
+      "detail": "20 priced bids, 0 at-or-above",
+      "gate": "bid-strictly-below-floor",
+      "ok": true
+    },
+    {
+      "detail": "WIN-ALERT.txt after the unexpanded-macro win: exists=False",
+      "gate": "alert-not-spent-on-a-zero-win",
+      "ok": true
+    },
+    {
+      "detail": "WIN-ZERO-PRICE.txt after the unexpanded-macro win: exists=True",
+      "gate": "zero-price-win-is-marked-not-swallowed",
+      "ok": true
+    },
+    {
+      "detail": "counter='wins=4 spend=0.670000 cap=0.500000 zero_price_wins=1', wins driven=4",
+      "gate": "win-counter-is-a-real-artifact",
+      "ok": true
+    },
+    {
+      "detail": "after spend past $0.5, a MATCHED request (matched-003) answered 204",
+      "gate": "spend-cap-halts-bidding",
+      "ok": true
+    }
+  ],
+  "latency_ms": {
+    "max": 0.632,
+    "n": 55,
+    "p50": 0.278,
+    "p95": 0.422
+  },
+  "post_cap_bid": {
+    "bid": false,
+    "probe_id": "matched-003",
+    "probe_kind": "matched",
+    "status": 204
+  },
+  "rows_on_disk": 21,
+  "run": "step1-20260830T021358Z",
+  "seed": 20260830,
+  "spend_cap": 0.5,
+  "started": "2026-08-30T02:13:58Z",
+  "target_ifa": "00000000-0000-4000-8000-000000000001",
+  "tmax_declared": [
+    80,
+    100,
+    120,
+    150
+  ],
+  "tmax_read_by_receiver": false,
+  "win_counter": "wins=4 spend=0.670000 cap=0.500000 zero_price_wins=1",
+  "wins": [
+    {
+      "p_sent": "${AUCTION_PRICE}",
+      "status": 200
+    },
+    {
+      "p_sent": "0.1200",
+      "status": 200
+    },
+    {
+      "p_sent": "0.2500",
+      "status": 200
+    },
+    {
+      "p_sent": "0.3000",
+      "status": 200
+    }
+  ]
+}

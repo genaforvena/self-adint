@@ -34,3 +34,14 @@ android/local.properties
 # so the detector under test is the one that runs, rather than a copy that rots away from it).
 __pycache__/
 *.pyc
+
+# …AND the Step 1 synthetic run. `*.jsonl` above keeps RAW CAPTURE out; this directory is
+# neither capture nor observation. Its `device.ifa` is the fixed fake UUID
+# 00000000-0000-4000-8000-000000000001, its coordinates are arithmetic on a constant, and
+# every request in it was generated locally from a seed by `tools/adint-step1-run`. It is
+# committed on purpose: the operator asked for the receiver RUNNING and not for a document
+# about it, and a run whose output is unreadable is a document about it. If a future run
+# is ever pointed at a real device, its output does NOT belong here — the path is what
+# makes this safe, so keep the exception narrow rather than widening it to testdata/.
+!receiver/testdata/step1-2026-08-30/
+!receiver/testdata/step1-2026-08-30/**

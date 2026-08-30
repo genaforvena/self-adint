@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""Step 1, RUN — drive the receiver + decoy bidder over a synthetic OpenRTB corpus.
+
+    tools/adint-step1-run --seed 20260830
+    tools/adint-step1-run --test          # self-check: the harness's own gates, no long run
+
+WHY THIS EXISTS AND WHY IT IS NOT `go test`
+`receiver/` has had unit gates since 2026-08-15 and they pass. What it has never had is a
+RUN: the binary started as a process, spoken to over a socket, driven by a corpus, and
+leaving artifacts on disk that were then read back and asserted. The difference is not
+ceremony. Three of this harness's checks CANNOT be made in the package's own tests:
+
+  * the leak sweep reads the process's real STDERR and the real files under the data dir.
+    A unit test calls the handler in-process with a captured logger; it cannot see what
+    the shipped `main()` wires up, and `main()` is where a logger, an access log or a
+    framework default would actually leak (CLAUDE.md rule 2 — the invariant is a
+    CONSTRUCTION, so it must be checked on the constructed thing).
+  * the on-disk JSONL is parsed back and joined against the corpus by request id, so the
+    claim "only the target device's rows reach disk" is asserted over the artifact a
+    reader would audit, not over a mock's call log.
+  * latency is measured against each request's own `tmax`, which only exists once there
+    is a socket and a process on the other end of it.
+
+WHAT IT REFUSES TO DO
+It never contacts a network. Every request goes to 127.0.0.1 on an ephemeral port, and
+the corpus is generated locally from a seed — there is no exchange, no seat, no egress.
+That is a property worth stating rather than assuming, so the run RECORDS the node's
+egress at run time (and whether this shell is proxied, the trap already recorded on this
+node) and labels the run `loopback-only` beside it. A run that quietly went out would
+then be visible as a contradiction between two fields instead of being invisible.
+
+THE TARGET IFA IS SYNTHETIC ON PURPOSE
+`ADINT_TARGET_IFA` here is a fixed fake UUID, never the operator's real advertising id.
+The corpus and the run output are therefore publishable by construction: nothing in them
+is about a person, which is what lets the artifact be committed at all.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RECEIVER_DIR = os.path.join(REPO, "receiver")
+
+# The synthetic target. Fixed, not random: the corpus is meant to be reproducible from a
+# seed alone, and a random target would make every run's artifact differ in the one field
+# a reader checks first.
+TARGET_IFA = "00000000-0000-4000-8000-000000000001"
+
+# Bundles the local stand-in gate passes. The real gate lives on the exchange (brief:
+# "гео-фильтр настраивается на стороне биржи"); this is only what makes both branches of
+# the decoy rule reachable from synthetic traffic.
+ALLOW_BUNDLES = ["com.pass.a", "com.pass.b"]
+DENY_BUNDLES = ["com.deny.x", "com.deny.y"]
+
+SPEND_CAP = 0.50
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --------------------------------------------------------------------------- corpus
+
+
+def make_corpus(seed):
+    """Deterministic OpenRTB 2.5 corpus. Every case exists to make one branch reachable.
+
+    The classes and why each is here:
+
+      matched-*      device.ifa == target. The ONLY class that may reach disk.
+      foreign-pass   a different ifa, bundle in the allowlist → the decoy MUST bid on it
+                     (a 204-on-everything seat throttles in days) and MUST NOT record it.
+                     This is the class the privacy invariant is actually about: a request
+                     we answer and never keep.
+      foreign-deny   a different ifa, bundle not allowed → 204.
+      no-ifa         no device.ifa at all. Neither matched nor, with a denied bundle,
+                     passing — it must not be treated as a match by an empty-string
+                     comparison, which is the classic way this filter fails open.
+      panic          carries the harness's `__panic` instruction AND a foreign ifa, so the
+                     recover() path runs with a foreign identifier live in scope. That is
+                     the §1b leak condition, and it is the reason this case exists.
+
+    Floors: half the imps carry one, half do not. Both matter — a bid must be strictly
+    below a floor that exists, and the no-floor case is the one that can WIN outright in a
+    first-price auction, which is what the ledger and the cap are for (§1a).
+
+    `tmax` and `at` are carried on every request even though the receiver reads neither.
+    They are not decoration: §1e says the bid deadline is `tmax` minus RTT and must be READ
+    per request rather than guessed, and the run reports observed latency against the tmax
+    each request declared. A field the corpus does not carry is a field no run can ever
+    measure the handling of.
+    """
+    rnd = random.Random(seed)
+    corpus = []
+
+    def req(kind, idx, ifa, bundle, floor, geo_type, segments, eids, consent, panic=False):
+        r = {
+            "id": f"{kind}-{idx:03d}",
+            "imp": [{"id": "1", "bidfloor": floor, "bidfloorcur": "USD"}],
+            "app": {"bundle": bundle},
+            "device": {"ifa": ifa, "geo": {"type": geo_type,
+                                           # Coordinates ARE present in the wire request —
+                                           # that is the point. The receiver's Geo struct
+                                           # has no lat/lon field, so they cannot be
+                                           # decoded; the run then greps the artifacts for
+                                           # these exact values to prove it.
+                                           "lat": 55.7558 + idx * 0.0001,
+                                           "lon": 37.6173 + idx * 0.0001}},
+            "at": rnd.choice([1, 2]),
+            "tmax": rnd.choice([80, 100, 120, 150]),
+        }
+        if segments or eids or consent:
+            u = {}
+            if segments:
+                u["data"] = segments
+            ext = {}
+            if eids:
+                ext["eids"] = eids
+            if consent:
+                ext["consent"] = "CPzy-gAPzy-gAAGABCENBXCgAP_AAH_AAA"
+            if ext:
+                u["ext"] = ext
+            r["user"] = u
+        if panic:
+            r["__panic"] = "panic"
+        return {"kind": kind, "req": r, "floor": floor,
+                "matched": ifa == TARGET_IFA, "ifa": ifa,
+                "lat": r["device"]["geo"]["lat"], "lon": r["device"]["geo"]["lon"]}
+
+    def segs(i):
+        return [
+            {"id": "p1", "name": "adsquare", "ext": {"segtax": 4},
+             "segment": [{"id": f"seg-{i}-a"}, {"id": f"seg-{i}-b"}]},
+            {"id": "p2", "name": "eyeota", "ext": {"segtax": 6},
+             "segment": [{"id": f"seg-{i}-c"}]},
+        ]
+
+    def eids(i):
+        return [
+            {"source": "liveramp.com", "uids": [{"id": f"RID-{i}-DEADBEEF"}]},
+            {"source": "adserver.org", "uids": [{"id": f"TDID-{i}-DEADBEEF"}]},
+        ]
+
+    # 20 matched requests, cycling geo precision class and payload richness.
+    for i in range(20):
+        corpus.append(req("matched", i, TARGET_IFA,
+                          rnd.choice(ALLOW_BUNDLES + DENY_BUNDLES),
+                          0.0 if i % 2 else round(rnd.uniform(0.30, 2.50), 4),
+                          (i % 3) + 1,
+                          segs(i) if i % 2 == 0 else [],
+                          eids(i) if i % 3 == 0 else [],
+                          i % 4 == 0))
+    # 20 foreign requests that PASS the gate — bid on, never recorded.
+    for i in range(20):
+        corpus.append(req("foreign-pass", i, f"FFFFFFFF-0000-4000-8000-{i:012d}",
+                          rnd.choice(ALLOW_BUNDLES),
+                          0.0 if i % 2 else round(rnd.uniform(0.30, 2.50), 4),
+                          (i % 3) + 1, segs(100 + i), eids(100 + i), True))
+    # 10 foreign requests that FAIL the gate — 204.
+    for i in range(10):
+        corpus.append(req("foreign-deny", i, f"EEEEEEEE-0000-4000-8000-{i:012d}",
+                          rnd.choice(DENY_BUNDLES), 1.0, 2, [], [], False))
+    # 5 with no ifa at all, on a denied bundle.
+    for i in range(5):
+        corpus.append(req("no-ifa", i, "", rnd.choice(DENY_BUNDLES), 1.0, 2, [], [], False))
+    # 2 panic injections, both carrying a foreign ifa.
+    for i in range(2):
+        corpus.append(req("panic", i, f"DDDDDDDD-0000-4000-8000-{i:012d}",
+                          ALLOW_BUNDLES[0], 1.0, 2, segs(200 + i), eids(200 + i), True,
+                          panic=True))
+
+    rnd.shuffle(corpus)
+    return corpus
+
+
+# --------------------------------------------------------------------------- process
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def build(binpath, log):
+    """Build the shipped binary. A run that tested `go run .` would still be testing a
+    package; the artifact under test here is the thing an operator would deploy."""
+    pr = subprocess.run(["go", "build", "-o", binpath, "."], cwd=RECEIVER_DIR,
+                        capture_output=True, timeout=300)
+    if pr.returncode != 0:
+        log("BUILD FAILED\n" + pr.stderr.decode("utf-8", "replace"))
+        return False
+    return True
+
+
+def start(binpath, port, data_dir, stdout_fp, cap=SPEND_CAP):
+    env = dict(os.environ)
+    env.update({
+        "ADINT_TARGET_IFA": TARGET_IFA,
+        "ADINT_BUNDLE_ALLOW": ",".join(ALLOW_BUNDLES),
+        "ADINT_DATA_DIR": data_dir,
+        "ADINT_ADDR": f"127.0.0.1:{port}",
+        "ADINT_SPEND_CAP": str(cap),
+        "ADINT_SOURCE": "step1-synthetic",
+    })
+    fh = open(stdout_fp, "wb")
+    # stderr is merged into the same file deliberately: the leak sweep must cover
+    # everything the process said, and two streams is two places to forget to look.
+    p = subprocess.Popen([binpath], env=env, stdout=fh, stderr=subprocess.STDOUT,
+                         cwd=RECEIVER_DIR)
+    return p, fh
+
+
+def wait_ready(port, deadline=15.0):
+    end = time.time() + deadline
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.05)
+    return False
+
+
+def post_bid(port, body, timeout=5.0):
+    """One bid call. Returns (status, response_json_or_None, elapsed_ms).
+
+    A non-2xx is a RESULT here, not an exception: 204 is the decoy's correct answer to
+    two thirds of the corpus and 500 is the expected answer on the panic path. Turning
+    either into a raised error would make the harness's own control flow decide what the
+    receiver was allowed to say.
+    """
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/bid", data=data,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            ms = (time.perf_counter() - t0) * 1000
+            if not raw:
+                return r.status, None, ms
+            return r.status, json.loads(raw.decode()), ms
+    except urllib.error.HTTPError as e:
+        ms = (time.perf_counter() - t0) * 1000
+        e.read()
+        return e.code, None, ms
+
+
+def get(port, path, timeout=5.0):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------- egress
+
+
+def egress_record():
+    """Where this node leaves from, measured in the SAME run as the claim, plus whether
+    this shell is proxied at all.
+
+    The board task names the trap directly: a curl from a mind pane on this node may go
+    out through privoxy to a socks tunnel rather than by the node's own route, and this
+    repo has already published one number that was the proxy's exit. So both are recorded
+    and neither is inferred. The run itself is loopback-only — this field is provenance
+    for the RUN, not a path any of its packets took.
+    """
+    rec = {"run_path": "loopback-only (127.0.0.1; the corpus never leaves this host)"}
+    proxy_vars = {k: os.environ.get(k) for k in
+                  ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy")}
+    rec["proxy_env"] = {k: v for k, v in proxy_vars.items() if v} or None
+
+    def exit_via(env, label):
+        try:
+            pr = subprocess.run(["curl", "-4", "-sS", "--max-time", "20",
+                                 "https://ifconfig.co/json"],
+                                capture_output=True, timeout=30, env=env)
+            j = json.loads(pr.stdout.decode())
+            return {"ip": j.get("ip"), "country": j.get("country_iso"),
+                    "asn": j.get("asn"), "asn_org": j.get("asn_org"),
+                    "said_by": "ifconfig.co", "leg": label, "at": now()}
+        except Exception as e:
+            # UNKNOWN, never a blank that reads as "no egress". An unmeasured field and a
+            # measured absence are different claims.
+            return {"error": f"{type(e).__name__}: {e}"[:160], "leg": label, "at": now()}
+
+    # BOTH legs, in the same run, because this pane may be proxied and the difference is
+    # invisible from one number. It is not hypothetical here: this repo has already
+    # published one figure that was privoxy's far end and not the node's route, and when
+    # this harness first ran, ALL_PROXY/HTTP(S)_PROXY were set to 127.0.0.1:8118 in the
+    # pane. Whether the two legs AGREE is itself a measurement — on this node today they
+    # do, because the socks tunnel lands on the same exit node the default route uses —
+    # and an agreement that is measured is a different thing from an agreement assumed.
+    stripped = dict(os.environ)
+    for k in proxy_vars:
+        stripped.pop(k, None)
+    rec["node_egress"] = exit_via(os.environ.copy(), "as-invoked (proxy env honoured if set)")
+    rec["node_egress_direct"] = exit_via(stripped, "proxy env stripped")
+    a = rec["node_egress"].get("ip")
+    b = rec["node_egress_direct"].get("ip")
+    rec["legs_agree"] = (a == b) if (a and b) else None
+    return rec
+
+
+# --------------------------------------------------------------------------- gates
+
+
+class Gates:
+    def __init__(self):
+        self.rows = []
+
+    def check(self, name, ok, detail=""):
+        self.rows.append({"gate": name, "ok": bool(ok), "detail": detail})
+        return bool(ok)
+
+    @property
+    def failed(self):
+        return [r for r in self.rows if not r["ok"]]
+
+    def render(self):
+        out = []
+        for r in self.rows:
+            out.append(f"  [{'ok ' if r['ok'] else 'FAIL'}] {r['gate']}"
+                       + (f" — {r['detail']}" if r["detail"] else ""))
+        return "\n".join(out)
+
+
+def leak_sweep(paths, needles):
+    """Every occurrence of any needle in any file. The needles are the foreign ifas and
+    the injected coordinates.
+
+    Deliberately a whole-byte scan and not a JSON field walk: the invariant is that these
+    strings are ABSENT from the artifacts, and a field-aware check would only look where
+    we already expect them not to be. A leak arrives through a path nobody modelled — a
+    log line, a panic dump, an error string — which is precisely what a field walk skips.
+    """
+    hits = []
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        try:
+            blob = open(p, "rb").read().decode("utf-8", "replace")
+        except Exception as e:
+            hits.append((p, f"<unreadable: {e}>", 0))
+            continue
+        for n in needles:
+            c = blob.count(n)
+            if c:
+                hits.append((p, n, c))
+    return hits
+
+
+def run_cell(args, log):
+    out_dir = args.out_dir
+    data_dir = os.path.join(out_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    binpath = os.path.join(out_dir, "adint-receiver")
+    proc_log = os.path.join(out_dir, "receiver.stdout.log")
+
+    g = Gates()
+    summary = {"run": os.path.basename(out_dir), "started": now(), "seed": args.seed,
+               "target_ifa": TARGET_IFA, "spend_cap": SPEND_CAP,
+               "egress": egress_record()}
+
+    if not build(binpath, log):
+        g.check("build", False, "go build failed")
+        summary["gates"] = g.rows
+        summary["build_failed"] = True
+        return summary, g
+
+    port = free_port()
+    proc, fh = start(binpath, port, data_dir, proc_log)
+    try:
+        if not wait_ready(port):
+            g.check("receiver-ready", False, f"no /healthz on 127.0.0.1:{port} in 15s")
+            summary["gates"] = g.rows
+            return summary, g
+        g.check("receiver-ready", True, f"listening on 127.0.0.1:{port}")
+
+        corpus = make_corpus(args.seed)
+        results = []
+        for c in corpus:
+            st, resp, ms = post_bid(port, c["req"])
+            price = None
+            if resp:
+                try:
+                    price = resp["seatbid"][0]["bid"][0]["price"]
+                except (KeyError, IndexError, TypeError):
+                    price = None
+            results.append({"id": c["req"]["id"], "kind": c["kind"], "status": st,
+                            "price": price, "floor": c["floor"], "ms": round(ms, 3),
+                            "tmax": c["req"]["tmax"], "at": c["req"]["at"],
+                            "matched": c["matched"]})
+
+        # ---- the win flow, driven in the order a real exchange would produce it.
+        # The FIRST call carries the settlement macro UNEXPANDED. That is not a contrived
+        # case: `nurl` ships with `${AUCTION_PRICE}` in it and an exchange that fails to
+        # substitute calls us with the literal, which parsePrice() correctly reads as 0.
+        # What the first win is worth decides which event the one-shot alert is spent on.
+        wins = []
+        st, _ = get(port, "/win?p=${AUCTION_PRICE}&id=macro-unexpanded")
+        wins.append({"p_sent": "${AUCTION_PRICE}", "status": st})
+        alert_after_zero = os.path.exists(os.path.join(data_dir, "WIN-ALERT.txt"))
+        alert_text_after_zero = ""
+        if alert_after_zero:
+            alert_text_after_zero = open(os.path.join(data_dir, "WIN-ALERT.txt")).read().strip()
+        # The other half of the same finding: not alerting on a zero must not mean
+        # SWALLOWING it. Winning an impression whose price we cannot read is the state
+        # in which a spend counter silently understates, so it owes its own marker.
+        zero_marker = os.path.exists(os.path.join(data_dir, "WIN-ZERO-PRICE.txt"))
+
+        for p in ("0.1200", "0.2500", "0.3000"):
+            st, _ = get(port, f"/win?p={p}&id=win-{p}")
+            wins.append({"p_sent": p, "status": st})
+
+        # After 0.12+0.25+0.30 = 0.67 > cap 0.50 the decoy must stop bidding entirely.
+        # The probe MUST be a request the decoy would otherwise bid on, and the corpus is
+        # shuffled — reusing corpus[0] made this gate pass whenever position 0 happened to
+        # be a foreign-deny request, which answers 204 because it was FILTERED. Measured:
+        # the mutant that deletes the cap check stayed green for exactly that reason. A
+        # gate whose expected value is also produced by an unrelated branch is not a gate.
+        probe = next(c for c in corpus if c["matched"] and not c["req"].get("__panic"))
+        st_after, resp_after, _ = post_bid(port, probe["req"])
+        post_cap = {"status": st_after, "bid": resp_after is not None,
+                    "probe_id": probe["req"]["id"], "probe_kind": probe["kind"]}
+
+        time.sleep(0.3)  # let the sink's last Encode reach the file
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        fh.close()
+
+    # ---------------------------------------------------------------- read artifacts
+    jsonl = os.path.join(data_dir, "receiver.jsonl")
+    rows = []
+    if os.path.exists(jsonl):
+        for line in open(jsonl):
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    proc_out = open(proc_log).read() if os.path.exists(proc_log) else ""
+
+    matched_ids = {c["req"]["id"] for c in corpus if c["matched"]}
+    written_ids = [r.get("req_id") for r in rows]
+
+    # G1 — completeness. Every matched request reaches disk. Stated as its own gate rather
+    # than folded into G2: a filter that writes NOTHING also leaks nothing, and without
+    # this the privacy gate would pass on a receiver that had simply stopped working.
+    #
+    # The expected row count is matched + 1, and the +1 is not slack: the post-cap probe
+    # re-sends one matched request after the cap has halted bidding, and the receiver
+    # persists BEFORE it checks the cap. Writing the gate as a set comparison would have
+    # hidden that; writing it as `== len(matched)` made it fail. Both would have been
+    # wrong about the same fact, so the fact gets a gate of its own below.
+    probe_id = post_cap["probe_id"]
+    expected = sorted(list(matched_ids) + [probe_id])
+    g.check("every-matched-row-written", sorted(written_ids) == expected,
+            f"{len(written_ids)} rows on disk; {len(matched_ids)} matched requests sent "
+            f"plus the post-cap probe {probe_id}")
+
+    # G1b — a property, not an accident: past the hard cap the decoy stops BIDDING and
+    # keeps RECORDING. That is the behaviour worth having (the point of the project is to
+    # observe his own device, and observation should not stop because the budget did), but
+    # nothing in the code said so and no test asserted it. Now one does, in both halves.
+    g.check("records-continue-past-the-cap",
+            written_ids.count(probe_id) == 2 and post_cap["status"] == 204,
+            f"probe {probe_id} written {written_ids.count(probe_id)}x, "
+            f"post-cap response {post_cap['status']}")
+
+    # G2 — the privacy invariant, over the artifact.
+    foreign_ids = {c["req"]["id"] for c in corpus if not c["matched"]}
+    strays = [i for i in written_ids if i in foreign_ids]
+    g.check("no-foreign-row-on-disk", not strays, f"strays={strays[:5]}")
+
+    # G3 — the leak sweep, over every byte the run produced INCLUDING the process's own
+    # output. This is the gate `go test` structurally cannot make.
+    foreign_ifas = sorted({c["ifa"] for c in corpus if not c["matched"] and c["ifa"]})
+    coords = sorted({f"{c['lat']:.4f}" for c in corpus} | {f"{c['lon']:.4f}" for c in corpus})
+    sweep_paths = [jsonl, proc_log,
+                   os.path.join(data_dir, "win-counter.txt"),
+                   os.path.join(data_dir, "WIN-ALERT.txt")]
+    ifa_hits = leak_sweep(sweep_paths, foreign_ifas)
+    g.check("no-foreign-ifa-anywhere", not ifa_hits, f"hits={ifa_hits[:3]}")
+    coord_hits = leak_sweep([jsonl], coords)
+    g.check("no-coordinates-on-disk", not coord_hits, f"hits={coord_hits[:3]}")
+
+    # G4 — the panic path actually ran. Without this the leak gate above is vacuous on
+    # the one path it was written for: a receiver that never panicked would pass it for
+    # free. The marker asserted is the handler's own, not the corpus's.
+    panics = [r for r in results if r["kind"] == "panic"]
+    g.check("panic-path-exercised",
+            bool(panics) and all(r["status"] == 500 for r in panics)
+            and "panic in /bid recovered" in proc_out,
+            f"{len(panics)} panic requests, statuses={[r['status'] for r in panics]}, "
+            f"handler marker in log={'panic in /bid recovered' in proc_out}")
+
+    # G5 — the decoy rule's truth table, read off the responses.
+    fp = [r for r in results if r["kind"] == "foreign-pass"]
+    fd = [r for r in results if r["kind"] == "foreign-deny"]
+    ni = [r for r in results if r["kind"] == "no-ifa"]
+    g.check("foreign-pass-is-bid-on", fp and all(r["status"] == 200 for r in fp),
+            f"{sum(1 for r in fp if r['status'] == 200)}/{len(fp)} answered 200")
+    g.check("foreign-deny-is-204", fd and all(r["status"] == 204 for r in fd),
+            f"{sum(1 for r in fd if r['status'] == 204)}/{len(fd)} answered 204")
+    g.check("no-ifa-is-not-a-match", ni and all(r["status"] == 204 for r in ni)
+            and not any(r["id"] in written_ids for r in ni),
+            f"{len(ni)} sent, none matched, none written")
+
+    # G6 — the bid is strictly below a floor that exists.
+    priced = [r for r in results if r["price"] is not None and r["floor"] > 0]
+    bad = [r for r in priced if not (r["price"] < r["floor"])]
+    g.check("bid-strictly-below-floor", priced and not bad, f"{len(priced)} priced bids, {len(bad)} at-or-above")
+
+    # G7 — the alert is spent on the first NON-ZERO win, as the ledger's own comment says.
+    # An alert raised by a zero-price win is worse than no alert: the latch is one-shot,
+    # so the real first spend then arrives silently.
+    g.check("alert-not-spent-on-a-zero-win", not alert_after_zero,
+            f"WIN-ALERT.txt after the unexpanded-macro win: exists={alert_after_zero}"
+            + (f" text={alert_text_after_zero!r}" if alert_after_zero else ""))
+
+    g.check("zero-price-win-is-marked-not-swallowed", zero_marker,
+            f"WIN-ZERO-PRICE.txt after the unexpanded-macro win: exists={zero_marker}")
+
+    counter = ""
+    cpath = os.path.join(data_dir, "win-counter.txt")
+    if os.path.exists(cpath):
+        counter = open(cpath).read().strip()
+    m = re.search(r"wins=(\d+) spend=([0-9.]+)", counter)
+    g.check("win-counter-is-a-real-artifact",
+            bool(m) and int(m.group(1)) == len(wins),
+            f"counter={counter!r}, wins driven={len(wins)}")
+
+    # G8 — the hard cap halts bidding.
+    g.check("spend-cap-halts-bidding", post_cap["status"] == 204,
+            f"after spend past ${SPEND_CAP}, a MATCHED request ({post_cap['probe_id']}) "
+            f"answered {post_cap['status']}")
+
+    # ---------------------------------------------------------------- measurements
+    # NOT gates. §1e says the bid budget is `tmax` minus RTT and must be read per request.
+    # The receiver reads neither field today; that is a finding, and a finding is a number,
+    # so the run publishes the distribution rather than asserting a threshold nobody has
+    # derived yet.
+    lat = sorted(r["ms"] for r in results if r["kind"] != "panic")
+    def pct(v, q):
+        return round(v[min(len(v) - 1, int(len(v) * q))], 3) if v else None
+    summary["latency_ms"] = {"n": len(lat), "p50": pct(lat, .5), "p95": pct(lat, .95),
+                             "max": round(lat[-1], 3) if lat else None}
+    summary["tmax_declared"] = sorted({r["tmax"] for r in results})
+    summary["tmax_read_by_receiver"] = False
+    summary["at_read_by_receiver"] = False
+    summary["counts"] = {}
+    for r in results:
+        k = f"{r['kind']}:{r['status']}"
+        summary["counts"][k] = summary["counts"].get(k, 0) + 1
+    summary["rows_on_disk"] = len(rows)
+    summary["wins"] = wins
+    summary["win_counter"] = counter
+    summary["post_cap_bid"] = post_cap
+    summary["gates"] = g.rows
+    summary["finished"] = now()
+
+    with open(os.path.join(out_dir, "results.jsonl"), "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    with open(os.path.join(out_dir, "corpus.jsonl"), "w") as f:
+        for c in corpus:
+            f.write(json.dumps(c["req"]) + "\n")
+    return summary, g
+
+
+# --------------------------------------------------------------------------- self-test
+
+
+def selftest():
+    """The harness's own gates, driven against mutations of the SUBJECT.
+
+    A gate nobody has seen fail is not a gate. Each arm below breaks one thing in a COPY
+    of the receiver source, runs the cell against it, and requires the named gate to go
+    red — and requires the control (unmutated) run to be green on that same gate, so a
+    universally-red gate cannot pass for a working one.
+    """
+    import tempfile
+    ok = True
+    base = tempfile.mkdtemp(prefix="adint-step1-selftest-")
+
+    def cell(srcdir, tag):
+        global RECEIVER_DIR
+        keep, RECEIVER_DIR = RECEIVER_DIR, srcdir
+        try:
+            a = argparse.Namespace(seed=1, out_dir=os.path.join(base, tag))
+            os.makedirs(a.out_dir, exist_ok=True)
+            return run_cell(a, lambda *x: None)
+        finally:
+            RECEIVER_DIR = keep
+
+    def copy_src():
+        d = os.path.join(base, f"src{len(os.listdir(base))}")
+        shutil.copytree(RECEIVER_DIR, d)
+        return d
+
+    print("control (unmutated receiver):")
+    _, g0 = cell(RECEIVER_DIR, "control")
+    print(g0.render())
+    control_green = {r["gate"] for r in g0.rows if r["ok"]}
+
+    mutants = [
+        # the ifa filter fails open → foreign rows land on disk
+        ("no-foreign-row-on-disk", "receiver.go",
+         'matched = r.Device.IFA != "" && r.Device.IFA == c.TargetIFA',
+         'matched = true'),
+        # the panic handler dumps something request-derived
+        # `req` is not in scope inside the deferred recover (it is declared after the
+        # defer), so the obvious "leak it from the panic handler" mutation does not
+        # compile. The leak this gate is really about is any handler that logs something
+        # request-derived, so the mutation logs the ifa on the ordinary path instead.
+        ("no-foreign-ifa-anywhere", "server.go",
+         "\tverdict, matched := s.cfg.decide(&req)",
+         '\ts.logf("bid ifa=%s", req.Device.IFA)\n\tverdict, matched := s.cfg.decide(&req)'),
+        # the decoy stops bidding on filter-passing foreign traffic (the seat dies quietly)
+        ("foreign-pass-is-bid-on", "receiver.go",
+         "if !matched && !c.pass(r) {",
+         "if !matched {"),
+        # the bid stops being strictly below the floor
+        ("bid-strictly-below-floor", "receiver.go",
+         "return floor * 0.5", "return floor * 1.5"),
+        # the cap stops halting
+        ("spend-cap-halts-bidding", "server.go",
+         "if verdict == NoBid || s.ledger.capReached() {", "if verdict == NoBid {"),
+        # nothing is written at all — the completeness gate is what catches this, and it
+        # is the arm that proves the privacy gate is not passing for free
+        # `if false {` leaves `matched` declared-and-unused, which Go refuses to compile;
+        # `matched && false` keeps the variable live and still writes nothing.
+        ("every-matched-row-written", "server.go",
+         "if matched {", "if matched && false {"),
+        # recording must not stop when bidding does
+        ("records-continue-past-the-cap", "server.go",
+         "\tif matched {", "\tif matched && !s.ledger.capReached() {"),
+        # the alert latch goes back to firing on any first win
+        ("alert-not-spent-on-a-zero-win", "ledger.go",
+         "if !l.alerted && price > 0 {", "if !l.alerted {"),
+        # a zero-price win is swallowed again
+        ("zero-price-win-is-marked-not-swallowed", "ledger.go",
+         "if price <= 0 {", "if false {"),
+    ]
+    for gate, fname, old, new in mutants:
+        if gate not in control_green:
+            print(f"  [SKIP] {gate}: control was not green, mutation says nothing")
+            ok = False
+            continue
+        d = copy_src()
+        p = os.path.join(d, fname)
+        src = open(p).read()
+        if old not in src:
+            print(f"  [FAIL] mutant for {gate}: anchor not found in {fname}")
+            ok = False
+            continue
+        open(p, "w").write(src.replace(old, new, 1))
+        sm, gm = cell(d, f"mut-{gate}")
+        # A mutant that did not BUILD proves nothing about the gate, and calling it
+        # "stayed green" would be the opposite conclusion from the true one. It is an
+        # INCONCLUSIVE arm and it fails the selftest all the same — an experiment that
+        # did not run is not a pass.
+        if sm.get("build_failed"):
+            print(f"  [FAIL] mutant {gate}: DID NOT BUILD — arm inconclusive, not evidence")
+            ok = False
+            continue
+        present = any(r["gate"] == gate for r in gm.rows)
+        red = any(r["gate"] == gate and not r["ok"] for r in gm.rows)
+        if not present:
+            print(f"  [FAIL] mutant {gate}: the gate never ran (absent from the mutant's rows)")
+            ok = False
+            continue
+        print(f"  [{'ok ' if red else 'FAIL'}] mutant {gate}: "
+              f"{'went red' if red else 'STAYED GREEN — the gate does not test this'}")
+        ok = ok and red
+
+    print(f"\nselftest: {'PASS' if ok else 'FAIL'}  (workdir {base})")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seed", type=int, default=20260830)
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+
+    if args.test:
+        return selftest()
+
+    if not args.out_dir:
+        args.out_dir = os.path.join(REPO, "data",
+                                    "step1-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    def log(*a):
+        print(*a, flush=True)
+
+    log(f"step1 run: out={args.out_dir} seed={args.seed}")
+    summary, g = run_cell(args, log)
+    log("")
+    log(g.render())
+    log("")
+    log(f"rows on disk: {summary.get('rows_on_disk')}   "
+        f"latency p50={summary.get('latency_ms', {}).get('p50')}ms "
+        f"p95={summary.get('latency_ms', {}).get('p95')}ms")
+    log(f"egress as-invoked: {json.dumps(summary['egress']['node_egress'])}")
+    log(f"egress proxy-stripped: {json.dumps(summary['egress']['node_egress_direct'])}")
+    log(f"legs agree: {summary['egress']['legs_agree']}   proxy_env={summary['egress']['proxy_env']}")
+    log(f"artifacts: {args.out_dir}")
+    return 1 if g.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

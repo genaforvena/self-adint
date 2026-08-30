@@ -263,3 +263,48 @@ func TestBidBelowFloor(t *testing.T) {
 		t.Fatalf("bid %.2f not below floor 2.0", price)
 	}
 }
+
+// --- §1a, found by the first real RUN (2026-08-30): the alert latch must not be
+// spent on a zero-price win ---
+//
+// The ledger's own comment said "alert on the FIRST non-zero win" and the code
+// alerted on the first win of any price. Driving the receiver over the synthetic
+// corpus surfaced it immediately, because the realistic first win notice is the
+// one whose ${AUCTION_PRICE} the exchange failed to substitute: parsePrice reads
+// the literal as 0, the alert fired, wrote "FIRST NON-ZERO WIN: price=0.0000",
+// and latched — so the first real spend would have arrived in silence.
+//
+// Seen red: reverting `if !l.alerted && price > 0` to `if !l.alerted` fails this
+// test on the first Stat.
+func TestAlertNotSpentOnZeroPriceWin(t *testing.T) {
+	srv, dir, _ := newTestServer(t)
+	h := srv.Handler()
+
+	// The exchange did not expand the macro. parsePrice guards it → 0.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/win?p=${AUCTION_PRICE}&id=x", nil))
+
+	if _, err := os.Stat(filepath.Join(dir, "WIN-ALERT.txt")); err == nil {
+		b, _ := os.ReadFile(filepath.Join(dir, "WIN-ALERT.txt"))
+		t.Fatalf("alert latch spent on a zero-price win: %q", string(b))
+	}
+	// It is a win all the same, and it is counted — and it raises its OWN marker,
+	// because "we won and cannot see what it cost" is a fact, not a non-event.
+	if wins, spend := srv.ledger.snapshot(); wins != 1 || spend != 0 {
+		t.Fatalf("zero-price win not booked: wins=%d spend=%.4f; want 1/0", wins, spend)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "WIN-ZERO-PRICE.txt")); err != nil {
+		t.Fatalf("zero-price win left no marker: %v", err)
+	}
+
+	// The real first spend must still alert afterwards.
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/win?p=0.42&id=y", nil))
+	b, err := os.ReadFile(filepath.Join(dir, "WIN-ALERT.txt"))
+	if err != nil {
+		t.Fatalf("first NON-ZERO win did not alert: %v", err)
+	}
+	if !strings.Contains(string(b), "price=0.4200") {
+		t.Fatalf("alert names the wrong event: %q", string(b))
+	}
+}
