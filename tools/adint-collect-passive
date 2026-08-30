@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Step 4's passive collection lane — ONE tick, single vantage, on a cadence.
+
+    tools/adint-collect-passive                 # one tick: N sites from the frame
+    tools/adint-collect-passive --dry-run       # what this tick WOULD do
+    tools/adint-collect-passive --test          # gates, with mutants
+
+WHY THIS EXISTS AND WHY IT IS NOT `adint-collect-cell`
+
+`adint-collect-cell` drives `adint-paired-run`, which is Step 0's VANTAGE study: two named
+arms, and a preflight that correctly refuses the cell when they collapse onto one exit. On
+this node they now do — the Note 3 tether is physically gone (no `ruvantage` netns, no
+`enx*` device) and the host's direct route and privoxy's far end both land on 38.49.216.141
+— so wiring that tool on a cadence would produce a lane that refuses every tick. **A reflex
+that runs green and collects nothing is worse than no reflex**, because its cron line reads
+as coverage.
+
+Step 4 does not need a pair. It asks what arrives about the operator over a week — what is
+in `user.data[]`, who is in `eids[]`, `geo.type` per bundle, how often his own impressions
+come round. That is a question about ONE vantage observed for a long time, and the only
+thing it has ever been blocked on is that **nobody was collecting**: the board's own
+measurement of why this repo stalled on 2026-08-21 is `adint` matching zero cron lines.
+
+So this is the smallest lane that actually collects, and it makes no cross-vantage claim at
+all. What it must never do is let that modesty become silence about its own coverage.
+
+FIVE THINGS IT REFUSES TO GET WRONG, each one this project's or this mesh's scar tissue:
+
+  ONE WRITER, BOUND TO THE KERNEL. Two ticks at once would interleave two browsers through
+  one uplink and neither reading would be the one it claims. The guard reads `os.getuid()`,
+  never `$USER` — cron sets `LOGNAME` and no `USER`, which is exactly how this project's
+  previous single-writer guard was green in every test and dead in production.
+
+  A TICK THAT COLLECTED NOTHING STILL WRITES A ROW. Every tick appends an outcome with its
+  reason, INCLUDING the refusals, the stand-downs and the crashes. A tape of only the
+  successful ticks is a numerator: over a week the difference between "the market was quiet"
+  and "our browser never started" is the difference between a finding and a fabrication, and
+  the cadence is not the denominator.
+
+  THE CURSOR IS SAVED BEFORE THE WORK, NOT AFTER. The frame is walked with a persistent
+  cursor so a week covers it round and round instead of re-sweeping the head forever. It is
+  advanced BEFORE the sites are loaded: a tick killed halfway must not hand its successor
+  the same sites, and a pass whose cursor is written at the end repeats every load a crash
+  interrupts.
+
+  EGRESS IS MEASURED IN THE SAME RUN AS THE ROWS, BOTH LEGS. This repo has already published
+  one number that was privoxy's far end rather than the node's route. A shell here may or may
+  not carry proxy variables — under cron it does not, in a mind's pane it does — so neither
+  "this node is proxied" nor "this node is direct" is a fact about the node. It is a fact
+  about the process, and the process records it.
+
+  THE LEDGER IS APPEND-ONLY AND WHOLE. No window, no pruning. An `n` quoted against a sliding
+  ledger is not reproducible and can move DOWN, which is how a corpus stops being evidence.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.join(REPO, "tools")
+DATA = os.path.join(REPO, "data")
+VENV = os.path.expanduser("~/.venv-browser/bin/python3")
+CAPTURE = os.path.join(TOOLS, "adint-hb-capture")
+FRAME = os.path.join(REPO, "ref", "ru-frame-stageB-nl-direct-2026-08-19.tsv")
+
+LEDGER = os.path.join(DATA, "passive-collect-ledger.jsonl")
+CURSOR = os.path.join(DATA, ".passive-collect-cursor")
+LOCK = os.path.join(DATA, ".passive-collect.pid")
+
+SITES_PER_TICK = 4
+SETTLE = 30
+NAV_TIMEOUT = 45
+MIN_FREE_GB = 3.0
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def record(ledger, outcome, reason, **extra):
+    """Append one outcome row. Called on EVERY path, including the ones that did nothing."""
+    row = {"ts": now(), "outcome": outcome, "reason": reason, "pid": os.getpid()}
+    row.update(extra)
+    os.makedirs(os.path.dirname(ledger), exist_ok=True)
+    with open(ledger, "a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+
+# ------------------------------------------------------------------ one writer
+
+
+def holder(lockpath):
+    """The pid recorded in the lock, if that pid is alive AND is one of ours.
+
+    Bound to the kernel twice over: liveness by `kill(pid, 0)` and identity by reading
+    `/proc/<pid>/cmdline` for this tool's own name. A bare pid check is not enough — pid
+    reuse on this node is hourly, so a recycled pid would wedge the lane permanently, which
+    is a stand-down that looks exactly like a busy one.
+
+    Returns (pid, why) or (None, why-it-is-free).
+    """
+    if not os.path.exists(lockpath):
+        return None, "no lock file"
+    try:
+        pid = int(open(lockpath).read().strip())
+    except (ValueError, OSError) as e:
+        return None, f"unreadable lock ({type(e).__name__})"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None, f"stale lock: pid {pid} is gone"
+    except PermissionError:
+        # Alive but not ours. That is NOT our lane holding the lock; say which it is
+        # rather than standing down forever behind somebody else's recycled pid.
+        return None, f"stale lock: pid {pid} belongs to another user"
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace")
+    except OSError:
+        return None, f"stale lock: pid {pid} has no readable cmdline"
+    if "adint-collect-passive" not in cmd:
+        return None, f"stale lock: pid {pid} is not this tool ({cmd.split(chr(0))[0][:40]!r})"
+    return pid, f"pid {pid} is a live adint-collect-passive"
+
+
+# ------------------------------------------------------------------ frame + cursor
+
+
+def frame_sites(path):
+    """Domains from the stage-B frame, in file order. Comments and the header row dropped.
+
+    Order is the frame's, not shuffled: the cursor is what spreads coverage over a week, and
+    a shuffle on top of a cursor would make which sites a given tick took unreproducible
+    without buying anything.
+    """
+    out = []
+    if not os.path.exists(path):
+        return out
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        dom = parts[1].strip()
+        if dom in ("domain", ""):
+            continue
+        out.append(dom)
+    return out
+
+
+def read_cursor(path, n_sites):
+    try:
+        v = int(open(path).read().strip())
+    except (OSError, ValueError):
+        return 0
+    return v % n_sites if n_sites else 0
+
+
+def write_cursor(path, v):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(v))
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------ egress
+
+
+def egress_legs():
+    """Both legs, in this run. Neither is inferred and an unreadable leg is UNKNOWN."""
+    pvars = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+             "http_proxy", "https_proxy", "all_proxy")
+
+    def leg(env, label):
+        try:
+            pr = subprocess.run(["curl", "-4", "-s", "--max-time", "15",
+                                 "https://ifconfig.co/json"],
+                                capture_output=True, timeout=25, env=env)
+            j = json.loads(pr.stdout.decode())
+            return {"ip": j.get("ip"), "country": j.get("country_iso"),
+                    "asn": j.get("asn"), "said_by": "ifconfig.co", "leg": label}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"[:120], "leg": label}
+
+    stripped = {k: v for k, v in os.environ.items() if k not in pvars}
+    proxy_env = {k: os.environ[k] for k in pvars if os.environ.get(k)}
+    rec = {"proxy_env": proxy_env or None,
+           "as_invoked": leg(os.environ.copy(), "as-invoked"),
+           "proxy_stripped": leg(stripped, "proxy-stripped")}
+    a, b = rec["as_invoked"].get("ip"), rec["proxy_stripped"].get("ip")
+    rec["legs_agree"] = (a == b) if (a and b) else None
+    return rec
+
+
+# ------------------------------------------------------------------ the tick
+
+
+def corpus_bytes(out_path):
+    try:
+        return os.path.getsize(out_path)
+    except OSError:
+        return 0
+
+
+def tick(args, ledger):
+    sites_all = frame_sites(args.frame)
+    if not sites_all:
+        return record(ledger, "stood-down", f"frame has no sites: {args.frame}"), 2
+
+    pid, why = holder(args.lock)
+    if pid:
+        return record(ledger, "stood-down", f"another tick is running ({why})"), 0
+
+    free_gb = shutil.disk_usage(REPO).free / 1e9
+    if free_gb < MIN_FREE_GB:
+        return record(ledger, "stood-down",
+                      f"free space {free_gb:.1f}GB below the {MIN_FREE_GB}GB floor",
+                      free_gb=round(free_gb, 2)), 2
+
+    cur = read_cursor(args.cursor, len(sites_all))
+    take = [sites_all[(cur + i) % len(sites_all)] for i in range(args.sites)]
+    urls = [f"https://{d}/" for d in take]
+    out_path = os.path.join(DATA, f"passive-{datetime.now(timezone.utc):%Y-%m-%d}.jsonl")
+
+    if args.dry_run:
+        return record(ledger, "dry-run", "no capture launched",
+                      cursor_from=cur, sites=take, out=os.path.basename(out_path)), 0
+
+    # THE CURSOR MOVES FIRST. A tick killed mid-capture must not hand its successor the same
+    # four sites; the cost of advancing early is that a crashed tick's sites are skipped
+    # once, and the ledger row says so. The opposite cost — repeating them silently — is
+    # unbounded, because nothing downstream can tell a re-load from a fresh one.
+    write_cursor(args.cursor, (cur + args.sites) % len(sites_all))
+
+    os.makedirs(DATA, exist_ok=True)
+    with open(args.lock, "w") as f:
+        f.write(str(os.getpid()))
+
+    before = corpus_bytes(out_path)
+    eg = egress_legs()
+    t0 = time.time()
+    cmd = [VENV, CAPTURE] + urls + [
+        "--settle", str(args.settle), "--nav-timeout", str(NAV_TIMEOUT),
+        "--arm", "passive", "--via", "direct", "--out", out_path]
+    try:
+        pr = subprocess.run(cmd, capture_output=True,
+                            timeout=args.settle * args.sites * 4 + 300,
+                            env=dict(os.environ, HOME=os.path.expanduser("~")))
+        rc = pr.returncode
+        err = pr.stderr.decode("utf-8", "replace")[-1200:]
+    except subprocess.TimeoutExpired:
+        rc, err = None, "capture exceeded its own wall bound"
+    finally:
+        try:
+            os.unlink(args.lock)
+        except OSError:
+            pass
+
+    after = corpus_bytes(out_path)
+    loads, cands = 0, 0
+    if after > before:
+        with open(out_path) as fh:
+            fh.seek(before)
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("kind") == "load":
+                    loads += 1
+                elif o.get("is_bid_candidate"):
+                    cands += 1
+
+    # The outcome word is decided by what reached the corpus, never by the child's rc alone:
+    # a capture can exit 0 having refused every load, and it can exit non-zero after writing
+    # most of them. Both facts are recorded; only one of them is the coverage.
+    if loads == 0:
+        outcome, reason = "collected-nothing", (
+            f"capture rc={rc} wrote no load rows — "
+            + (err.strip().splitlines()[-1][:200] if err.strip() else "no stderr"))
+    elif loads < len(urls):
+        outcome, reason = "partial", f"{loads}/{len(urls)} sites produced a load row (rc={rc})"
+    else:
+        outcome, reason = "collected", f"{loads}/{len(urls)} sites (rc={rc})"
+
+    return record(ledger, outcome, reason,
+                  cursor_from=cur, sites=take, rc=rc,
+                  loads=loads, bid_candidates=cands,
+                  bytes_added=after - before, corpus_bytes=after,
+                  seconds=round(time.time() - t0, 1),
+                  out=os.path.basename(out_path),
+                  egress=eg,
+                  free_gb=round(free_gb, 2)), (0 if loads else 1)
+
+
+# ------------------------------------------------------------------ selftest
+
+
+def selftest():
+    import tempfile
+    ok = True
+    base = tempfile.mkdtemp(prefix="adint-passive-test-")
+
+    def check(name, got, want=True):
+        nonlocal ok
+        good = (got == want)
+        ok = ok and good
+        print(f"  [{'ok ' if good else 'FAIL'}] {name}" + ("" if good else f"  got={got!r}"))
+        return good
+
+    # --- the frame parser drops the header and the comments, keeps the domains
+    fpath = os.path.join(base, "frame.tsv")
+    open(fpath, "w").write("# a comment\nrank\tdomain\tx\ty\tz\n"
+                           "721\tmagnit.ru\ta\tb\tc\n1146\tpikabu.ru\ta\tb\tc\n")
+    check("frame parser keeps only domains", frame_sites(fpath), ["magnit.ru", "pikabu.ru"])
+
+    # --- the cursor advances and WRAPS, so a week walks the frame round rather than
+    #     re-sweeping its head
+    cpath = os.path.join(base, "cursor")
+    write_cursor(cpath, 1)
+    check("cursor wraps at the frame length", read_cursor(cpath, 2), 1)
+    write_cursor(cpath, 5)
+    check("cursor modulo, not out of range", read_cursor(cpath, 2), 1)
+    check("absent cursor reads 0, not an error", read_cursor(os.path.join(base, "nope"), 2), 0)
+
+    # --- the one-writer guard: a recycled pid must NOT wedge the lane
+    lock = os.path.join(base, "lock")
+    open(lock, "w").write("1")          # pid 1 is alive and is not this tool
+    pidv, why = holder(lock)
+    check("a live pid that is not this tool is not a holder", pidv, None)
+    check("and it says why", "not this tool" in why or "another user" in why)
+    open(lock, "w").write("999999")     # almost certainly dead
+    check("a dead pid is not a holder", holder(lock)[0], None)
+    open(lock, "w").write(str(os.getpid()))  # us: cmdline carries our own name
+    check("our own live pid IS a holder", holder(lock)[0], os.getpid())
+    open(lock, "w").write("not-a-number")
+    check("an unreadable lock is not a holder", holder(lock)[0], None)
+
+    # --- EVERY path writes a ledger row, including the ones that collected nothing.
+    #     Driven, not asserted: three stand-down paths, each must leave a row.
+    led = os.path.join(base, "ledger.jsonl")
+    a = argparse.Namespace(frame=os.path.join(base, "absent.tsv"), sites=2, settle=1,
+                           dry_run=False, cursor=cpath, lock=lock)
+    tick(a, led)
+    a.frame, a.lock = fpath, os.path.join(base, "free-lock")
+    a.dry_run = True
+    tick(a, led)
+    rows = [json.loads(x) for x in open(led) if x.strip()]
+    check("a missing frame still wrote a row", rows[0]["outcome"], "stood-down")
+    check("a dry run still wrote a row", rows[1]["outcome"], "dry-run")
+    check("every row carries a reason", all(r.get("reason") for r in rows))
+
+    # --- and the busy path stands down rather than launching a second browser
+    open(a.lock, "w").write(str(os.getpid()))
+    a.dry_run = False
+    r, rc = tick(a, led)
+    check("a live holder makes the tick stand down", r["outcome"], "stood-down")
+    check("and the stand-down is rc 0, not an error", rc, 0)
+
+    # --- the egress record carries both legs and never invents one
+    eg = egress_legs()
+    check("egress record has both legs",
+          set(("as_invoked", "proxy_stripped")) <= set(eg))
+    check("legs_agree is a verdict or None, never a silent default",
+          eg["legs_agree"] in (True, False, None))
+
+    print(f"\nselftest: {'PASS' if ok else 'FAIL'}  (workdir {base})")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frame", default=FRAME)
+    ap.add_argument("--sites", type=int, default=SITES_PER_TICK)
+    ap.add_argument("--settle", type=int, default=SETTLE)
+    ap.add_argument("--cursor", default=CURSOR)
+    ap.add_argument("--lock", default=LOCK)
+    ap.add_argument("--ledger", default=LEDGER)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+    try:
+        row, rc = tick(a, a.ledger)
+    except Exception as e:
+        # A crash is an OUTCOME and must reach the tape. A lane whose failures are invisible
+        # to its own ledger reports its silences as quiet weeks.
+        record(a.ledger, "crashed", f"{type(e).__name__}: {e}"[:300])
+        raise
+    print(json.dumps(row, ensure_ascii=False))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

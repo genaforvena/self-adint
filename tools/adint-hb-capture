@@ -637,6 +637,46 @@ def vantage_collapse(exits):
                + " ".join(f"{a}={exits[a]}" for a in sorted(exits)))
 
 
+def via_direct_leak_verdict(browser_exit, parent_direct, proxied):
+    """Did a `--via direct` browser leak back through the inherited proxy? -> (rc, word).
+
+    THREE outcomes, and the third is the whole point:
+
+      rc 0  "proven-distinct: …"   the parent's two legs are different addresses and the
+                                   browser matched the DIRECT one — a leak would have shown
+      rc 1  "LEAK: …"              the legs differ and the browser matched the PROXIED one
+      rc 0  "unprovable-…"         the legs coincide, or the parent's direct leg is unknown
+      rc 0  "n/a: …"               there is no proxy in this environment to leak into
+
+    Why `unprovable` is rc 0 and not a refusal. Until 2026-08-30 this comparison lived
+    inline and refused whenever the browser's exit equalled the proxied one. That is only a
+    leak while the node's own route lands somewhere ELSE — and on this node it stopped
+    doing so: the host consumes phaedra as its tailscale exit node while privoxy's socks
+    tunnel lands on phaedra too, so both legs read 38.49.216.141. With one address in the
+    world a leaked browser and a perfectly direct one produce the identical reading, and
+    refusing there converts an undecidable case into a positive. It blocked every
+    single-arm passive run on this node, which is how it was found.
+
+    The verdict is a WORD that travels onto the row, never a silent pass: a run whose check
+    was `unprovable-*` is not a run that passed it, and a reader joining these rows later
+    has no other way to tell the two apart.
+    """
+    if not proxied:
+        return 0, "n/a: no proxy in this environment to leak into"
+    if not parent_direct:
+        return 0, ("unprovable-parent-direct-unknown: the parent's proxy-stripped leg could "
+                   "not be read, so the browser's exit cannot be attributed")
+    if parent_direct == proxied:
+        return 0, (f"unprovable-single-exit: the node's own route and the proxy's far end "
+                   f"are both {proxied}, so a leak and a direct run read identically")
+    if browser_exit == proxied:
+        return 1, (f"refusing: --via direct left from {browser_exit}, which is the PROXY's "
+                   f"exit, while the node's own route is {parent_direct} — the run is not "
+                   f"what its label says")
+    return 0, (f"proven-distinct: browser={browser_exit} parent-direct={parent_direct} "
+               f"proxied={proxied}")
+
+
 # The echo host is part of the INSTRUMENT, and on a censored or mangling vantage it can be the
 # one host that does not work. Measured 2026-08-18 from the RU MTS vantage: MTS's own resolvers
 # (212.188.31.154/155) answer api.ipify.org AND example.com with 8.47.69.0 / 8.6.112.0 — the
@@ -802,6 +842,12 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         "egress_ip_proxied": ip.get("egress_ip_proxied") if isinstance(ip, dict) else None,
         "egress_ip_direct": ip.get("egress_ip_direct") if isinstance(ip, dict) else None,
         "proxy_env": ip.get("proxy_env") if isinstance(ip, dict) else None,
+        # What the `--via direct` leak check was actually able to CONCLUDE. A run whose
+        # check was `unprovable-*` is not a run that passed it, and the distinction has to
+        # survive onto the artifact — a reader joining these rows a month from now has no
+        # other way to tell a proven vantage from an undecidable one.
+        "via_direct_leak_check": (ip.get("via_direct_leak_check")
+                                  if isinstance(ip, dict) else None),
         # PROFILE AGE IS THE TREATMENT, not a constant. Until 2026-08-20 this field was
         # hardcoded 0 and the comment below explained why that was safe — a fresh context per
         # load means cookie age cannot become an unrecorded covariate. True, and it also made
@@ -1124,7 +1170,7 @@ def capture(pw, url, settle, nav_timeout, ip, run_idx, arm, headed=False, arm_no
         for k in ("run_idx", "arm", "arm_note", "egress_ip", "browser_used_proxy",
                   "nav_timeout_s", "nav_attempts",
                   "browser_egress_ip", "browser_egress_attempts",
-                  "vantage_verified",
+                  "vantage_verified", "via_direct_leak_check",
                   "hour_utc", "profile_age_s"):
             row[k] = load.get(k)
     return load, rows
@@ -1360,12 +1406,34 @@ def main():
             # launched. Only asked when there IS a proxy leg to collide with: with no proxy
             # in the environment egress_ips() reports None for it (never a number), and
             # comparing against None here would refuse a run that has no proxy to leak into.
-            if ip.get("egress_ip_proxied"):
-                rc_v, msg_v = vantage_collapse({"--via direct": seen,
-                                                "the proxy's exit": ip.get("egress_ip_proxied")})
-                if rc_v == 1:
-                    print(msg_v, file=sys.stderr)
-                    return 1
+            #
+            # BUT THE COMPARISON IS ONLY DECIDABLE WHILE THE NODE'S OWN ROUTE AND THE PROXY'S
+            # FAR END ARE DIFFERENT ADDRESSES, and on 2026-08-30 they stopped being: this node
+            # consumes phaedra as its tailscale exit node while privoxy's socks tunnel lands
+            # on phaedra too, so the parent's direct leg and its proxied leg both read
+            # 38.49.216.141. With one address in the world, "did the browser leak back into
+            # privoxy?" HAS NO OBSERVABLE ANSWER — a leaked browser and a perfectly direct one
+            # produce the identical reading. Refusing there is not caution, it is treating an
+            # undecidable case as a positive, and it blocked every single-arm passive run on
+            # this node until it was found. (Same shape as a probe that blames the far end for
+            # a failure mode both ends share.)
+            #
+            # So the check now has THREE outcomes and the third is a word, not a refusal:
+            #   proven-distinct    the parent's two legs differ and the browser matched the
+            #                      direct one — a leak would have shown and did not
+            #   LEAK (rc 1)        the parent's two legs differ and the browser matched the
+            #                      PROXIED one — the run is not what it says it is
+            #   unprovable-...     the legs coincide, or the parent's direct leg is unknown —
+            #                      no evidence either way, recorded ON THE ROW so a reader can
+            #                      never mistake this run's `--via direct` for a proven one
+            rc_v, word = via_direct_leak_verdict(seen, ip.get("egress_ip_direct"),
+                                                 ip.get("egress_ip_proxied"))
+            ip["via_direct_leak_check"] = word
+            if rc_v == 1:
+                print(word, file=sys.stderr)
+                return 1
+            if word.startswith("unprovable"):
+                print("note: " + word, file=sys.stderr)
             ip["egress_ip_direct"] = seen
         for i, u in enumerate(urls, 1):
             arm = plan[i - 1]
@@ -2070,6 +2138,38 @@ document.cookie = 'adint_warm=1; path=/; max-age=3600';
              live["load"].get("vantage_verified") is True
              and live["load"].get("browser_egress_ip") == live["direct"]),
         ]
+    # THE --via direct LEAK VERDICT — driven over every world it can meet, because its
+    # third outcome is the one that was missing and the cost of getting it wrong ran in
+    # both directions: refusing an undecidable case blocked every single-arm run on this
+    # node, and calling it a pass would have published an unproven vantage as a proven one.
+    checks += [
+        # a real leak, and only here may it refuse
+        ("a --via direct browser wearing the PROXY's exit is a leak (rc 1)",
+         via_direct_leak_verdict("2.2.2.2", "1.1.1.1", "2.2.2.2")[0] == 1),
+        ("and the refusal names both addresses, not just the fact",
+         "1.1.1.1" in via_direct_leak_verdict("2.2.2.2", "1.1.1.1", "2.2.2.2")[1]
+         and "2.2.2.2" in via_direct_leak_verdict("2.2.2.2", "1.1.1.1", "2.2.2.2")[1]),
+        # the honest pass
+        ("a browser on the node's own route with the legs distinct is proven",
+         via_direct_leak_verdict("1.1.1.1", "1.1.1.1", "2.2.2.2")[0] == 0
+         and via_direct_leak_verdict("1.1.1.1", "1.1.1.1", "2.2.2.2")[1]
+         .startswith("proven-distinct")),
+        # THE CASE THIS NODE IS IN. One address in the world: a leak and a direct run read
+        # identically, so the only honest verdict is that there is no evidence either way.
+        ("legs that coincide render UNPROVABLE and do not refuse",
+         via_direct_leak_verdict("1.1.1.1", "1.1.1.1", "1.1.1.1")[0] == 0
+         and via_direct_leak_verdict("1.1.1.1", "1.1.1.1", "1.1.1.1")[1]
+         .startswith("unprovable-single-exit")),
+        # …and it must never read as a pass. The word is the artifact, not the rc.
+        ("an unprovable check is not worded as proven",
+         "proven" not in via_direct_leak_verdict("1.1.1.1", "1.1.1.1", "1.1.1.1")[1]),
+        ("an unreadable parent leg is unprovable, never proven",
+         via_direct_leak_verdict("1.1.1.1", None, "2.2.2.2")[1]
+         .startswith("unprovable-parent-direct-unknown")),
+        ("with no proxy in the environment there is nothing to leak into",
+         via_direct_leak_verdict("1.1.1.1", "1.1.1.1", None)[1].startswith("n/a:")),
+    ]
+
     # THE ECHO CONTROL IS A DIAGNOSTIC ON A FAILURE PATH, so the one thing it must never
     # do is raise — a crash there would turn an honest rc=2 refusal into a traceback and
     # lose the refusal itself. Driven with a captured stderr, asserting it probes EVERY
