@@ -1,0 +1,1 @@
+WIN WITH NO PRICE: wins=1 zero_price_wins=1 spend=0.000000 — spend is a LOWER BOUND

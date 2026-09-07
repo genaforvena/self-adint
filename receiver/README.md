@@ -12,6 +12,10 @@ decoy's bid, and persists **only** the target device's payload. Runs on syntheti
     ADINT_ADDR=127.0.0.1:8788 \
     go run .
 
+For a fresh loopback-only process run against the committed synthetic corpus:
+
+    tools/adint-receiver-run --out receiver/testdata/step1-2026-09-07-final
+
 `POST /bid` (OpenRTB BidRequest JSON) · `GET /win?p=<price>` (win notice) · `GET /healthz`.
 
 Env: `ADINT_TARGET_IFA` (required — the only ifa ever written), `ADINT_FLOOR` (fallback floor),

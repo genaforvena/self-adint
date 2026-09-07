@@ -1,0 +1,5 @@
+2026/09/07 11:37:37 adint receiver: listening on 127.0.0.1:48761 (cap=$0.50, target set, allow="com.pass.a,com.pass.b")
+2026/09/07 11:37:37 panic in /bid recovered: synthetic panic (test harness)
+2026/09/07 11:37:37 panic in /bid recovered: synthetic panic (test harness)
+2026/09/07 11:37:37 WIN WITH NO PRICE: wins=1 zero_price_wins=1 — settlement macro unexpanded, or a zero settlement; spend is a LOWER BOUND
+2026/09/07 11:37:37 ALERT FIRST NON-ZERO WIN: price=0.1200 spend=0.1200 cap=0.5000

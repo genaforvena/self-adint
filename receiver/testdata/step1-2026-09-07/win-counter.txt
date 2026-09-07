@@ -1,0 +1,1 @@
+wins=2 spend=0.120000 cap=0.500000 zero_price_wins=1

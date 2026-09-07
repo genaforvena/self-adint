@@ -1,0 +1,1 @@
+FIRST NON-ZERO WIN: price=0.5000 spend=0.5000 cap=0.5000

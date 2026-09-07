@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Freeze the passive baseline and a signed, offline treatment/control replay.
+
+No network calls and no active-oracle requests are made. All output is written under the
+explicit --out directory. A row's signature is a SHA-256 digest of its canonical JSON.
+"""
+import argparse, hashlib, json, pathlib, tempfile
+from collections import Counter
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+LEDGER = ROOT / "data/passive-collect-ledger.jsonl"
+CORPUS = ROOT / "data/passive-2026-09-07.jsonl"
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+def signed(kind, source_digest, status):
+    row = {"kind": kind, "source_sha256": source_digest, "status": status}
+    row["signature_sha256"] = digest(row)
+    return row
+
+def run(out):
+    out.mkdir(parents=True, exist_ok=False)
+    ledger = read_jsonl(LEDGER)
+    corpus = read_jsonl(CORPUS)
+    schemas = Counter(row.get("schema") for row in corpus if row.get("kind") == "request")
+    kinds = Counter(row.get("kind") for row in corpus)
+    outcomes = Counter(row.get("outcome") for row in ledger)
+    loads = [row for row in corpus if row.get("kind") == "load"]
+    agrees = Counter(str(row.get("egress", {}).get("legs_agree")) for row in ledger)
+    source = digest({"ledger": ledger, "corpus": corpus})
+    baseline = {
+        "schema": {str(k): v for k, v in sorted(schemas.items(), key=lambda x: str(x[0]))},
+        "corpus_rows_by_kind": dict(sorted(kinds.items())), "corpus_rows": len(corpus),
+        "ledger_rows": len(ledger), "ledger_outcomes": dict(sorted(outcomes.items())),
+        "load_rows": len(loads), "priced_request_rows": sum(r.get("outcome") == "priced" for r in corpus),
+        "egress_legs_agree_in_ledger": dict(sorted(agrees.items())), "source_sha256": source,
+        "interpretation": "browser passive corpus; not phone/device or seat evidence",
+    }
+    (out / "passive-ledger.jsonl").write_text(LEDGER.read_text())
+    (out / "schema-egress-report.json").write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+    verdict = {"verdict": "NOT_ELIGIBLE", "active_result": None,
+               "reason": "passive browser evidence does not establish device seat payload-empty-or-hashed gate",
+               "required_before_active": "a measured device/seat payload verdict, then operator go for active treatment"}
+    (out / "oracle-verdict.json").write_text(json.dumps(verdict, indent=2, sort_keys=True) + "\n")
+    schedule = {"mode": "passive-only", "active_oracle": "held", "treatment": "replay passive baseline",
+                "control": "replay the identical baseline input", "network_calls": 0,
+                "next_gate": "device/seat payload-empty-or-hashed evidence"}
+    (out / "schedule.json").write_text(json.dumps(schedule, indent=2, sort_keys=True) + "\n")
+    events = [signed("treatment", source, "passive-baseline-replayed"),
+              signed("control", source, "identical-baseline-replayed")]
+    (out / "events.jsonl").write_text("".join(json.dumps(x, sort_keys=True) + "\n" for x in events))
+    runs = [{"run_id": "passive-baseline-2026-09-07", "arm": "treatment", "source_sha256": source,
+             "rows": len(corpus), "network": False},
+            {"run_id": "passive-baseline-2026-09-07-control-replay", "arm": "control", "source_sha256": source,
+             "rows": len(corpus), "network": False}]
+    (out / "runs.jsonl").write_text("".join(json.dumps(x, sort_keys=True) + "\n" for x in runs))
+    report = {"treatment_control": "replayed control identical to treatment input", "network_calls": 0,
+              "rows_each": len(corpus), "source_digests_equal": True,
+              "event_signatures_valid": all(e["signature_sha256"] == digest({k: v for k, v in e.items() if k != "signature_sha256"}) for e in events),
+              "active_oracle_result": None, "verdict": "persistence-verified-offline"}
+    (out / "persistence-report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    manifest = []
+    for path in sorted(out.iterdir()):
+        if path.name != "SHA256SUMS":
+            manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+    (out / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
+
+def selftest():
+    with tempfile.TemporaryDirectory(prefix="adint-passive-test-") as d:
+        root = pathlib.Path(d); global LEDGER, CORPUS
+        old = LEDGER, CORPUS
+        try:
+            LEDGER = root / "ledger.jsonl"; CORPUS = root / "corpus.jsonl"
+            LEDGER.write_text('{"outcome":"collected","egress":{"legs_agree":true}}\n')
+            CORPUS.write_text('{"schema":7,"kind":"load"}\n{"schema":7,"kind":"request","outcome":"priced"}\n')
+            out = root / "out"; run(out)
+            verdict = json.loads((out / "oracle-verdict.json").read_text())
+            report = json.loads((out / "persistence-report.json").read_text())
+            assert verdict["verdict"] == "NOT_ELIGIBLE"
+            assert report["source_digests_equal"] and report["active_oracle_result"] is None
+            lines = (out / "events.jsonl").read_text().splitlines()
+            assert all(json.loads(x)["signature_sha256"] for x in lines)
+        finally: LEDGER, CORPUS = old
+    print("selftest: ok")
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--out"); ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test: selftest(); return 0
+    if not args.out: ap.error("--out is required")
+    run(pathlib.Path(args.out)); print(args.out); return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

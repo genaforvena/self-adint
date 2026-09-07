@@ -119,6 +119,14 @@ code being a mesh organ, so the tool carries no `# reflex-cadence:` header and i
 to `mesh-autowire` and `mesh-doctor` by construction. The existing 301 crontab lines were
 verified byte-identical after the write.
 
+## Echo redundancy added 2026-09-07
+
+Each passive tick now records the ordered attempts against two independent IP-echo providers for
+each process leg. A dead provider is retained as a failed attempt and the next provider may still
+establish the leg; if all providers fail, the leg's IP remains `null` and the tick is UNKNOWN rather
+than a fabricated egress. This closes the single-provider outage shape without turning provider
+availability into a market result.
+
 ## What this lane is not
 
 It is not the seat. Step 4 as the plan writes it reads bid requests arriving *for his

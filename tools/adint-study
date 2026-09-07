@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Render the current self-ADINT study state without performing gated actions."""
+
+import argparse
+import json
+import os
+import sys
+
+
+def _exists(root, *parts):
+    return os.path.exists(os.path.join(root, *parts))
+
+
+def _nonempty(root, *parts):
+    path = os.path.join(root, *parts)
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def phase_status(root):
+    """Return statuses derived only from artifacts already on disk."""
+    data = os.path.join(root, "data")
+    device = _nonempty(root, "data", "device-observations.jsonl")
+    web = _nonempty(root, "data", "passive-collect-ledger.jsonl")
+    payload_gate = os.path.join(data, "step4-payload-verdict.json")
+    oracle_ready = False
+    if os.path.exists(payload_gate):
+        try:
+            with open(payload_gate, encoding="utf-8") as fh:
+                oracle_ready = json.load(fh).get("verdict") == "empty_or_hashed"
+        except (OSError, ValueError):
+            oracle_ready = False
+    return {
+        "step0-device-entry-points": {
+            "status": "MEASURED" if _nonempty(root, "data", "bundle-exchange.tsv") else "UNKNOWN",
+            "next": "inspect the device export" if not _nonempty(root, "data", "bundle-exchange.tsv") else "rederive from the append-only records",
+        },
+        "step1-local-receiver": {
+            "status": "MEASURED" if _exists(root, "receiver", "testdata", "step1-2026-08-30", "summary.json") else "UNKNOWN",
+            "next": "run receiver test corpus" if not _exists(root, "receiver", "testdata", "step1-2026-08-30", "summary.json") else "audit win and spend markers",
+        },
+        "step2-questions": {"status": "DRAFT_ONLY", "next": "operator sends questions after choosing a candidate"},
+        "step3-seat": {"status": "GATED_OPERATOR_GO", "next": "operator explicitly authorises onboarding, agreement, and payment"},
+        "step4-device": {
+            "status": "MEASURED" if device else "BLOCKED_OPERATOR_EXPORT",
+            "next": "import an operator-exported PCAPdroid CSV" if not device else "run bundle aggregation and inspect coverage",
+        },
+        "step4-web": {
+            "status": "MEASURED" if web else "UNKNOWN",
+            "next": "inspect passive ledger and corpus" if web else "start the safe passive lane",
+        },
+        "step5-oracle": {
+            "status": "READY_OPERATOR_GO" if oracle_ready else "NOT_ELIGIBLE",
+            "next": "operator go required before any active targeting" if oracle_ready else "wait for measured payload-empty/hashed evidence",
+        },
+        "step6-gaid-reset": {
+            "status": "GATED_OPERATOR_GO" if _nonempty(root, "data", "step4-baseline.json") else "NO-BASIS",
+            "next": "build passive baseline, then request explicit reset go" if not _nonempty(root, "data", "step4-baseline.json") else "operator explicitly authorises destructive reset",
+        },
+    }
+
+
+def selftest():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        rows = phase_status(td)
+        assert rows["step3-seat"]["status"] == "GATED_OPERATOR_GO"
+        assert rows["step4-device"]["status"] == "BLOCKED_OPERATOR_EXPORT"
+        assert rows["step5-oracle"]["status"] == "NOT_ELIGIBLE"
+    print("selftest: PASS")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--out")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    result = phase_status(args.root)
+    text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+    if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    print(text, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

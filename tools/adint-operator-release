@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Build a deterministic, redacted operator-gated release bundle.
+
+The bundle is a handoff artifact, not an authorization mechanism.  It records every
+unfinished branch, its evidence, and its witness disposition without copying raw device
+captures or the private passive ledger.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUT = ROOT / "data" / "operator-release-2026-09-07"
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    else:
+        for child in sorted(path.rglob("*")):
+            if child.is_file():
+                h.update(child.relative_to(path).as_posix().encode() + b"\0")
+                with child.open("rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+    return h.hexdigest()
+
+
+def write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def source_status() -> dict:
+    status_path = ROOT / "data" / "study-status.json"
+    if not status_path.is_file():
+        raise SystemExit(f"missing measured status: {status_path}")
+    return json.loads(status_path.read_text())
+
+
+def build(out: Path) -> None:
+    if out.exists():
+        shutil.rmtree(out)
+    (out / "evidence").mkdir(parents=True)
+
+    status = source_status()
+    baseline_dir = ROOT / "data" / "passive-oracle-2026-09-07"
+    baseline_report = json.loads((baseline_dir / "schema-egress-report.json").read_text())
+    verdict = json.loads((baseline_dir / "oracle-verdict.json").read_text())
+    baseline_digest = sha256(baseline_dir)
+
+    branches = [
+        {
+            "branch": "device-capture",
+            "status": status["step4-device"]["status"],
+            "gate": "operator_export",
+            "next_action": status["step4-device"]["next"],
+            "evidence": ["docs/full-study-review-2026-09-07.md", "docs/device-observations-blocked-2026-09-07.md"],
+            "witness": {"state": "absent", "disposition": "UNFINISHED_BLOCKED_OPERATOR_EXPORT", "required": "complete PCAPdroid CSV plus reachable host/device label"},
+        },
+        {
+            "branch": "seat-onboarding",
+            "status": status["step3-seat"]["status"],
+            "gate": "explicit_operator_go",
+            "next_action": status["step3-seat"]["next"],
+            "evidence": ["docs/full-study-review-2026-09-07.md", "docs/step3-small-buyer-onboarding-2026-08-15-ru.md"],
+            "witness": {"state": "absent", "disposition": "UNFINISHED_OPERATOR_DECISION_REQUIRED", "required": "operator go per onboarding/agreement/payment step"},
+        },
+        {
+            "branch": "active-oracle",
+            "status": status["step5-oracle"]["status"],
+            "gate": "measured_device_seat_payload_empty_or_hashed",
+            "next_action": status["step5-oracle"]["next"],
+            "evidence": ["data/passive-oracle-2026-09-07/oracle-verdict.json", "docs/passive-oracle-persistence-2026-09-07.md"],
+            "witness": {"state": "present", "disposition": "UNFINISHED_NOT_ELIGIBLE", "required": "device/seat payload gate; no active result exists"},
+        },
+        {
+            "branch": "gaid-reset",
+            "status": status["step6-gaid-reset"]["status"],
+            "gate": "device_baseline_and_explicit_operator_go",
+            "next_action": status["step6-gaid-reset"]["next"],
+            "evidence": ["docs/full-study-review-2026-09-07.md", "docs/passive-oracle-persistence-2026-09-07.md"],
+            "witness": {"state": "absent", "disposition": "UNFINISHED_NO_BASIS_NO_RESET", "required": "device baseline followed by explicit reset go"},
+        },
+    ]
+    ledger = out / "decision-ledger.jsonl"
+    with ledger.open("w") as f:
+        for row in branches:
+            f.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+
+    evidence = {
+        "bundle": "operator-gated-release",
+        "source_status": "data/study-status.json",
+        "branches": [
+            {"branch": b["branch"], "status": b["status"], "witness": b["witness"]} for b in branches
+        ],
+        "passive_baseline": {
+            "artifact": "data/passive-oracle-2026-09-07",
+            "sha256": baseline_digest,
+            "schema": baseline_report.get("schema"),
+            "oracle_verdict": verdict.get("verdict"),
+            "active_result": verdict.get("active_result"),
+            "network_calls": 0,
+        },
+        "redaction": {"raw_device_capture": "excluded", "raw_passive_ledger": "excluded", "full_ifa": "excluded", "request_body": "excluded"},
+    }
+    write_json(out / "evidence" / "evidence-blocks.json", evidence)
+    write_json(out / "baseline-lock.json", {
+        "baseline": "data/passive-oracle-2026-09-07",
+        "sha256": baseline_digest,
+        "reset": "not performed",
+        "reset_requires": "explicit operator go after a measured device baseline",
+        "active_oracle": "held",
+        "comparison_rule": "a reset run must preserve this digest and write a new, separately named artifact",
+    })
+    (out / "guide-redacted.md").write_text("""# Self-ADINT operator-gated release guide\n\nThis bundle is a reproducible handoff. It contains no raw device capture, full advertising ID, request body, or private passive ledger.\n\n## Current disposition\n\nRead `decision-ledger.jsonl` and `evidence/evidence-blocks.json`. Every unfinished branch has a status, next action, evidence pointers, and a witness disposition.\n\n## Safe reproduction\n\nFrom the repository root:\n\n```\npython3 tools/adint-operator-release --out data/operator-release-2026-09-07\n(cd data/operator-release-2026-09-07 && sha256sum -c SHA256SUMS)\n```\n\nThe output is deterministic for the same source artifacts. The passive baseline is bound by `baseline-lock.json`; its hash must match before any comparison.\n\n## Operator gates\n\nThe device export, seat onboarding, active oracle, and GAID reset remain unfinished. No onboarding, agreement, payment, active bid, outbound letter, or GAID reset was performed. A reset is not authorized by this bundle: the operator must explicitly go, per step, after a measured device baseline exists.\n\n## Redaction boundary\n\nThe bundle is suitable for handoff inside the project. It is not a public-data publication: keep the generated `data/` directory private and do not copy raw observations into tracked files.\n""")
+    (out / "HANDOFF.md").write_text("""# Handoff — operator-gated release\n\nDone: decision ledger, redacted guide, evidence blocks, deterministic baseline lock, and witness dispositions for every unfinished branch.\n\nNext exact action: obtain one complete operator-exported PCAPdroid CSV and reachable Termux SSH host/device label; then run `tools/adint-device-capture --pull` and regenerate this bundle.\n\nHeld: active oracle, seat onboarding, and GAID reset. No irreversible step was taken.\n""")
+
+    files = sorted(p for p in out.rglob("*") if p.is_file())
+    lines = [f"{sha256(p)}  {p.relative_to(out).as_posix()}" for p in files]
+    (out / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    write_json(out / "manifest.json", {"format": 1, "files": [p.relative_to(out).as_posix() for p in files] + ["SHA256SUMS", "manifest.json"], "baseline_sha256": baseline_digest})
+
+
+def selftest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        a, b = Path(td) / "a", Path(td) / "b"
+        build(a)
+        build(b)
+        def tree(p: Path) -> dict:
+            return {x.relative_to(p).as_posix(): x.read_bytes() for x in p.rglob("*") if x.is_file()}
+        if tree(a) != tree(b):
+            raise AssertionError("reproduction mismatch")
+        if sha256(ROOT / "data" / "passive-oracle-2026-09-07") != json.loads((a / "baseline-lock.json").read_text())["sha256"]:
+            raise AssertionError("baseline hash mismatch")
+        rows = [json.loads(x) for x in (a / "decision-ledger.jsonl").read_text().splitlines()]
+        if len(rows) != 4 or any("witness" not in row or "disposition" not in row["witness"] for row in rows):
+            raise AssertionError("unfinished branch witness disposition missing")
+        print("selftest: deterministic reproduction, baseline hash, and witness dispositions: ok")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        selftest()
+        return 0
+    build(args.out)
+    print(f"bundle -> {args.out}")
+    print(f"baseline -> {(args.out / 'baseline-lock.json').read_text().splitlines()[2].strip()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

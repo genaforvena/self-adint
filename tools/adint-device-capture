@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Pull one operator-exported PCAPdroid CSV and produce a provenance manifest.
+
+This tool never starts/stops a VPN capture and never guesses a phone address.  The operator
+exports the CSV; this command only performs an explicit read-only pull when --pull is given.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+
+def remote_command(host, remote_csv, local_csv):
+    return ["scp", "-P", "8022", "%s:%s" % (host, remote_csv), local_csv]
+
+
+def manifest(csv_path, device, records):
+    with open(csv_path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return {"device": device, "source_csv_sha256": digest, "records": records}
+
+
+def pull_and_import(args):
+    required = (args.host, args.remote_csv, args.out, args.device)
+    if not all(required):
+        raise SystemExit("--host, --remote-csv, --out and --device are required")
+    part_csv = args.out + ".csv.part"
+    part_jsonl = args.out + ".jsonl.part"
+    manifest_path = args.out + ".manifest.json"
+    cmd = remote_command(args.host, args.remote_csv, part_csv)
+    if args.dry_run:
+        print(json.dumps({"command": cmd, "out": args.out}, ensure_ascii=False))
+        return 0
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    try:
+        subprocess.run(cmd, check=True)
+        importer = os.path.join(os.path.dirname(__file__), "adint-import-pcapdroid")
+        with open(part_jsonl, "w", encoding="utf-8") as out:
+            subprocess.run([sys.executable, importer, "--device", args.device,
+                            "--source", "pcapdroid-device-export", "--in", part_csv,
+                            "--ring", str(args.ring)], stdout=out, check=True)
+        os.replace(part_jsonl, args.out)
+        records = sum(1 for line in open(args.out, encoding="utf-8") if line.strip())
+        with open(manifest_path + ".part", "w", encoding="utf-8") as fh:
+            json.dump(manifest(part_csv, args.device, records), fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(manifest_path + ".part", manifest_path)
+        os.unlink(part_csv)
+        print(json.dumps({"artifact": args.out, "manifest": manifest_path,
+                          "records": records}, ensure_ascii=False))
+        return 0
+    except Exception:
+        for path in (part_csv, part_jsonl, manifest_path + ".part"):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def selftest():
+    assert remote_command("termux-user@phone", "/sdcard/Download/a.csv", "/tmp/a.csv") == [
+        "scp", "-P", "8022", "termux-user@phone:/sdcard/Download/a.csv", "/tmp/a.csv"]
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        csv_path = os.path.join(td, "a.csv")
+        open(csv_path, "wb").write(b"synthetic")
+        assert manifest(csv_path, "redmi10-daily", 3)["device"] == "redmi10-daily"
+    print("selftest: PASS")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host")
+    ap.add_argument("--remote-csv")
+    ap.add_argument("--out", required=False)
+    ap.add_argument("--device")
+    ap.add_argument("--pull", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    args = ap.parse_args()
+    if args.test:
+        return selftest()
+    if not args.pull and not args.dry_run:
+        raise SystemExit("pass --pull to contact the declared device, or --dry-run")
+    if args.pull:
+        return pull_and_import(args)
+    return pull_and_import(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

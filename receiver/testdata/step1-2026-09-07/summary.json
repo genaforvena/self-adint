@@ -1,0 +1,17 @@
+{
+  "coordinates_on_disk": false,
+  "counts": {
+    "foreign-deny:204": 10,
+    "foreign-pass:200": 20,
+    "matched-post-cap:200": 1,
+    "matched:200": 20,
+    "no-ifa:204": 5,
+    "panic:500": 2
+  },
+  "foreign_ifa_on_disk": false,
+  "input_rows": 57,
+  "persisted_rows": 21,
+  "post_cap_probe_status": 200,
+  "run": "step1-2026-09-07",
+  "transport": "loopback-only"
+}

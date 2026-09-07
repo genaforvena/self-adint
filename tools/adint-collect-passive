@@ -77,6 +77,7 @@ SITES_PER_TICK = 4
 SETTLE = 30
 NAV_TIMEOUT = 45
 MIN_FREE_GB = 3.0
+ECHO_HOSTS = ("https://ipv4.internet.yandex.net/api/v0/ip", "https://ifconfig.co/json")
 
 
 def now():
@@ -175,21 +176,50 @@ def write_cursor(path, v):
 # ------------------------------------------------------------------ egress
 
 
-def egress_legs():
-    """Both legs, in this run. Neither is inferred and an unreadable leg is UNKNOWN."""
+def _echo_request(host, env):
+    """Read one provider's exact response; return only a structured IP answer."""
+    pr = subprocess.run(["curl", "-4", "-s", "--max-time", "15", host],
+                        capture_output=True, timeout=25, env=env)
+    if pr.returncode:
+        raise RuntimeError("curl rc=%d" % pr.returncode)
+    value = json.loads(pr.stdout.decode())
+    if isinstance(value, str):
+        return {"ip": value, "country": None, "asn": None}
+    if not isinstance(value, dict) or not value.get("ip"):
+        raise ValueError("provider response has no ip")
+    return {"ip": value["ip"], "country": value.get("country_iso") or value.get("country"),
+            "asn": value.get("asn")}
+
+
+def egress_legs(runner=None, hosts=None):
+    """Both process legs, with every echo attempt preserved in the artifact.
+
+    No provider is authoritative. A working result is usable only when the provider that
+    produced it is named; all-provider failure remains UNKNOWN. ``runner`` is injectable so
+    the provider-failure path is tested without making the self-test depend on the network.
+    """
     pvars = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
              "http_proxy", "https_proxy", "all_proxy")
+    runner = runner or _echo_request
+    hosts = tuple(hosts or ECHO_HOSTS)
 
     def leg(env, label):
-        try:
-            pr = subprocess.run(["curl", "-4", "-s", "--max-time", "15",
-                                 "https://ifconfig.co/json"],
-                                capture_output=True, timeout=25, env=env)
-            j = json.loads(pr.stdout.decode())
-            return {"ip": j.get("ip"), "country": j.get("country_iso"),
-                    "asn": j.get("asn"), "said_by": "ifconfig.co", "leg": label}
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"[:120], "leg": label}
+        attempts = []
+        chosen = None
+        for host in hosts:
+            try:
+                answer = runner(host, env)
+                attempts.append({"host": host, "ok": True, **answer})
+                if chosen is None:
+                    chosen = (host, answer)
+            except Exception as e:
+                attempts.append({"host": host, "ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:120]})
+        if chosen is not None:
+            host, answer = chosen
+            return {**answer, "said_by": host, "leg": label, "attempts": attempts}
+        return {"ip": None, "country": None, "asn": None, "leg": label,
+                "attempts": attempts, "error": "all echo providers failed"}
 
     stripped = {k: v for k, v in os.environ.items() if k not in pvars}
     proxy_env = {k: os.environ[k] for k in pvars if os.environ.get(k)}
@@ -368,6 +398,24 @@ def selftest():
     r, rc = tick(a, led)
     check("a live holder makes the tick stand down", r["outcome"], "stood-down")
     check("and the stand-down is rc 0, not an error", rc, 0)
+
+    # --- a dead echo provider must not erase a working independent provider
+    def fake_echo(host, env):
+        if host == "https://dead.example/":
+            raise TimeoutError("synthetic dead provider")
+        return {"ip": "198.51.100.7", "country": "ZZ", "asn": "AS64500"}
+
+    multi = egress_legs(runner=fake_echo,
+                        hosts=["https://dead.example/", "https://echo.example/"])
+    check("dead echo provider is recorded",
+          multi["as_invoked"]["attempts"][0]["ok"] is False)
+    check("independent echo answer survives provider failure",
+          multi["as_invoked"]["ip"] == "198.51.100.7" and
+          multi["as_invoked"]["said_by"] == "https://echo.example/")
+    both = egress_legs(runner=fake_echo,
+                       hosts=["https://echo-a.example/", "https://echo-b.example/"])
+    check("all independent echo providers are attempted",
+          len(both["as_invoked"]["attempts"]) == 2)
 
     # --- the egress record carries both legs and never invents one
     eg = egress_legs()
