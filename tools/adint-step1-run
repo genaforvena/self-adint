@@ -21,13 +21,12 @@ ceremony. Three of this harness's checks CANNOT be made in the package's own tes
   * latency is measured against each request's own `tmax`, which only exists once there
     is a socket and a process on the other end of it.
 
-WHAT IT REFUSES TO DO
-It never contacts a network. Every request goes to 127.0.0.1 on an ephemeral port, and
-the corpus is generated locally from a seed — there is no exchange, no seat, no egress.
-That is a property worth stating rather than assuming, so the run RECORDS the node's
-egress at run time (and whether this shell is proxied, the trap already recorded on this
-node) and labels the run `loopback-only` beside it. A run that quietly went out would
-then be visible as a contradiction between two fields instead of being invisible.
+NETWORK BOUNDARY
+The receiver and every corpus request use 127.0.0.1 on an ephemeral port; the corpus is
+generated locally from a seed. By default, the harness ALSO makes two external curl
+requests to ifconfig.co to record the node's egress and proxy path. Use `--offline-egress`
+to skip those probes and record egress as UNKNOWN. `--test` always uses offline mode.
+`loopback-only` describes receiver traffic, not the default harness's egress probes.
 
 THE TARGET IFA IS SYNTHETIC ON PURPOSE
 `ADINT_TARGET_IFA` here is a fixed fake UUID, never the operator's real advertising id.
@@ -95,11 +94,10 @@ def make_corpus(seed):
     below a floor that exists, and the no-floor case is the one that can WIN outright in a
     first-price auction, which is what the ledger and the cap are for (§1a).
 
-    `tmax` and `at` are carried on every request even though the receiver reads neither.
-    They are not decoration: §1e says the bid deadline is `tmax` minus RTT and must be READ
-    per request rather than guessed, and the run reports observed latency against the tmax
-    each request declared. A field the corpus does not carry is a field no run can ever
-    measure the handling of.
+    `tmax` and `at` are carried on every request. The receiver's expired-budget contract is
+    covered by `TestExpiredTmaxRefusesWork`; this process harness records declared tmax and
+    observed latency but does not drive an intentionally expired request. `at` remains an
+    explicitly unused field in this local synthetic study.
     """
     rnd = random.Random(seed)
     corpus = []
@@ -272,21 +270,33 @@ def get(port, path, timeout=5.0):
 # --------------------------------------------------------------------------- egress
 
 
-def egress_record():
+def egress_record(probe_external=True):
     """Where this node leaves from, measured in the SAME run as the claim, plus whether
     this shell is proxied at all.
 
     The board task names the trap directly: a curl from a mind pane on this node may go
     out through privoxy to a socks tunnel rather than by the node's own route, and this
     repo has already published one number that was the proxy's exit. So both are recorded
-    and neither is inferred. The run itself is loopback-only — this field is provenance
-    for the RUN, not a path any of its packets took.
+    and neither is inferred. Receiver traffic is loopback-only. By default this separate
+    provenance check makes external ifconfig.co requests; explicit offline mode skips
+    them and records UNKNOWN.
     """
     rec = {"run_path": "loopback-only (127.0.0.1; the corpus never leaves this host)"}
     proxy_vars = {k: os.environ.get(k) for k in
                   ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                    "http_proxy", "https_proxy", "all_proxy")}
     rec["proxy_env"] = {k: v for k, v in proxy_vars.items() if v} or None
+
+    if not probe_external:
+        reason = "disabled by explicit offline mode"
+        rec["probe_status"] = "unknown"
+        rec["probe_reason"] = reason
+        rec["node_egress"] = {"status": "unknown", "reason": reason,
+                              "leg": "as-invoked (proxy env honoured if set)"}
+        rec["node_egress_direct"] = {"status": "unknown", "reason": reason,
+                                     "leg": "proxy env stripped"}
+        rec["legs_agree"] = None
+        return rec
 
     def exit_via(env, label):
         try:
@@ -378,7 +388,8 @@ def run_cell(args, log):
     g = Gates()
     summary = {"run": os.path.basename(out_dir), "started": now(), "seed": args.seed,
                "target_ifa": TARGET_IFA, "spend_cap": SPEND_CAP,
-               "egress": egress_record()}
+               "egress": egress_record(
+                   probe_external=not getattr(args, "offline_egress", False))}
 
     if not build(binpath, log):
         g.check("build", False, "go build failed")
@@ -557,18 +568,17 @@ def run_cell(args, log):
             f"answered {post_cap['status']}")
 
     # ---------------------------------------------------------------- measurements
-    # NOT gates. §1e says the bid budget is `tmax` minus RTT and must be read per request.
-    # The receiver reads neither field today; that is a finding, and a finding is a number,
-    # so the run publishes the distribution rather than asserting a threshold nobody has
-    # derived yet.
+    # Measurements. The receiver's expired tmax contract is covered by the focused Go test;
+    # this process harness publishes its observed latency distribution separately and does not
+    # pretend that ordinary fast requests prove the expired-request branch.
     lat = sorted(r["ms"] for r in results if r["kind"] != "panic")
     def pct(v, q):
         return round(v[min(len(v) - 1, int(len(v) * q))], 3) if v else None
     summary["latency_ms"] = {"n": len(lat), "p50": pct(lat, .5), "p95": pct(lat, .95),
                              "max": round(lat[-1], 3) if lat else None}
     summary["tmax_declared"] = sorted({r["tmax"] for r in results})
-    summary["tmax_read_by_receiver"] = False
-    summary["at_read_by_receiver"] = False
+    summary["tmax_contract"] = "covered by receiver/TestExpiredTmaxRefusesWork; expired branch not exercised by this harness"
+    summary["at_contract"] = "unused by receiver"
     summary["counts"] = {}
     for r in results:
         k = f"{r['kind']}:{r['status']}"
@@ -610,7 +620,8 @@ def selftest():
         global RECEIVER_DIR
         keep, RECEIVER_DIR = RECEIVER_DIR, srcdir
         try:
-            a = argparse.Namespace(seed=1, out_dir=os.path.join(base, tag))
+            a = argparse.Namespace(seed=1, out_dir=os.path.join(base, tag),
+                                   offline_egress=True)
             os.makedirs(a.out_dir, exist_ok=True)
             return run_cell(a, lambda *x: None)
         finally:
@@ -709,6 +720,8 @@ def main():
     ap.add_argument("--seed", type=int, default=20260830)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--test", action="store_true")
+    ap.add_argument("--offline-egress", action="store_true",
+                    help="skip ifconfig.co probes and record egress as unknown")
     args = ap.parse_args()
 
     if args.test:

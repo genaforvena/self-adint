@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -54,6 +55,7 @@ func newTestServer(t *testing.T) (*Server, string, *bufLog) {
 func req(ifa, bundle string, floor float64, extra map[string]any) *http.Request {
 	m := map[string]any{
 		"id":     "req-" + ifa,
+		"tmax":   100,
 		"imp":    []map[string]any{{"id": "1", "bidfloor": floor}},
 		"app":    map[string]any{"bundle": bundle},
 		"device": map[string]any{"ifa": ifa, "geo": map[string]any{"type": 2, "lat": 55.75, "lon": 37.61}},
@@ -68,6 +70,88 @@ func req(ifa, bundle string, floor float64, extra map[string]any) *http.Request 
 	b, _ := json.Marshal(m)
 	r := httptest.NewRequest("POST", "/bid", strings.NewReader(string(b)))
 	return r
+}
+
+func TestExpiredTmaxRefusesWork(t *testing.T) {
+	srv, dir, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	srv.handleBidWithRTT(w, req(targetIFA, "com.random", 1.0, map[string]any{"tmax": 20}), func() time.Duration {
+		return 35 * time.Millisecond
+	})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expired request status=%d; want 204", w.Code)
+	}
+	if recs := readJSONL(t, dir); len(recs) != 0 {
+		t.Fatalf("expired request wrote %d rows; must refuse work before persistence", len(recs))
+	}
+}
+
+func TestResponseCompletionGateRefusesAfterIngressBudget(t *testing.T) {
+	srv, dir, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	readings := []time.Duration{10 * time.Millisecond, 101 * time.Millisecond}
+	srv.handleBidWithRTT(w, req(targetIFA, "com.random", 1.0, map[string]any{"tmax": 100}), func() time.Duration {
+		got := readings[0]
+		readings = readings[1:]
+		return got
+	})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("response-completion timeout status=%d; want 204", w.Code)
+	}
+	if recs := readJSONL(t, dir); len(recs) != 1 {
+		t.Fatalf("response-completion timeout wrote %d rows; matched observation must remain recorded", len(recs))
+	}
+}
+
+func TestMissingPrivateIngressTimingRefusesWork(t *testing.T) {
+	srv, dir, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	srv.handleBid(w, req(targetIFA, "com.random", 1.0, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("missing private ingress timing status=%d; want 204", w.Code)
+	}
+	if recs := readJSONL(t, dir); len(recs) != 0 {
+		t.Fatalf("missing private ingress timing wrote %d rows", len(recs))
+	}
+}
+
+func TestPrivateIngressTimingIsTheOnlyTrustedClock(t *testing.T) {
+	srv, dir, _ := newTestServer(t)
+	r := withIngressTiming(req(targetIFA, "com.random", 1.0, map[string]any{"tmax": 20}),
+		time.Now().Add(-35*time.Millisecond))
+	w := httptest.NewRecorder()
+	srv.handleBid(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expired private ingress timing status=%d; want 204", w.Code)
+	}
+	if recs := readJSONL(t, dir); len(recs) != 0 {
+		t.Fatalf("expired private ingress timing wrote %d rows", len(recs))
+	}
+}
+
+func TestZeroAndMalformedTmaxRefuseBeforePersistence(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{name: "zero", body: `{"id":"zero","tmax":0,"device":{"ifa":"TARGET-IFA-0000-1111"}}`, wantStatus: http.StatusNoContent},
+		{name: "missing", body: `{"id":"missing","device":{"ifa":"TARGET-IFA-0000-1111"}}`, wantStatus: http.StatusNoContent},
+		{name: "malformed", body: `{"id":"malformed","tmax":"120","device":{"ifa":"TARGET-IFA-0000-1111"}}`, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, dir, _ := newTestServer(t)
+			r := httptest.NewRequest("POST", "/bid", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, r)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("%s tmax status=%d; want %d", tc.name, w.Code, tc.wantStatus)
+			}
+			if recs := readJSONL(t, dir); len(recs) != 0 {
+				t.Fatalf("%s tmax wrote %d rows", tc.name, len(recs))
+			}
+		})
+	}
 }
 
 func readJSONL(t *testing.T, dir string) []Record {
@@ -119,6 +203,15 @@ func TestDecoyRule(t *testing.T) {
 				t.Fatalf("verdict=%v matched=%v; want %v/%v", v, m, c.want, c.matched)
 			}
 		})
+	}
+}
+
+func TestBidBudgetReadsTmaxAndSubtractsRTT(t *testing.T) {
+	if got := bidBudget(120, 35*time.Millisecond); got != 85*time.Millisecond {
+		t.Fatalf("budget=%s; want 85ms", got)
+	}
+	if got := bidBudget(20, 35*time.Millisecond); got != 0 {
+		t.Fatalf("expired budget=%s; want 0", got)
 	}
 }
 

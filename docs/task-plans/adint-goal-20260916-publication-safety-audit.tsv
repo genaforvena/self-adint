@@ -1,0 +1,1 @@
+adint	publication-safety-audit	Audit the current working tree for publication-boundary safety and write docs/task-receipts/publication-safety-audit-20260916.md with changed-path classification, private-data checks, and an explicit keep/quarantine disposition for each dirty path; acceptance is a reproducible receipt that identifies any unsafe path before publication.

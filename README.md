@@ -19,6 +19,10 @@ the code is built to*, below.
 Two threads run in parallel. **`docs/INDEX.md` is the map**; start there if you want to
 navigate rather than read.
 
+For a local, network-free Step 1 verification from the repository root, run
+`tools/test-step1-working-tree`. It tests the nested receiver module, the synthetic harness,
+and the offline egress regression in that order.
+
 **Thread A — measurement.** Which exchanges actually sell this device's traffic, and what is
 observable from where. This is where the current work is.
 
@@ -35,13 +39,13 @@ papers.
 
 <!-- NUMBERS: regenerate with `python3 tools/adint-status` — do not hand-edit -->
 
-*Generated 2026-08-21 12:56 UTC by `tools/adint-status` from the files on disk.*
+*Generated 2026-09-16 18:23 UTC by `tools/adint-status` from the files on disk.*
 
 ### The sampling frame — and its rejections, which are half the result
 
 The study runs on the **`ru-mobile`** frame, declared in `ref/CANONICAL-FRAME`. Which vantage a frame is built from changes its membership, so this is a choice with a reason, recorded in that file.
 
-**Vantage `ru-mobile`** — **canonical** · 208 domains touched in rank order · 3 duplicate row(s) collapsed · browser egress 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
+**Vantage `ru-mobile`** — **canonical** · 209 domains touched in rank order · 3 duplicate row(s) collapsed · browser egress 38.49.216.141, 91.78.80.171, 91.79.81.62 · `frame-stageb-ru-mobile-2026-08-19-schema3.jsonl`
 
 | verdict | n | what it means |
 |---|---:|---|
@@ -52,7 +56,7 @@ The study runs on the **`ru-mobile`** frame, declared in `ref/CANONICAL-FRAME`. 
 | `blocked` | 23 | 4xx/5xx — **we never saw the page**, so this says nothing about its wrapper |
 | `rate-limited` | 1 | 428/429 — caused by our own load, not by the site |
 | `unreachable` | 20 | timeout or refused connection — our blindness |
-| `no-web-apex` | 45 | DNS/TLS failure — the domain serves no page at its apex at all |
+| `no-web-apex` | 46 | DNS/TLS failure — the domain serves no page at its apex at all |
 
 Admitted: `magnit.ru`, `pikabu.ru`, `rbc.ru`, `gismeteo.ru`, `hh.ru`, `ria.ru`, `iz.ru`, `matchtv.ru`, `kp.ru`, `aif.ru`, `mk.ru`, `sports.ru`, `aviasales.ru`, `interfax.ru`.
 

@@ -1,0 +1,1 @@
+adint	live-state-reconciliation-0739	90	Refresh the live adint study state from mesh-dash --once adint and record a receipt that names the rendered pane state, command exit, timestamp, and the current persisted status artifact; acceptance is a fresh docs/task-receipts/adint-live-state-reconciliation-20260920-0739.md plus observed pane evidence.

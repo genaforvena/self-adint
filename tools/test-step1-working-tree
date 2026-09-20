@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir/receiver"
+go test .
+cd "$repo_dir"
+tools/adint-step1-run --test
+python3 tools/test-step1-egress-offline.py

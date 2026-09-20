@@ -1,0 +1,1 @@
+adint	refresh-safe-study-status	0	read-only status reconciliation: run tools/adint-study --test and tools/adint-study, inspect the rendered status, and write a receipt with the exact next action; no collection or gated action

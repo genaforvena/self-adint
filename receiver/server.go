@@ -1,12 +1,29 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
 	"sync"
+	"time"
 )
+
+// ingressTimingKey is deliberately unexported: the exchange-facing HTTP
+// request cannot provide or override the timing origin.  Only Handler's
+// private ingress boundary may put this value in the context.
+type ingressTimingKey struct{}
+
+type ingressTiming struct {
+	receivedAt time.Time
+}
+
+func withIngressTiming(r *http.Request, receivedAt time.Time) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), ingressTimingKey{}, ingressTiming{
+		receivedAt: receivedAt,
+	}))
+}
 
 // Sink is the JSONL artifact writer. By construction the ONLY caller is the
 // matched-request path, so nothing but the target device's own rows are ever
@@ -59,7 +76,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/bid", s.handleBid)
 	mux.HandleFunc("/win", s.handleWin)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	return mux
+	// Capture the monotonic ingress origin before routing.  This is the only
+	// production timing source; no client header or body field can set it.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, withIngressTiming(r, time.Now()))
+	})
 }
 
 // handleBid is the hot path. Its recover() is the leak path the brief §1b
@@ -67,6 +88,19 @@ func (s *Server) Handler() http.Handler {
 // foreign ifa to a log even though the filter kept it off the JSONL. So the
 // recover logs the request id at most — NEVER the body, NEVER the ifa.
 func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
+	timing, ok := r.Context().Value(ingressTimingKey{}).(ingressTiming)
+	if !ok || timing.receivedAt.IsZero() {
+		// A direct call without the private ingress boundary is not a trusted
+		// receiver invocation.  Refuse rather than substitute a guessed clock.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	s.handleBidWithRTT(w, r, func() time.Duration { return time.Since(timing.receivedAt) })
+}
+
+// handleBidWithRTT keeps the deadline gate deterministic in tests while the
+// production handler measures the request's arrival-to-decision latency.
+func (s *Server) handleBidWithRTT(w http.ResponseWriter, r *http.Request, measuredRTT func() time.Duration) {
 	defer func() {
 		if p := recover(); p != nil {
 			// Nothing request-derived is logged here — not the body, not the
@@ -96,6 +130,13 @@ func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
 		panic("synthetic panic (test harness)")
 	}
 
+	// tmax includes network latency. Anything left after the measured arrival
+	// latency is the only budget this bidder may spend; zero means refuse.
+	if bidBudget(req.TMax, measuredRTT()) <= 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	verdict, matched := s.cfg.decide(&req)
 
 	// Persist BEFORE responding, and only for a matched request.
@@ -114,6 +155,13 @@ func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
 	resp := s.cfg.buildBid(&req)
 	// Point the win notice at our own endpoint so a win is always booked.
 	resp.SeatBid[0].Bid[0].NURL = "/win?p=${AUCTION_PRICE}&id=" + req.ID
+	// The response must still complete inside the same private-ingress budget.
+	// This is deliberately immediately before encoding: the matched observation
+	// above remains an observation even when the late response is refused.
+	if bidBudget(req.TMax, measuredRTT()) <= 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }

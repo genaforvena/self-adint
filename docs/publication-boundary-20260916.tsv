@@ -1,0 +1,18 @@
+# generated=2026-09-16T22:34Z source=docs/task-receipts/publication-safety-audit-20260916.md dirty_paths=89
+# digest_scope=sha256(path-list) for grouped rows; no files were edited, staged, sent, or published
+KEEP	4 files	 docs/task-plans/**	8412dbff9c46a47dbf35fe170ac5dde0bb9ac76bc68b9c7edb678e5fb68fbb25	method/task metadata; no runtime identifier scan finding
+KEEP	65 files	docs/task-receipts/** excluding the 11 rows below	d04577d12b78741a92410be81c73788b55a9ab977523b61c9484604483659488	receipts without IPv4-shaped content; retain for review, not automatic publication
+KEEP	3 files	docs/INDEX.md; tools/adint-step1-run; tools/test-step1-egress-offline.py	eb4e5cfd41e84a83eb26fab93cb613fca5942a10569f99b32ef88f83f4e9e5ca	method/code candidates; prior audit found no added private identifiers
+QUARANTINE	5 files	README.md; docs/step1-run-2026-08-30.md; public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl; ref/ru-frame-stageB-ru-mobile-2026-08-19.tsv; report.html	8ba2e67abb6a45693011701d4d50edb66199a1925c502d3dc78597025d334d2a	runtime egress addresses; regenerate with placeholders or keep outside publication
+NONPUBLIC	1 file	public-data/frame-stageb-ru-mobile-2026-08-19-schema3.jsonl.lock	e1082c3e23dc57eeac3559bf99f3ea10bb6fde290c9215314f823c684a60b4f2	lock-owner artifact; never a publication input
+QUARANTINE	1 file	docs/task-receipts/live-state-20260914.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/live-state-20260914T0350Z.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/live-state-20260914T0800Z.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/retry-camera-ssh-block-20260916T212317Z.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/ru-vantage-wifi-off-20260916.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/step0d-first-cell-post-fix-paired-run-20260916.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/step0d-namespace-retry-check-20260916T211452Z.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/step1-loopback-privacy-20260914.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/unblock-adint-3fc14554d7aaa695-resolve-20260916.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/unblock-adint-a9534782d8636395-resolve-20260916T212836Z.md		IPv4-shaped runtime address
+QUARANTINE	1 file	docs/task-receipts/unblock-adint-aec9a98f69e425a5-resolve-20260916.md		IPv4-shaped runtime address

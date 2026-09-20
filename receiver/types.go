@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // Minimal OpenRTB 2.5 subset — only the fields Step 1 reads or preserves.
 // The receiver never round-trips the whole request; it decodes what it needs
 // and, for a matched request, extracts the payload fields the brief §A names.
@@ -10,10 +12,22 @@ type BidRequest struct {
 	App    *App   `json:"app"`
 	Device Device `json:"device"`
 	User   *User  `json:"user"`
+	TMax   int    `json:"tmax"` // exchange deadline in milliseconds, including network latency
 	// Test holds an out-of-band instruction used ONLY by the synthetic
 	// harness to exercise the panic path (§ correction 1b). A real exchange
 	// never sends it; it is ignored on the wire and never persisted.
 	Test string `json:"__panic,omitempty"`
+}
+
+// bidBudget is the part of tmax left for bidder work after measured network RTT.
+// Negative budgets are clamped to zero so an expired request can never receive
+// a guessed positive timeout.
+func bidBudget(tmaxMS int, measuredRTT time.Duration) time.Duration {
+	budget := time.Duration(tmaxMS)*time.Millisecond - measuredRTT
+	if budget < 0 {
+		return 0
+	}
+	return budget
 }
 
 type Imp struct {
@@ -87,7 +101,7 @@ type Bid struct {
 	ID    string  `json:"id"`
 	ImpID string  `json:"impid"`
 	Price float64 `json:"price"`
-	AdM   string  `json:"adm"`  // fallback creative — must be servable (§1a)
+	AdM   string  `json:"adm"` // fallback creative — must be servable (§1a)
 	CrID  string  `json:"crid"`
 	NURL  string  `json:"nurl"` // win notice; exchange calls it if we win
 }
@@ -96,14 +110,14 @@ type Bid struct {
 // whose device.ifa matched the target. Foreign-ifa requests never construct
 // one (§ privacy invariant). It carries the brief §A payload, not coordinates.
 type Record struct {
-	TS      string       `json:"ts"`
-	Source  string       `json:"source"`
-	ReqID   string       `json:"req_id"`
-	Bundle  string       `json:"bundle"`
-	GeoType int          `json:"geo_type"`
-	Consent bool         `json:"consent_present"`
-	Segments []SegGroup  `json:"segments"`
-	EIDs    []string     `json:"eid_sources"`
+	TS       string     `json:"ts"`
+	Source   string     `json:"source"`
+	ReqID    string     `json:"req_id"`
+	Bundle   string     `json:"bundle"`
+	GeoType  int        `json:"geo_type"`
+	Consent  bool       `json:"consent_present"`
+	Segments []SegGroup `json:"segments"`
+	EIDs     []string   `json:"eid_sources"`
 }
 
 type SegGroup struct {

@@ -19,6 +19,25 @@ def _nonempty(root, *parts):
         return False
 
 
+def _step1_fixture_valid(root):
+    path = os.path.join(root, "data", "step1-20260830", "summary.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            summary = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return (
+        summary.get("seed") == 20260830
+        and summary.get("input_rows") == 55
+        and summary.get("persisted_rows") == 21
+        and summary.get("foreign_ifa_on_disk") is False
+        and summary.get("coordinates_on_disk") is False
+        and summary.get("post_cap_bid", {}).get("status") == 204
+        and summary.get("tmax_read_by_receiver") is False
+        and summary.get("at_read_by_receiver") is False
+    )
+
+
 def phase_status(root):
     """Return statuses derived only from artifacts already on disk."""
     data = os.path.join(root, "data")
@@ -38,8 +57,8 @@ def phase_status(root):
             "next": "inspect the device export" if not _nonempty(root, "data", "bundle-exchange.tsv") else "rederive from the append-only records",
         },
         "step1-local-receiver": {
-            "status": "MEASURED" if _exists(root, "receiver", "testdata", "step1-2026-08-30", "summary.json") else "UNKNOWN",
-            "next": "run receiver test corpus" if not _exists(root, "receiver", "testdata", "step1-2026-08-30", "summary.json") else "audit win and spend markers",
+            "status": "MEASURED" if _step1_fixture_valid(root) else "UNKNOWN",
+            "next": "run receiver test corpus" if not _step1_fixture_valid(root) else "audit win and spend markers",
         },
         "step2-questions": {"status": "DRAFT_ONLY", "next": "operator sends questions after choosing a candidate"},
         "step3-seat": {"status": "GATED_OPERATOR_GO", "next": "operator explicitly authorises onboarding, agreement, and payment"},
@@ -66,6 +85,7 @@ def selftest():
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         rows = phase_status(td)
+        assert rows["step1-local-receiver"]["status"] == "UNKNOWN"
         assert rows["step3-seat"]["status"] == "GATED_OPERATOR_GO"
         assert rows["step4-device"]["status"] == "BLOCKED_OPERATOR_EXPORT"
         assert rows["step5-oracle"]["status"] == "NOT_ELIGIBLE"

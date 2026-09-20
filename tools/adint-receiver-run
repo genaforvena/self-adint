@@ -1,124 +1,19 @@
 #!/usr/bin/env python3
-"""Run the local receiver against the committed synthetic corpus.
-
-The only persistent outputs are the explicitly selected dated run directory and its
-manifest. The receiver itself is loopback-only and receives no external traffic.
-"""
-import argparse
-import hashlib
-import json
+"""Compatibility entry point for the canonical Step 1 process harness."""
+import os
 import pathlib
 import subprocess
 import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CORPUS = ROOT / "receiver/testdata/step1-2026-08-30/corpus.jsonl"
-TARGET = "00000000-0000-4000-8000-000000000001"
-ALLOW = {"com.pass.a", "com.pass.b"}
-
-
-def post(port, row):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/bid", data=json.dumps(row).encode(),
-        method="POST", headers={"Content-Type": "application/json"})
-    started = time.monotonic()
-    try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            body, status = response.read(), response.status
-    except urllib.error.HTTPError as exc:
-        body, status = exc.read(), exc.code
-    price = None
-    if body:
-        try:
-            price = json.loads(body)["seatbid"][0]["bid"][0]["price"]
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
-            pass
-    return status, price, round((time.monotonic() - started) * 1000, 3)
-
-
-def kind(row):
-    if row.get("__panic"):
-        return "panic"
-    ifa = row.get("device", {}).get("ifa", "")
-    if ifa == TARGET:
-        return "matched"
-    if not ifa:
-        return "no-ifa"
-    return "foreign-pass" if row.get("app", {}).get("bundle") in ALLOW else "foreign-deny"
-
-
-def run(out):
-    out.mkdir(parents=True, exist_ok=False)
-    port = 48761
-    data = pathlib.Path(tempfile.mkdtemp(prefix="adint-receiver-data-"))
-    log = out / "receiver.stdout.log"
-    env = {"ADINT_TARGET_IFA": TARGET, "ADINT_BUNDLE_ALLOW": ",".join(sorted(ALLOW)),
-           "ADINT_SPEND_CAP": "0.50", "ADINT_DATA_DIR": str(data),
-           "ADINT_ADDR": f"127.0.0.1:{port}"}
-    proc = subprocess.Popen(["go", "run", "."], cwd=ROOT / "receiver", env={**dict(__import__("os").environ), **env},
-                            stdout=log.open("w"), stderr=subprocess.STDOUT)
-    try:
-        for _ in range(60):
-            try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1):
-                    break
-            except (urllib.error.URLError, TimeoutError):
-                time.sleep(0.1)
-        else:
-            raise RuntimeError("receiver did not become ready")
-        (out / "corpus.jsonl").write_bytes(CORPUS.read_bytes())
-        results = []
-        for line in CORPUS.read_text().splitlines():
-            row = json.loads(line)
-            status, price, elapsed = post(port, row)
-            results.append({"id": row.get("id"), "kind": kind(row), "status": status,
-                            "price": price, "ms": elapsed, "matched": kind(row) == "matched"})
-        # Exercise both the unexpanded settlement macro and a real non-zero win.
-        for price in ("${AUCTION_PRICE}", "0.50"):
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/win?p={price}&id=synthetic").read()
-        probe = {"id": "post-cap-probe", "imp": [{"id": "1", "bidfloor": 0.0}],
-                 "app": {"bundle": "com.pass.a"}, "device": {"ifa": TARGET}}
-        status, _, _ = post(port, probe)
-        results.append({"id": probe["id"], "kind": "matched-post-cap", "status": status,
-                        "price": None, "matched": True})
-        receiver_jsonl = data / "receiver.jsonl"
-        (out / "receiver-output.jsonl").write_bytes(receiver_jsonl.read_bytes())
-        (out / "results.jsonl").write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in results))
-        for name in ("win-counter.txt", "WIN-ALERT.txt", "WIN-ZERO-PRICE.txt"):
-            source = data / name
-            if source.exists():
-                (out / name).write_bytes(source.read_bytes())
-        raw = (out / "receiver-output.jsonl").read_text()
-        summary = {"run": "step1-2026-09-07", "transport": "loopback-only",
-                   "input_rows": len(results) - 1, "persisted_rows": len(raw.splitlines()),
-                   "foreign_ifa_on_disk": any(x in raw for x in ("FFFFFFFF-", "DDDDDDDD-")),
-                   "coordinates_on_disk": any(x in raw for x in ("55.75", "37.61")),
-                   "post_cap_probe_status": status, "counts": {}}
-        for result in results:
-            key = f"{result['kind']}:{result['status']}"
-            summary["counts"][key] = summary["counts"].get(key, 0) + 1
-        (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-        manifest = []
-        for path in sorted(out.iterdir()):
-            if path.name != "SHA256SUMS":
-                manifest.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
-        (out / "SHA256SUMS").write_text("\n".join(manifest) + "\n")
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=pathlib.Path, required=True)
-    args = parser.parse_args()
-    run(args.out)
-    print(args.out)
+    out = pathlib.Path(os.environ.get("ADINT_STEP1_OUT", ROOT / "data" / "step1-20260830"))
+    command = [sys.executable, str(ROOT / "tools" / "adint-step1-run"),
+               "--seed", "20260830", "--out-dir", str(out), "--offline-egress"]
+    return subprocess.call(command)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

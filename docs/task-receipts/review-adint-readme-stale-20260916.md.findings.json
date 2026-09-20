@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "findings": [
+    {
+      "id": "stale-stageb-readme-block",
+      "actionable": false,
+      "reason": "The requested stale Stage B README block was the sole finding; it was repaired by the mandated tools/adint-status --write run and independently verified against a fresh render. No downstream task remains."
+    }
+  ]
+}

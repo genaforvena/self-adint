@@ -1,0 +1,1 @@
+adint	safe-study-loop-regression	[receipt-only] Run the current safe-study executable self-tests and canonical status, capture the resulting report plus mesh-dash pane observation, and write docs/task-receipts/adint-safe-study-loop-regression-20260920.md; acceptance requires recorded exit codes, current HEAD/status, no fabricated data claim, and pane:adint rendering.

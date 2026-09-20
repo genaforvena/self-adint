@@ -1,0 +1,1 @@
+adint	step1-offline-egress-regression	0	Run the existing offline Step 1 egress regression and write docs/task-receipts/step1-offline-egress-regression-20260917.md. Acceptance: python3 tools/test-step1-egress-offline.py exits 0; the receipt records that offline mode reports UNKNOWN without invoking external probes, with command output and artifact hash.

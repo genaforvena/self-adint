@@ -1,0 +1,1 @@
+adint	public-boundary-manifest-refresh	2	Regenerate a hash-pinned inventory of the current dirty/publication paths, identify any device/network-bearing material that must remain quarantined, and record the scan plus receiver/offline test results in a task receipt; do not publish, contact an external party, or alter router/VM state.

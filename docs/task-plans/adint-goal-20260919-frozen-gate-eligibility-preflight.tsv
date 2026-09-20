@@ -1,0 +1,1 @@
+adint	frozen-gate-eligibility-preflight	90	Measure the live eligibility count and date gate for routing-shadow follow-up; write a receipt with exact commands, parent status, and retry/terminal decision. Do not run the frozen comparison early.
