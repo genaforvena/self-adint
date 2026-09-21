@@ -1,0 +1,1 @@
+adint	ru-mobile-namespace-question-2136	Restore the already-approved /run/netns/ru-mobile namespace and verify its approved RU-mobile route; stop before capture. Acceptance artifact must record the exact predicates, current UNKNOWN state if absent, and the next retry command.
